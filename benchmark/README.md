@@ -241,6 +241,27 @@ python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb 
 python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models sonnet --reps 1 --modes tilth
 ```
 
+**Tasks that guard a specific tilth path:**
+
+Most tasks measure cost and accuracy, and the agent is free to solve them however
+it likes — reaching the right answer with `Bash` and grep is a legitimate data
+point about tool adoption.
+
+A few tasks exist instead to detect a regression in one tilth code path. For those,
+a correct answer obtained by grepping proves nothing: the task goes green while the
+path it guards is broken. Such a task declares what it must exercise via
+`requires_tool_use` (see `tasks/base.py`), and a run in a tilth mode that does not
+satisfy it is reported as **incorrect**, with the reason naming what was missed.
+
+The three `leveldb_*` tasks are the C++ regression signal and all declare a
+requirement — `leveldb_corruption_callers` was added for C++ qualified-static call
+sites and originally passed using `Glob`, `Bash` and `Read` with zero tilth calls.
+`tool_requirements_met` in each result row records the outcome (`null` when the task
+declares no requirement, or in `baseline` mode where there are no tilth tools).
+
+Requirements are satisfiable by any legitimate entry point to the path, so
+`kind="callers"` search and `tilth_grok` both count for caller detection.
+
 **Analyze:**
 
 ```bash

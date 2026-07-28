@@ -801,6 +801,69 @@ mod tests {
         }
     }
 
+    /// Deterministic guard for C++ qualified-static caller detection on *real* code.
+    ///
+    /// The synthetic test above pins the AST shapes; this pins the behaviour on a real
+    /// codebase, which is where the original defect was found and where a shape-level
+    /// test can still miss something. Upstream v0.9.0 reports 3 call sites for
+    /// `Corruption` in leveldb; with qualified statics detected it reports 33 — the 30
+    /// `Status::Corruption` calls plus 3 `Reporter::Corruption`. A regression that
+    /// silently drops the qualified ones shows up here as a collapse toward 3.
+    ///
+    /// Skipped unless the benchmark fixture is present, so CI (which does not clone it)
+    /// stays green. Populate it with:
+    ///   `python benchmark/fixtures/setup_repos.py --repos leveldb`
+    ///
+    /// This exists because the benchmark task covering the same ground is stochastic:
+    /// the agent picks its own route, and measurement showed it uses the callers search
+    /// in only about 5 runs out of 8 even when tilth is its only tool. Route choice
+    /// makes that a poor gate; this is the gate.
+    #[test]
+    fn cpp_qualified_static_callers_on_real_fixture() {
+        let Some(repo) = leveldb_fixture() else {
+            eprintln!("skipping: leveldb benchmark fixture not present");
+            return;
+        };
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let out = search_callers_expanded("Corruption", &repo, &bloom, 0, None, None, true)
+            .expect("callers search on the leveldb fixture");
+
+        let header = out.lines().next().unwrap_or_default();
+        let count: usize = header
+            .rsplit("— ")
+            .next()
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not read a count from header: {header:?}"));
+
+        assert_eq!(
+            count, 33,
+            "expected 33 call sites at the pinned leveldb commit (30 Status::Corruption \
+             + 3 Reporter::Corruption); a value near 3 means qualified statics stopped \
+             being detected. Header: {header}"
+        );
+        // Spot-check that the qualified form specifically is present, not just the count.
+        assert!(
+            out.contains("Status::Corruption("),
+            "the qualified call form must appear in the results"
+        );
+    }
+
+    /// Path to the leveldb benchmark fixture, if it has been cloned.
+    ///
+    /// `benchmark/config.py` sets `REPOS_DIR = /tmp/tilth_bench/repos`; on Windows that
+    /// literal path resolves against the current drive, so both spellings are probed.
+    /// Identified by a file it must contain, not by the directory existing, so a
+    /// half-finished clone skips rather than failing confusingly.
+    fn leveldb_fixture() -> Option<PathBuf> {
+        [
+            PathBuf::from(r"C:\tmp\tilth_bench\repos\leveldb"),
+            PathBuf::from("/tmp/tilth_bench/repos/leveldb"),
+        ]
+        .into_iter()
+        .find(|c| c.join("include/leveldb/status.h").is_file())
+    }
+
     /// Regression test: when there are more than MAX_MATCHES (10) hop-1 call
     /// sites but still <= IMPACT_FANOUT_THRESHOLD unique callers, the footer
     /// "N functions affected across 2 hops" must use the pre-truncation unique

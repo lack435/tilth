@@ -55,6 +55,41 @@ def _tilth_version() -> Optional[str]:
         return None
 
 
+def _unmet_tool_requirements(run_result, requirements: list[str]) -> list[str]:
+    """Return the entries of `requirements` this run did not satisfy.
+
+    Requirement syntax (see `Task.requires_tool_use`):
+      "tool_name"                — the tool was called at least once
+      "tool_name:key=value"      — ...with `key` equal to `value` in its input
+      "alt_a|alt_b"              — either alternative satisfies the requirement
+
+    Argument matching is on the string form of the input value, so `kind=callers`
+    matches `{"kind": "callers"}`. One argument per alternative is supported; that
+    is enough to distinguish tilth_search's `kind` modes, which is the case that
+    needs it (a plain symbol search and a callers search are the same tool).
+
+    Alternation exists because a code path usually has more than one legitimate
+    entry point — caller detection runs for both `tilth_search kind="callers"` and
+    `tilth_grok`, and pinning one would fail a run that exercised the path via the
+    other.
+    """
+    calls = [tc for turn in run_result.turns for tc in turn.tool_calls]
+
+    def satisfied(alternative: str) -> bool:
+        tool_name, _, arg_spec = alternative.partition(":")
+        matching = [tc for tc in calls if tc.name == tool_name]
+        if arg_spec:
+            key, _, value = arg_spec.partition("=")
+            matching = [tc for tc in matching if str(tc.input.get(key, "")) == value]
+        return bool(matching)
+
+    return [
+        requirement
+        for requirement in requirements
+        if not any(satisfied(alt) for alt in requirement.split("|"))
+    ]
+
+
 def get_repo_path(repo_name: str) -> Path:
     """Resolve working directory for a task's repo."""
     if repo_name == "synthetic":
@@ -192,6 +227,26 @@ def run_single(
         run_result.result_text,
         str(repo_path),
     )
+
+    # Enforce declared tool-use requirements (see Task.requires_tool_use).
+    #
+    # A task that exists to guard a tilth code path is only a guard if that path
+    # actually ran. Without this, an agent that answers correctly via Bash and grep
+    # records `correct: true` while the path under test could be entirely broken —
+    # which is exactly what happened to leveldb_corruption_callers, the task written
+    # for C++ qualified-static call sites: it passed using Glob, Bash and Read, and
+    # zero tilth calls.
+    requirements_met: Optional[bool] = None
+    if "tilth" in mode_name and task.requires_tool_use:
+        missing = _unmet_tool_requirements(run_result, task.requires_tool_use)
+        requirements_met = not missing
+        if missing:
+            correct = False
+            reason = (
+                "tilth path not exercised (answer may be correct but proves nothing "
+                f"about it): {', '.join(missing)}"
+            )
+
     run_result.correct = correct
     run_result.correctness_reason = reason
 
@@ -210,6 +265,8 @@ def run_single(
         "model": model_name,
         "repetition": repetition,
         "tilth_version": _tilth_version() if "tilth" in mode_name else None,
+        # None when the task declares no requirement or the mode has no tilth.
+        "tool_requirements_met": requirements_met,
         "num_turns": run_result.num_turns,
         "num_tool_calls": sum(tool_breakdown.values()),
         "tool_calls": tool_breakdown,
