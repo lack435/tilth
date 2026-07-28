@@ -62,6 +62,11 @@ from .express_diff_tasks import ExpressDiffMultiMutationTask
 from .fastapi_diff_tasks import FastAPIDiffWhichCommitTask
 from .ripgrep_diff_tasks import RipgrepDiffMisdirectedErrorTask
 from .gin_diff_tasks import GinDiffComprehensionTask
+from .leveldb_tasks import (
+    LevelDBStatusTypeTask,
+    LevelDBCorruptionCallersTask,
+    LevelDBEnvHeaderDepsTask,
+)
 from .grok_tasks import (
     GrokGinNewTask,
     GrokDependsTask,
@@ -118,6 +123,10 @@ TASKS = {
     "express_edit_json_type": ExpressEditJsonContentTypeTask(),
     "express_edit_cookie_prefix": ExpressEditCookiePrefixTask(),
     "express_edit_send_type": ExpressEditSendHtmlTypeTask(),
+    # leveldb (C++)
+    "leveldb_status_type": LevelDBStatusTypeTask(),
+    "leveldb_corruption_callers": LevelDBCorruptionCallersTask(),
+    "leveldb_env_header_deps": LevelDBEnvHeaderDepsTask(),
     # diff-specific benchmark tasks
     "express_diff_multi_mutation": ExpressDiffMultiMutationTask(),
     "fastapi_diff_which_commit": FastAPIDiffWhichCommitTask(),

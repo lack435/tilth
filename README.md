@@ -154,7 +154,7 @@ Function-level change detection. Drill in with `--scope`, summarize history with
 
 ## Benchmarks
 
-Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
+Code navigation tasks across 5 real-world repos (Express, FastAPI, Gin, ripgrep, leveldb). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
 
 | Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|---|

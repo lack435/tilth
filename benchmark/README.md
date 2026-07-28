@@ -193,6 +193,14 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 | [FastAPI](https://github.com/tiangolo/fastapi) | Python | Async web framework |
 | [Gin](https://github.com/gin-gonic/gin) | Go | HTTP framework |
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | Rust | Line-oriented search |
+| [leveldb](https://github.com/google/leveldb) | C++ | Embedded key-value store |
+
+leveldb covers the C++ constructs the other four repos have no analogue for:
+classes declared in headers behind an export macro (`class LEVELDB_EXPORT
+Status`), base classes in the class head (`class LEVELDB_EXPORT EnvWrapper :
+public Env`), member functions defined out-of-line in a `.cc`, qualified static
+member calls (`Status::Corruption(...)`), and `#include` graphs instead of
+module imports. The results tables above predate these tasks.
 
 **Difficulty tiers (7 tasks each, Sonnet only):**
 - **Easy** — Single-file lookups, finding definitions, tracing short paths
@@ -218,19 +226,19 @@ python benchmark/fixtures/setup_repos.py
 
 ```bash
 # All tasks, baseline + tilth, 3 reps, Sonnet
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models sonnet --reps 3
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models sonnet --reps 3
 
 # Specific tasks
 python benchmark/run.py --tasks fastapi_depends_processing,gin_middleware_chain --models sonnet --reps 3
 
 # Opus on all tasks
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models opus --reps 3
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models opus --reps 3
 
 # Haiku forced mode (built-in search tools removed)
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models haiku --reps 1 --modes tilth_forced
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models haiku --reps 1 --modes tilth_forced
 
 # Single mode only (skip baseline comparison)
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models sonnet --reps 1 --modes tilth
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models sonnet --reps 1 --modes tilth
 ```
 
 **Analyze:**
@@ -247,7 +255,7 @@ Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. 
 
 ### Task definitions
 
-Tasks are in `benchmark/tasks/`. Each specifies `repo`, `prompt`, `ground_truth` (correctness strings), and `difficulty`.
+Tasks are in `benchmark/tasks/`. Each specifies `repo`, `prompt`, `ground_truth` (correctness strings), and `task_type` (`"read"` / `"navigate"` / `"edit"`). There is no `difficulty` field on `Task` — the easy/medium/hard tier is recorded in the task class docstring.
 
 ### Contributing benchmarks
 
@@ -259,9 +267,14 @@ We welcome benchmark contributions — more data makes the results more reliable
 - `repo`: which benchmark repo to use
 - `prompt`: the code navigation question
 - `ground_truth`: list of strings that must appear in a correct answer
-- `difficulty`: `"easy"`, `"medium"`, or `"hard"`
+- `task_type`: `"read"`, `"navigate"` or `"edit"` (defaults to `"read"`); note the easy/medium/hard tier in the class docstring
 
 Good tasks have unambiguous correct answers that can be verified by string matching. Avoid tasks where the answer depends on interpretation.
+
+Two traps to check for, both of which have bitten real tasks:
+
+- **Grading is a bare substring match, so shorter strings are satisfied by longer ones.** Requiring `Recover` is a no-op if a correct answer says `RecoverLogFile`. Pick strings that cannot contain one another.
+- **Don't calibrate ground truth to tilth's output.** If the required strings are whatever tilth happens to print, baseline runs fail for giving a different but equally correct answer, and any tilth blind spot becomes frozen in as expected behaviour. Verify against the repo, then make the prompt determinate enough that both modes are asked the same question.
 
 ## Version history
 
