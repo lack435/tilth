@@ -801,31 +801,41 @@ mod tests {
         }
     }
 
-    /// Deterministic guard for C++ qualified-static caller detection on *real* code.
+    /// Real-code check on C++ qualified-static caller detection.
     ///
-    /// The synthetic test above pins the AST shapes; this pins the behaviour on a real
-    /// codebase, which is where the original defect was found and where a shape-level
-    /// test can still miss something. Upstream v0.9.0 reports 3 call sites for
-    /// `Corruption` in leveldb; with qualified statics detected it reports 33 — the 30
-    /// `Status::Corruption` calls plus 3 `Reporter::Corruption`. A regression that
-    /// silently drops the qualified ones shows up here as a collapse toward 3.
+    /// `cpp_finds_qualified_static_and_member_call_sites` above is the CI gate — it is
+    /// synthetic, always runs, and does fail if the `qualified_identifier` pattern is
+    /// removed. This adds the same assurance against a real codebase, where shapes a
+    /// hand-written fixture omits actually occur. Upstream v0.9.0 reports 3 call sites
+    /// for `Corruption` in leveldb; with qualified statics detected it reports 33 — the
+    /// 30 `Status::Corruption` calls plus 3 `Reporter::Corruption` — so a regression
+    /// that drops the qualified ones collapses the number back toward 3.
     ///
-    /// Skipped unless the benchmark fixture is present, so CI (which does not clone it)
-    /// stays green. Populate it with:
-    ///   `python benchmark/fixtures/setup_repos.py --repos leveldb`
+    /// Be clear about its reach: this **does not run in CI**, which never clones the
+    /// fixture, and a silent skip is indistinguishable from a pass in the default test
+    /// output. Treat it as a local pre-release check, not protection. It is also
+    /// deliberately not the benchmark's job — the `leveldb_corruption_callers` task
+    /// covers the same ground but the agent picks its own route, taking the callers path
+    /// in roughly 5 runs of 8 even when tilth is its only tool, which makes it useless
+    /// as a gate.
     ///
-    /// This exists because the benchmark task covering the same ground is stochastic:
-    /// the agent picks its own route, and measurement showed it uses the callers search
-    /// in only about 5 runs out of 8 even when tilth is its only tool. Route choice
-    /// makes that a poor gate; this is the gate.
+    /// Populate the fixture with
+    /// `python benchmark/fixtures/setup_repos.py --repos leveldb`, or point
+    /// `TILTH_BENCH_REPOS` at an existing clone's parent directory.
     #[test]
     fn cpp_qualified_static_callers_on_real_fixture() {
         let Some(repo) = leveldb_fixture() else {
-            eprintln!("skipping: leveldb benchmark fixture not present");
+            eprintln!(
+                "skipping cpp_qualified_static_callers_on_real_fixture: leveldb fixture \
+                 not found (see the test's doc comment)"
+            );
             return;
         };
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let out = search_callers_expanded("Corruption", &repo, &bloom, 0, None, None, true)
+        // `full = false`: the path agents actually take. The header count is `total`,
+        // computed before the display cap, so it reads 33 either way — but there is no
+        // reason to exercise the rarer branch.
+        let out = search_callers_expanded("Corruption", &repo, &bloom, 0, None, None, false)
             .expect("callers search on the leveldb fixture");
 
         let header = out.lines().next().unwrap_or_default();
@@ -851,17 +861,23 @@ mod tests {
 
     /// Path to the leveldb benchmark fixture, if it has been cloned.
     ///
-    /// `benchmark/config.py` sets `REPOS_DIR = /tmp/tilth_bench/repos`; on Windows that
-    /// literal path resolves against the current drive, so both spellings are probed.
-    /// Identified by a file it must contain, not by the directory existing, so a
-    /// half-finished clone skips rather than failing confusingly.
+    /// `benchmark/config.py` sets `REPOS_DIR = /tmp/tilth_bench/repos`. On Windows that
+    /// literal resolves against the *process's current drive*, so a checkout on `D:`
+    /// clones to `D:\tmp\…` and neither hardcoded spelling finds it — hence the
+    /// `TILTH_BENCH_REPOS` override, which takes the repos directory.
+    ///
+    /// Identified by a file it must contain rather than by the directory existing, so a
+    /// half-finished clone skips instead of failing confusingly.
     fn leveldb_fixture() -> Option<PathBuf> {
-        [
-            PathBuf::from(r"C:\tmp\tilth_bench\repos\leveldb"),
-            PathBuf::from("/tmp/tilth_bench/repos/leveldb"),
-        ]
-        .into_iter()
-        .find(|c| c.join("include/leveldb/status.h").is_file())
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(root) = std::env::var("TILTH_BENCH_REPOS") {
+            candidates.push(PathBuf::from(root).join("leveldb"));
+        }
+        candidates.push(PathBuf::from(r"C:\tmp\tilth_bench\repos\leveldb"));
+        candidates.push(PathBuf::from("/tmp/tilth_bench/repos/leveldb"));
+        candidates
+            .into_iter()
+            .find(|c| c.join("include/leveldb/status.h").is_file())
     }
 
     /// Regression test: when there are more than MAX_MATCHES (10) hop-1 call

@@ -149,7 +149,11 @@ Results written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each
 
 Key metric: **cost per correct answer** = total_spend / correct_count. This is the expected cost under retry (geometric model: `avg_cost / accuracy`).
 
-Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`, `leveldb_corruption_callers`.
+That model assumes `correct` measures the answer. For the three `leveldb_*` tasks it does not: they declare `requires_tool_use`, so `correct` means answer **and** intended route, and a right answer reached with grep is reported false. Use `answer_correct` for cost-per-correct and for any baseline comparison on those tasks. See "Tasks that guard a specific tilth path" in `benchmark/README.md`.
+
+Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`. Prefer these three for instruction work — `leveldb_corruption_callers` is hard too, but its route requirement makes it fail on route choice in roughly 3 runs of 8, which is noise you don't want when measuring a prompt change.
+
+The harness has unit tests: `python -m unittest discover -s benchmark -p 'test_*.py'`.
 
 ## MCP instructions
 

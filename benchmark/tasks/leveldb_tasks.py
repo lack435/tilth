@@ -65,7 +65,13 @@ class LevelDBStatusTypeTask(Task):
         # Type resolution is the path under test, reachable through either a
         # structural symbol search or grok. Reading the header with tilth_read alone
         # does not exercise it — that is just `cat`.
-        return ["mcp__tilth__tilth_grok|mcp__tilth__tilth_search"]
+        #
+        # `kind!=content` matters: a bare tilth_search requirement is satisfied by
+        # `kind="content"`, which is a ripgrep literal search that touches no C++ AST
+        # code at all. Stated negatively rather than as `kind=symbol` because symbol is
+        # the default and the argument is usually omitted, so the positive form would
+        # fail on exactly the calls it means to accept.
+        return ["mcp__tilth__tilth_grok|mcp__tilth__tilth_search:kind!=content"]
 
     @property
     def prompt(self) -> str:
@@ -123,11 +129,15 @@ class LevelDBCorruptionCallersTask(Task):
     A task that never enters the code path it guards is not a guard.
 
     So the prompt asks for a repo-wide survey of the call sites before narrowing
-    to the three graded files. That phrasing is load-bearing and was measured:
-    with it, every run that got past the first rep used `kind="callers"`, where
-    the pinned-files-only phrasing never did. The survey is not itself graded —
-    see `ground_truth` — it exists to steer the route. `requires_tool_use` is
-    what actually enforces that the route was taken.
+    to the three graded files. That phrasing is load-bearing and was measured: of
+    six runs under the pinned-files-only phrasing, *none* used `kind="callers"` or
+    grok; of eight runs with the survey, five reached the caller-detection path
+    (four via `kind="callers"`, one via grok). It costs roughly 40% more turns.
+    Route adherence is therefore better but still not reliable, which is why the
+    deterministic check lives in a Rust test
+    (`cpp_qualified_static_callers_on_real_fixture`) rather than here. The survey
+    is not itself graded — see `ground_truth`. `requires_tool_use` does not force
+    the route; it makes a run that skipped it stop counting as coverage.
 
     The enclosing-function names alone are a weak signal — `ReportCorruption` is
     also declared at db/log_reader.h:85 and every name appears in a plain outline
@@ -192,14 +202,19 @@ class LevelDBCorruptionCallersTask(Task):
         # "missing files" (db_impl.cc:358, snprintf'd into the buf passed at
         # :360 inside DBImpl::Recover — the site the scope names miss).
         # Deliberately no repo-wide count here, though the prompt asks for the survey.
-        # A count is not gradeable through tilth: the callers view caps at 10 matches,
-        # so the 30 `Status::Corruption` calls across 12 files cannot be tallied from
-        # its output. Measured — both `tilth_forced` runs used `kind="callers"` as
-        # intended and still answered "6 files", while hybrid runs answered 12 because
-        # they had grep. Grading a count therefore penalises using tilth, which is
-        # backwards. The survey stays in the prompt because it demonstrably steers the
-        # agent onto the callers path (see the class docstring); the *graded* facts are
-        # the per-file details, which are stable at the pinned commit.
+        #
+        # Note what is and is not obtainable. The callers *total* IS printed in the
+        # header before the display cap, so "33 call sites" is readable — that is what
+        # the Rust fixture test asserts. What cannot be derived is the number of
+        # distinct *files* (only 10 call-site blocks are shown) or the qualification-
+        # filtered count of 30 (the header's 33 includes 3 unrelated
+        # `Reporter::Corruption` calls, and tilth cannot filter callers by qualifier).
+        #
+        # Measured: both `tilth_forced` runs used `kind="callers"` as intended and still
+        # answered "6 files", while hybrid runs answered 12 because they had grep. So
+        # grading a count would penalise using tilth. The survey stays in the prompt
+        # because it steers the route (see the class docstring); the *graded* facts are
+        # the per-file details, unchanged from when this task was introduced.
         return GroundTruth(
             required_strings=[
                 "kCorruption",

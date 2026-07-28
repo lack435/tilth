@@ -185,10 +185,27 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
                 ))
 
             elif item_type == "mcp_tool_call":
+                # codex reports `server` and `tool` separately, with `tool` being the
+                # bare name ("tilth_search"); Claude Code reports one flattened name
+                # ("mcp__tilth__tilth_search"). Normalise to the flattened form so a
+                # tool is identified the same way whichever runner produced the row.
+                #
+                # Without this, per-runner `tool_calls` breakdowns use different keys
+                # for the same tool — and `Task.requires_tool_use`, whose entries are
+                # written in the flattened form, could never be satisfied by a codex
+                # run, silently failing every such task regardless of behaviour.
                 tool_name = item.get("tool", "unknown")
+                server = item.get("server")
+                if server and not tool_name.startswith("mcp__"):
+                    tool_name = f"mcp__{server}__{tool_name}"
+                # `arguments` should be an object; guard so a string payload degrades to
+                # "no arguments" rather than breaking argument matching downstream.
+                arguments = item.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    arguments = {}
                 tool_calls.append(ToolCall(
                     name=tool_name,
-                    input=item.get("arguments", {}),
+                    input=arguments,
                     tool_use_id=item_id,
                     turn_index=turn_idx,
                 ))
