@@ -23,9 +23,16 @@ const FULL_MAX_MATCHES: usize = 100;
 // threshold (`BATCH_EARLY_QUIT = 50`). That made results **non-deterministic**: the
 // walk is parallel, the counter is only checked at the start of each file callback,
 // and each in-flight file can add many matches, so how far the walk got before
-// quitting depended on thread scheduling. Five identical runs over leveldb returned
-// 52, 59, 70, 94, 114 and 128 call sites for `Slice`; symbols whose true count sat
-// under the threshold were stable, which is exactly the signature.
+// quitting depended on thread scheduling.
+//
+// Two measurements, both six identical consecutive runs:
+//
+//   175k-file C++ tree, one hot symbol   53, 69, 55, 52, 53, 53   true count 9581
+//   leveldb, `Slice`                     52, 59, 70, 94, 114, 128 true count  203
+//
+// So it was undercounting as well as varying. Symbols whose true count sat under the
+// threshold were perfectly stable, which is exactly the signature of a count cutoff
+// and not of file ordering — glob order was never the variable here.
 //
 // It stayed invisible for a long time because a language whose call sites tilth
 // could not resolve never reached 50 matches in the first place. Making C++
@@ -37,12 +44,18 @@ const FULL_MAX_MATCHES: usize = 100;
 // a fully collected and ranked set. Work is still bounded per file by the size gate
 // and bloom pre-check in `bloom_walk::read_with_bloom_check`.
 //
-// The cost is real and worth knowing. On a 175k-file C++ tree, one hot-symbol query
-// went from ~0.1s returning 52–69 sites (varying) to ~9.5s returning 9581 every time.
-// That is inside the 90s request timeout, and the walk is what makes the answer true,
-// but it does mean a hot symbol on a very large tree is a multi-second call. The
-// resident cost at that scale is dominated by `BloomFilterCache`, which holds one
-// filter per code file walked and is currently unbounded.
+// The cost is real and worth knowing. On the 175k-file tree above, that query went
+// from ~0.1s to ~9.5s, and now returns 9581 every time. That is inside the 90s
+// request timeout, and the walk is what makes the answer true, but a hot symbol on a
+// very large tree is now a multi-second call — and `search_callers_multi_expanded`
+// runs one such walk per target plus a second hop each, so a 5-target query is a
+// multiple of it. Peak RSS at that scale is dominated by `BloomFilterCache`, which
+// holds one filter per code file walked and is currently unbounded.
+//
+// Not fixed here: `search::symbol` and `search::content` still gate their parallel
+// walks on a shared count (`EARLY_QUIT_THRESHOLD_DEFINITIONS` and friends), so the
+// same class of instability remains on the most-used search paths. Removing it there
+// costs a full walk on every `tilth_search`, which needs its own measurement.
 
 /// A single caller match — a call site of a target symbol.
 ///
@@ -50,8 +63,8 @@ const FULL_MAX_MATCHES: usize = 100;
 /// file so `expand` would not re-read it, which was free while the walk stopped at ~50
 /// matches. Now that the walk completes, that turned into every matched file in the
 /// repository staying resident: on a 175k-file C++ tree a single hot-symbol query peaked
-/// at 411 MB. At most `expand` matches (≤10) are ever expanded, so the survivors re-read
-/// their own file instead.
+/// at 410 MB, of which ~73 MB was this field. At most `expand` matches (≤10) are ever
+/// expanded, so the survivors re-read their own file instead.
 #[derive(Debug)]
 pub struct CallerMatch {
     pub path: PathBuf,
@@ -397,8 +410,17 @@ fn write_caller_bucket(
                     continue;
                 };
                 let lines: Vec<&str> = file_content.lines().collect();
+                // `caller_range` came from the content read during the walk, which on a
+                // large tree can be seconds earlier. If the file shrank in between — a
+                // formatter, a code generator, a branch switch, an editor save — the
+                // range no longer fits, and clamping only `end` leaves `start > end`,
+                // which panics on the slice below. Skip the block instead: the header
+                // and call text are already written, so nothing else is lost.
                 let start_idx = (start as usize).saturating_sub(1);
                 let end_idx = (end as usize).min(lines.len());
+                if start_idx >= end_idx {
+                    continue;
+                }
 
                 output.push('\n');
                 output.push_str("```\n");
@@ -448,7 +470,7 @@ fn write_second_hop_impact(
         .map(|c| (c.path.clone(), c.line))
         .collect();
 
-    let hop2_filtered: Vec<_> = hop2
+    let mut hop2_filtered: Vec<_> = hop2
         .into_iter()
         .filter(|(_, m)| !hop1_locations.contains(&(m.path.clone(), m.line)))
         .collect();
@@ -456,6 +478,15 @@ fn write_second_hop_impact(
     if hop2_filtered.is_empty() {
         return;
     }
+
+    // Total order before the dedup-and-cap loop below. `find_callers_batch` returns
+    // matches in walk order, which is thread-scheduling order — so without this the
+    // `IMPACT_MAX_RESULTS` cap kept a different 15 of them on each run, and the dedup
+    // kept a different representative per (function, file). Removing the walk's early
+    // quit made the *total* stable; it did nothing for this rendering, and an unranked
+    // truncation of an unordered vector is the same class of bug.
+    hop2_filtered
+        .sort_by(|(via_a, a), (via_b, b)| (&a.path, a.line, via_a).cmp(&(&b.path, b.line, via_b)));
 
     output.push_str("\n-- impact (2nd hop) --\n");
 
@@ -512,9 +543,17 @@ fn write_second_hop_impact(
 /// `write_second_hop_impact` helpers the single-target path uses, so a
 /// bucket here is byte-identical to what a lone `search_callers_expanded`
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
-/// MED — header shape parity). The batch walk's early-quit budget is scaled
-/// by target count so a hit-rich earlier target cannot starve a later,
-/// rarer one (PR #138 review: MED — budget scaling).
+/// MED — header shape parity).
+///
+/// The walk-wide early-quit budget this used to scale by target count is gone: it was
+/// the source of the non-determinism described above `find_callers_batch`'s constants,
+/// and starvation of a later target by a hit-rich earlier one is not possible once
+/// every candidate file is visited.
+///
+/// Cost note: `write_second_hop_impact` runs inside the per-target loop, so a 5-target
+/// query is one primary walk plus up to five second-hop walks, each now a full
+/// traversal. On a very large tree that is the multiple of the single-walk cost quoted
+/// above — bounded by the request timeout, not by a match count.
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -743,37 +782,52 @@ mod tests {
         }
     }
 
+    /// Files in the fixture below. A count-based cutoff quits the walk *between* files,
+    /// so what defeats it is a fixture with far more files than the cutoff admits — not
+    /// merely more matches. A first version of these tests used 12 files holding 60
+    /// matches: past the old threshold on matches, but the walker's threads consumed all
+    /// 12 before the shared counter was ever read, so the exact-total assertion stayed
+    /// green with the bug reintroduced (verified 12/12 runs). 400 files is comfortably
+    /// past the point where that can happen, and still writes in well under a second.
+    const DETERMINISM_FIXTURE_FILES: usize = 400;
+    const DETERMINISM_FIXTURE_CALLS_PER_FILE: usize = 2;
+
+    /// Write `DETERMINISM_FIXTURE_FILES` files each calling `target_fn`, and return the
+    /// total number of call sites in the tree.
+    fn write_determinism_fixture(dir: &Path) -> usize {
+        for f in 0..DETERMINISM_FIXTURE_FILES {
+            let mut src = String::from("fn target_fn() {}\n");
+            for i in 0..DETERMINISM_FIXTURE_CALLS_PER_FILE {
+                src.push_str(&format!("fn caller_{f}_{i}() {{ target_fn(); }}\n"));
+            }
+            std::fs::write(dir.join(format!("m{f}.rs")), src).unwrap();
+        }
+        DETERMINISM_FIXTURE_FILES * DETERMINISM_FIXTURE_CALLS_PER_FILE
+    }
+
     /// The caller walk must report *every* call site, not however many a shared counter
     /// happened to admit before a parallel walk noticed it had crossed a threshold.
     ///
-    /// The old `BATCH_EARLY_QUIT = 50` cutoff made this non-deterministic: six identical
-    /// runs over leveldb returned 52, 59, 70, 94, 114 and 128 sites for `Slice`, whose
-    /// true count is 203 — so it was both unstable and undercounting by up to 4×. Symbols
-    /// under the threshold were stable, which is what made the bug easy to miss.
+    /// The old `BATCH_EARLY_QUIT = 50` cutoff made this non-deterministic. Six identical
+    /// runs against a 175k-file C++ tree returned 53, 69, 55, 52, 53 and 53 sites for one
+    /// hot symbol whose true count is 9581; six runs over leveldb returned 52, 59, 70, 94,
+    /// 114 and 128 for `Slice`, true count 203. Both unstable and undercounting. Symbols
+    /// whose true count sat under the threshold were perfectly stable, which is what made
+    /// the bug easy to miss for so long.
     ///
-    /// 60 sites here is deliberately just over that old threshold. The assertion is on an
-    /// exact total, so a reintroduced cutoff fails rather than merely varying.
+    /// The assertion is on an exact total, so a reintroduced cutoff fails outright rather
+    /// than merely varying.
     #[test]
     fn callers_reports_every_call_site_past_the_old_early_quit_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        // 12 files x 5 calls = 60, spread across files so a parallel walk has several in
-        // flight at once — the condition under which the old cutoff overshot unpredictably.
-        let files = 12;
-        let per_file = 5;
-        for f in 0..files {
-            let mut src = String::from("fn target_fn() {}\n");
-            for i in 0..per_file {
-                src.push_str(&format!("fn caller_{f}_{i}() {{ target_fn(); }}\n"));
-            }
-            std::fs::write(dir.path().join(format!("m{f}.rs")), src).unwrap();
-        }
+        let expected = write_determinism_fixture(dir.path());
 
         let targets: HashSet<String> = std::iter::once("target_fn".to_string()).collect();
         let found = find_callers_batch(&targets, dir.path(), &bloom, None).unwrap();
         assert_eq!(
             found.len(),
-            files * per_file,
+            expected,
             "expected every call site, got {}",
             found.len()
         );
@@ -782,7 +836,7 @@ mod tests {
         let out =
             search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false).unwrap();
         assert!(
-            out.contains(&format!("{} call sites", files * per_file)),
+            out.contains(&format!("{expected} call sites")),
             "header must report the true total: {}",
             out.lines().next().unwrap_or_default()
         );
@@ -794,13 +848,7 @@ mod tests {
     fn callers_result_is_stable_across_repeated_runs() {
         let dir = tempfile::tempdir().unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        for f in 0..12 {
-            let mut src = String::from("fn target_fn() {}\n");
-            for i in 0..5 {
-                src.push_str(&format!("fn caller_{f}_{i}() {{ target_fn(); }}\n"));
-            }
-            std::fs::write(dir.path().join(format!("m{f}.rs")), src).unwrap();
-        }
+        write_determinism_fixture(dir.path());
         let targets: HashSet<String> = std::iter::once("target_fn".to_string()).collect();
 
         let counts: Vec<usize> = (0..5)
@@ -813,6 +861,91 @@ mod tests {
         assert!(
             counts.windows(2).all(|w| w[0] == w[1]),
             "caller counts must not vary run to run, got {counts:?}"
+        );
+    }
+
+    /// The *rendered* second-hop block must be stable too, not just the walk's total.
+    ///
+    /// `write_second_hop_impact` dedups and caps at `IMPACT_MAX_RESULTS`, and it used to do
+    /// that over `find_callers_batch`'s raw vector — which is in walk order, i.e. thread
+    /// order. With more than 15 unique hop-2 callers, identical runs rendered a different
+    /// 15 of them (measured: 5 distinct renderings in 6 runs). Fixing the walk's total did
+    /// not fix this; an unranked truncation of an unordered vector is the same bug.
+    #[test]
+    fn second_hop_impact_block_is_stable_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        // 2 hop-1 callers keeps us under IMPACT_FANOUT_THRESHOLD; 40 hop-2 callers is well
+        // past IMPACT_MAX_RESULTS, so the cap has to choose.
+        std::fs::write(
+            dir.path().join("target.rs"),
+            "fn target_fn() {}\nfn hop1_a() { target_fn(); }\nfn hop1_b() { target_fn(); }\n",
+        )
+        .unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                dir.path().join(format!("h{i}.rs")),
+                format!("fn hop2_{i}() {{ hop1_a(); }}\n"),
+            )
+            .unwrap();
+        }
+
+        let renders: Vec<String> = (0..6)
+            .map(|_| {
+                let out =
+                    search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false)
+                        .unwrap();
+                out.split("-- impact (2nd hop) --")
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !renders[0].trim().is_empty(),
+            "fixture must produce a 2nd-hop block"
+        );
+        assert!(
+            renders.windows(2).all(|w| w[0] == w[1]),
+            "2nd-hop block must not vary run to run:\n{renders:#?}"
+        );
+    }
+
+    /// `caller_range` is computed from the content read during the walk; expansion re-reads
+    /// the file, which on a large tree is seconds later. A file that shrank in between
+    /// leaves `start > end` after `end` alone is clamped, which panicked on the slice.
+    #[test]
+    fn expand_does_not_panic_when_the_file_shrank_after_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.rs");
+        let mut src = String::from("fn target_fn() {}\n");
+        for i in 0..30 {
+            src.push_str(&format!("fn pad_{i}() {{ let _ = {i}; }}\n"));
+        }
+        src.push_str("fn late_caller() {\n    target_fn();\n}\n");
+        std::fs::write(&path, &src).unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("target_fn".to_string()).collect();
+        let mut raw = find_callers_batch(&targets, dir.path(), &bloom, None).unwrap();
+        assert!(!raw.is_empty(), "fixture must produce a call site");
+        let callers: Vec<CallerMatch> = raw.drain(..).map(|(_, m)| m).collect();
+
+        // Truncate the file so every recorded range is now out of bounds.
+        std::fs::write(&path, "fn target_fn() {}\n").unwrap();
+
+        let mut out = String::new();
+        write_caller_bucket(
+            &mut out,
+            "target_fn",
+            dir.path(),
+            callers.len(),
+            &callers,
+            5,
+        );
+        assert!(
+            out.contains("target_fn"),
+            "header and call text must still render: {out}"
         );
     }
 

@@ -593,16 +593,54 @@ public:
             !outline.contains("BODY_MACRO"),
             "a macro invocation must not be outlined as a member:\n{outline}"
         );
-        // The constructor shares the macro's exact node shape and must survive.
-        assert!(
-            outline.contains("Widget"),
-            "the constructor must still be outlined:\n{outline}"
+        // Assert on the *rendered member line*, not on the bare name. `contains("Widget")`
+        // is satisfied by the `class Widget` header the outline always emits, so it stayed
+        // green under a mutation that dropped every C++ constructor — a review found
+        // exactly that. `fn Widget` can only come from the member entry.
+        assert_eq!(
+            outline.matches("fn Widget").count(),
+            2,
+            "both constructors must be outlined:\n{outline}"
         );
         assert!(
-            outline.contains("~Widget"),
+            outline.contains("fn ~Widget"),
             "the destructor must still be outlined:\n{outline}"
         );
         assert!(outline.contains("fn Work"), "actual:\n{outline}");
+    }
+
+    /// A constructor is recognised by comparing its name to the enclosing type's. That
+    /// comparison used the whole text of the specifier's `name` node, which is not always
+    /// a bare identifier — so any class whose name is a `template_type` or a
+    /// `qualified_identifier` had its constructor misread as a macro and dropped. The loss
+    /// reached past outlines: `get_outline_entries` also feeds deps' exported symbols and
+    /// blast radius, so an edit to such a constructor produced no blast radius at all.
+    #[test]
+    fn cpp_outline_keeps_constructors_of_specialized_and_qualified_classes() {
+        for (src, ctor) in [
+            (
+                "template <> class Box<int> { public: Box(); void Put(int); };\n",
+                "fn Box",
+            ),
+            (
+                "template <typename T> class Box<T*> { public: Box(); void Put(T* p); };\n",
+                "fn Box",
+            ),
+            (
+                "class Outer::Inner { public: Inner(); void Go(); };\n",
+                "fn Inner",
+            ),
+            (
+                "namespace n { class Deep { public: Deep(); void Go(); }; }\n",
+                "fn Deep",
+            ),
+        ] {
+            let outline = outline(src, Lang::Cpp, 1000);
+            assert!(
+                outline.contains(ctor),
+                "constructor dropped from `{src}`:\n{outline}"
+            );
+        }
     }
 
     /// A *braced* PHP namespace is a Module entry whose body is a
