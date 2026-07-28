@@ -780,6 +780,56 @@ mod tests {
         );
     }
 
+    /// End-to-end for the include-root case, which is the common layout: a header
+    /// including `"lib/other.h"` where that path is relative to an include root one level
+    /// up. Such includes previously resolved to nothing and were therefore reported as
+    /// *external* — a project header misfiled as a third-party dependency, with local
+    /// deps stuck at zero.
+    #[test]
+    fn cpp_include_relative_to_an_include_root_is_local_not_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("include/lib")).unwrap();
+        std::fs::write(
+            root.join("include/lib/status.h"),
+            "struct Status { int V; };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("include/lib/env.h"),
+            "#pragma once\n\
+             #include <vector>\n\
+             #include \"lib/status.h\"\n\
+             class Env { public: void Sync(); };\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("include/lib/env.h"), root, &bloom).unwrap();
+
+        assert!(
+            result
+                .uses_local
+                .iter()
+                .any(|d| d.path.ends_with("status.h")),
+            "an include-root-relative header must be local, got local={:?} external={:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>(),
+            result.uses_external
+        );
+        assert!(
+            !result.uses_external.iter().any(|e| e.contains("status.h")),
+            "it must not also be reported as external, got {:?}",
+            result.uses_external
+        );
+        // The genuine system header is still external.
+        assert!(result.uses_external.iter().any(|e| e == "vector"));
+    }
+
     /// The fallback above is C/C++-only. Other languages' relative imports normally do
     /// resolve on disk, so applying it there would reclassify genuine resolution
     /// failures as external dependencies.

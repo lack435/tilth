@@ -708,7 +708,45 @@ pub(crate) fn elixir_definition_weight(node: tree_sitter::Node, lines: &[&str]) 
     }
 }
 
+/// Semantic weight for a definition *node*, for the cases where the kind string alone
+/// is not enough to say how a definition should rank.
+///
+/// Two C/C++ kinds each cover two very different things, and weighting them by kind
+/// forced one answer on both:
+///
+///   * `field_declaration` is `void Work();` *and* `int Count;`. The first is a method
+///     declaration whose real definition is usually out-of-line at 100, so 70 keeps it
+///     just below. The second is a data member — a variable — and weighting it like a
+///     near-type meant a common member name competed with the type and function
+///     definitions in a definitions-first view. 40 is the plain-variable tier, and it
+///     also falls under `stratum_for_display`'s 60 cutoff, so a data member sorts below
+///     real definitions and is dropped before one when the match cap bites.
+///   * `declaration` is a macro-misparsed class head (a type, 100) *or* an out-of-line
+///     static member definition (data, 80 — the tier `static_item` and
+///     `const_declaration` use in other languages).
+pub(crate) fn definition_weight_for(node: tree_sitter::Node) -> u16 {
+    match node.kind() {
+        "field_declaration" => {
+            if declarator_chain_has_function(node) {
+                70
+            } else {
+                40
+            }
+        }
+        "declaration" => {
+            if is_cpp_misparsed_class_head(node) {
+                100
+            } else {
+                80
+            }
+        }
+        kind => definition_weight(kind),
+    }
+}
+
 /// Semantic weight for definition kinds. Primary declarations rank highest.
+///
+/// Prefer `definition_weight_for` when a node is available — two C/C++ kinds need it.
 pub(crate) fn definition_weight(kind: &str) -> u16 {
     match kind {
         "function_declaration"
@@ -810,6 +848,67 @@ mod tests {
         // A C++ member *declaration* sits below the out-of-line definition (100)
         // that usually accompanies it, but above the doc-heading tier (30).
         assert_eq!(definition_weight("field_declaration"), 70);
+    }
+
+    /// `field_declaration` and `declaration` each cover two different things, so their
+    /// weight cannot come from the kind string alone. A data member weighted like a
+    /// near-type crowded real type and function definitions out of a definitions-first
+    /// view whenever a common member name was searched.
+    #[test]
+    fn definition_weight_for_separates_members_from_methods() {
+        let src = "class Holder {\npublic:\n\tvoid Work();\n\tint Count;\n};\n";
+        let tree = parse(src, Lang::Cpp);
+        let mut cursor = tree.root_node().walk();
+        let mut fields = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            if n.kind() == "field_declaration" {
+                fields.push(n);
+            }
+            stack.extend(n.children(&mut cursor));
+        }
+        fields.sort_by_key(|n| n.start_position().row);
+        assert_eq!(fields.len(), 2, "expected the method and the data member");
+
+        // `void Work();` — a method declaration. Its real definition is usually
+        // out-of-line at 100, so this sits just below.
+        assert_eq!(definition_weight_for(fields[0]), 70);
+        // `int Count;` — a data member, weighted as the variable it is. Below
+        // `stratum_for_display`'s 60 cutoff, so it never outranks a real definition.
+        assert_eq!(definition_weight_for(fields[1]), 40);
+        assert!(definition_weight_for(fields[1]) < 60);
+    }
+
+    #[test]
+    fn definition_weight_for_separates_class_heads_from_static_members() {
+        let head = "class API Widget { public: void W(); };\n";
+        let tree = parse(head, Lang::Cpp);
+        let node = tree.root_node().named_child(0).expect("top-level node");
+        assert_eq!(
+            definition_weight_for(node),
+            100,
+            "a macro-misparsed class head is a type definition"
+        );
+
+        let member = "int Widget::sCount = 0;\n";
+        let tree = parse(member, Lang::Cpp);
+        let node = tree.root_node().named_child(0).expect("declaration");
+        assert_eq!(
+            definition_weight_for(node),
+            80,
+            "an out-of-line static member is data — the tier static_item uses"
+        );
+    }
+
+    #[test]
+    fn definition_weight_for_falls_through_to_the_kind_table() {
+        let src = "class Widget { int x; };\n";
+        let tree = parse(src, Lang::Cpp);
+        let node = find_by_kind(tree.root_node(), "class_specifier");
+        assert_eq!(
+            definition_weight_for(node),
+            definition_weight("class_specifier")
+        );
     }
 
     /// The kind strings in `DEFINITION_KINDS` are matched against every grammar

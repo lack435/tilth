@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use super::file_metadata;
 use crate::lang::treesitter::{
-    definition_weight, elixir_definition_weight, extract_definition_name,
+    definition_weight_for, elixir_definition_weight, extract_definition_name,
     extract_elixir_definition_name, extract_impl_trait, extract_impl_type,
     extract_implemented_interfaces, is_definition_node, is_elixir_definition,
 };
@@ -397,7 +397,7 @@ fn walk_for_definitions(
                         node.end_position().row as u32 + 1,
                     )),
                     def_name: Some(query.to_string()),
-                    def_weight: definition_weight(node.kind()),
+                    def_weight: definition_weight_for(node),
                     impl_target: None,
                 });
             }
@@ -1583,6 +1583,45 @@ using MyAlias = float;
     fn cpp_member_template_resolves() {
         let src = "class Holder {\npublic:\ntemplate <typename T>\nvoid Apply(T V);\n};\n";
         assert_eq!(cpp_find(src, "Apply").len(), 1);
+    }
+
+    /// Registering C++ member declarations as definitions made member variables compete
+    /// with real type definitions: searching a name that is both a data member somewhere
+    /// and a class elsewhere could lead with the member. The class must win.
+    #[test]
+    fn cpp_data_member_ranks_below_a_real_type_of_the_same_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path();
+        std::fs::write(
+            scope.join("Component.h"),
+            "class HeroComponent\n{\nprivate:\n\tint AbilityLevel;\n};\n",
+        )
+        .expect("write");
+        std::fs::write(
+            scope.join("AbilityLevel.h"),
+            "class AbilityLevel { public: int Value; };\n",
+        )
+        .expect("write");
+
+        let result = search("AbilityLevel", scope, None, None, false).expect("search");
+        let top = result.matches.first().expect("a match");
+        assert!(
+            top.path.ends_with("AbilityLevel.h"),
+            "the class must outrank the same-named data member, got {:?}",
+            result
+                .matches
+                .iter()
+                .map(|m| (m.path.file_name(), m.def_weight))
+                .collect::<Vec<_>>()
+        );
+        // The member is still findable — just ranked below.
+        assert!(
+            result
+                .matches
+                .iter()
+                .any(|m| m.path.ends_with("Component.h") && m.is_definition),
+            "the data member should still be reported as a definition"
+        );
     }
 
     #[test]
