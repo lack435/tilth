@@ -162,7 +162,12 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "alias_declaration" => "type",
         "enum_item" | "enum_declaration" | "enum_specifier" => "enum",
         "template_declaration" => "template",
-        "lexical_declaration" | "variable_declaration" => "variable",
+        // A C/C++ `declaration` reaches here only as an out-of-line static member
+        // definition (`int Widget::sCount = 0;`) or a member template — a
+        // macro-misparsed class head is caught by the `cpp_misparsed_class_name` check
+        // above. Without it the node fell through to `_ => "definition"`, rendering
+        // `in definition sCount`.
+        "declaration" | "lexical_declaration" | "variable_declaration" => "variable",
         "const_item" | "const_declaration" => "const",
         "static_item" => "static",
         "property_declaration" => "property",

@@ -20,6 +20,13 @@ const MAX_EXPORTED_SYMBOLS: usize = 25;
 /// Maximum number of dependents to show before truncation.
 const MAX_DEPENDENTS: usize = 15;
 
+/// Maximum number of external dependencies to list before truncating.
+///
+/// The list was unbounded, which was tolerable while it only held `<system>` headers.
+/// Reporting unresolvable quoted includes as external enlarged the population — a
+/// framework header can pull in dozens — so it needs the same bound `used_by` has.
+const MAX_EXTERNAL_DEPS: usize = 20;
+
 /// Result of a full dependency analysis for a single file.
 pub struct DepsResult {
     pub target: PathBuf,
@@ -171,13 +178,14 @@ pub fn analyze_deps(
         // Scoped to C/C++ deliberately. Other languages' relative imports normally do
         // resolve on disk, so applying the same fallback there would reclassify genuine
         // resolution failures as external deps.
-        let unresolved_local = matches!(lang, crate::types::Lang::C | crate::types::Lang::Cpp)
-            && !is_external(&source, lang)
+        let external = is_external(&source, lang);
+        let unresolved_local = !external
+            && matches!(lang, crate::types::Lang::C | crate::types::Lang::Cpp)
             && path.parent().is_none_or(|dir| {
                 crate::read::imports::resolve_import_to_file(dir, &source, lang).is_none()
             });
 
-        if (!is_external(&source, lang) && !unresolved_local) || is_stdlib(&source, lang) {
+        if (!external && !unresolved_local) || is_stdlib(&source, lang) {
             continue;
         }
         // C/C++ `extract_import_source` deliberately keeps the `<…>` / `"…"`
@@ -533,8 +541,15 @@ fn format_uses_external(externals: &[String]) -> String {
         return String::new();
     }
     let mut out = String::from("## Uses (external)");
-    for ext in externals {
+    for ext in externals.iter().take(MAX_EXTERNAL_DEPS) {
         let _ = write!(out, "\n{ext}");
+    }
+    if externals.len() > MAX_EXTERNAL_DEPS {
+        let _ = write!(
+            out,
+            "\n... and {} more",
+            externals.len() - MAX_EXTERNAL_DEPS
+        );
     }
     out
 }

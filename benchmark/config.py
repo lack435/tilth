@@ -19,9 +19,15 @@ RUNNERS = {
     "o3": "codex",
 }
 
-# MCP config arguments for codex (tilth server)
+# MCP config arguments for codex (tilth server).
+#
+# Resolved from PATH, matching fixtures/tilth_mcp.json. The previous
+# f'{Path.home()}/.cargo/bin/tilth' had the same two problems as the config file: it
+# assumed the binary lives under the invoking user's cargo home, and it omitted the
+# `.exe` suffix, so on Windows the server never started and codex runs in `tilth`
+# mode silently measured baseline tooling.
 TILTH_MCP_CODEX_ARGS = [
-    "-c", f'mcp_servers.tilth.command="{Path.home()}/.cargo/bin/tilth"',
+    "-c", 'mcp_servers.tilth.command="tilth"',
     "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
 ]
 

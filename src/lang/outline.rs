@@ -1,6 +1,6 @@
 use crate::lang::treesitter::{
     c_declarator_name, cpp_misparsed_class_name, declarator_chain_has_function,
-    is_bodied_specifier, node_text_simple, SPECIFIER_KINDS,
+    is_bodied_specifier, is_named_bodied_specifier, node_text_simple, SPECIFIER_KINDS,
 };
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
@@ -110,12 +110,30 @@ pub(crate) fn walk_top_level(
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
+        // C/C++ conditional-compilation blocks are transparent. Platform guards are
+        // the dominant use of `#ifdef` in headers, so anything inside one — includes
+        // especially, but declarations too — was invisible in the outline while
+        // `tilth_deps` (which reads lines, not the AST) reported it, an outline/deps
+        // disagreement. Both branches of an `#if`/`#else` are surfaced: both exist in
+        // the source, and tilth does not evaluate the preprocessor.
+        if matches!(lang, Lang::C | Lang::Cpp) && is_preproc_conditional(child.kind()) {
+            entries.extend(walk_top_level(child, lines, lang));
+            continue;
+        }
         if let Some(entry) = node_to_entry(child, lines, lang, 0) {
             entries.push(entry);
         }
     }
 
     entries
+}
+
+/// True for the C/C++ conditional-compilation wrappers that hold ordinary declarations.
+fn is_preproc_conditional(kind: &str) -> bool {
+    matches!(
+        kind,
+        "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif" | "preproc_elifdef"
+    )
 }
 
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
@@ -213,7 +231,10 @@ fn node_to_entry(
         // recurses so the inner type renders as itself.
         "field_declaration" if matches!(lang, Lang::C | Lang::Cpp) => {
             if let Some(type_node) = node.child_by_field_name("type") {
-                if is_bodied_specifier(type_node) {
+                // Requires a *named* specifier: an anonymous one has a body but nothing
+                // to call it, so preferring it would replace a searchable identifier
+                // (`anonInst`) with `<anonymous>`.
+                if is_named_bodied_specifier(type_node) {
                     let mut inner = node_to_entry(type_node, lines, lang, depth)?;
                     inner.start_line = start_line;
                     return Some(inner);
@@ -241,7 +262,10 @@ fn node_to_entry(
             // arm above and keeps the outline consistent with symbol search, which
             // already finds the type here.
             if let Some(type_node) = node.child_by_field_name("type") {
-                if is_bodied_specifier(type_node) {
+                // Requires a *named* specifier: an anonymous one has a body but nothing
+                // to call it, so preferring it would replace a searchable identifier
+                // (`anonInst`) with `<anonymous>`.
+                if is_named_bodied_specifier(type_node) {
                     let mut inner = node_to_entry(type_node, lines, lang, depth)?;
                     inner.start_line = start_line;
                     return Some(inner);

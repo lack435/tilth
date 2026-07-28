@@ -333,6 +333,25 @@ Examples:
         if args.verbose:
             print(f"Cleaned repo: {repo_name}")
 
+    # Fail fast when a tilth mode is requested but no tilth binary is reachable.
+    #
+    # Without this the run completes and looks fine: the MCP server simply fails to
+    # start, the agent falls back to built-in tools, and every row is recorded under
+    # mode "tilth" while actually measuring baseline — silently invalid results that
+    # are indistinguishable from real ones except for a null `tilth_version`. Better
+    # to refuse than to emit numbers nobody can trust.
+    if any("tilth" in m for m in modes) and _tilth_version() is None:
+        print(
+            "ERROR: a tilth mode was requested but `tilth` is not runnable from PATH.\n"
+            "       The MCP server would fail to start and the run would silently\n"
+            "       measure baseline tooling instead.\n"
+            "       Install it with `cargo install --path .` from the repo root.",
+            file=sys.stderr,
+        )
+        # `sys.exit`, not `return`: `main()`'s value is discarded at the call site, so
+        # returning would let the run continue. Matches the other guards above.
+        sys.exit(1)
+
     # Create results directory
     RESULTS_DIR.mkdir(exist_ok=True)
 
