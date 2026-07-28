@@ -569,6 +569,42 @@ public:
         assert!(outline.contains("stdio.h"), "actual:\n{outline}");
     }
 
+    /// A bare macro invocation in a class body is shaped exactly like a constructor
+    /// declaration — a typeless `declaration` with a `function_declarator` — so outlining
+    /// it named the macro as a member of the class. That is worse than cosmetic: the name
+    /// became an "exported symbol" of the header, and `tilth_deps` then reported every
+    /// other file invoking the same macro as a dependent. Constructors and destructors
+    /// must still be outlined; only the name distinguishes them.
+    #[test]
+    fn cpp_outline_omits_macro_invocations_but_keeps_constructors() {
+        let cpp_code = "\
+class Widget
+{
+\tBODY_MACRO()
+public:
+\tWidget();
+\t~Widget();
+\texplicit Widget(int Times);
+\tvoid Work();
+};
+";
+        let outline = outline(cpp_code, Lang::Cpp, 1000);
+        assert!(
+            !outline.contains("BODY_MACRO"),
+            "a macro invocation must not be outlined as a member:\n{outline}"
+        );
+        // The constructor shares the macro's exact node shape and must survive.
+        assert!(
+            outline.contains("Widget"),
+            "the constructor must still be outlined:\n{outline}"
+        );
+        assert!(
+            outline.contains("~Widget"),
+            "the destructor must still be outlined:\n{outline}"
+        );
+        assert!(outline.contains("fn Work"), "actual:\n{outline}");
+    }
+
     /// A *braced* PHP namespace is a Module entry whose body is a
     /// `compound_statement` — the same kind a macro-misparsed C++ class body uses. When
     /// `collect_children`'s body finder matched that kind ungated, PHP namespace

@@ -212,13 +212,7 @@ pub fn analyze_deps(
 
     let mut used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
-        let raw_matches = find_callers_batch(
-            &symbols_set,
-            scope,
-            bloom,
-            None,
-            crate::search::callers::BATCH_EARLY_QUIT,
-        )?;
+        let raw_matches = find_callers_batch(&symbols_set, scope, bloom, None)?;
 
         // Group by file path
         let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
@@ -832,6 +826,64 @@ mod tests {
         );
         // The genuine system header is still external.
         assert!(result.uses_external.iter().any(|e| e == "vector"));
+    }
+
+    /// A code-generating framework's body macro must not become an exported symbol.
+    ///
+    /// `GENERATED_BODY()` in a class body is a typeless `declaration` — the same shape as
+    /// a constructor — so it was outlined as a member and became one of the header's
+    /// "exported symbols". `tilth_deps` then searched for call sites of it, and since
+    /// every such header invokes the same macro, reported files that never include the
+    /// header as dependents. On a real tree that is most of the project.
+    ///
+    /// The two class forms here are both needed to reproduce it: a cleanly-parsed class
+    /// exports the macro name as a symbol, while a class behind an export macro misparses
+    /// so the same text becomes a *call site* that matches it.
+    #[test]
+    fn cpp_framework_body_macro_does_not_create_false_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        // Parses cleanly -> would export `BODY_MACRO` as a symbol.
+        std::fs::write(
+            root.join("HeroComponent.h"),
+            "#pragma once\n\
+             ANNOTATE()\n\
+             class UHeroComponent : public UPawnComponent\n\
+             {\n\
+             \tBODY_MACRO()\n\
+             public:\n\
+             \tstatic const char* GetLogNameSafe(const Actor* Subject);\n\
+             };\n",
+        )
+        .unwrap();
+        // Behind an export macro -> misparses, so `BODY_MACRO()` here is a call site.
+        // It does not include the header above.
+        std::fs::write(
+            root.join("HudTypes.h"),
+            "#pragma once\n\
+             ANNOTATE()\n\
+             class MYLIB_API UHudTypes final : public UObject\n\
+             {\n\
+             \tBODY_MACRO()\n\
+             public:\n\
+             \tvoid Layout();\n\
+             };\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("HeroComponent.h"), root, &bloom).unwrap();
+
+        assert!(
+            result.used_by.is_empty(),
+            "no file includes this header, so it has no dependents; got {:?}",
+            result
+                .used_by
+                .iter()
+                .map(|d| (&d.path, &d.symbols))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Every resolvable include must be reported, however many there are.

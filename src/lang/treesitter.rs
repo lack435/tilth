@@ -377,6 +377,56 @@ fn first_identifier_child(node: tree_sitter::Node, lines: &[&str]) -> Option<Str
     found
 }
 
+/// True when a C/C++ `declaration` is really a macro invocation rather than a member.
+///
+/// A bare `GENERATED_BODY()` or `DECLARE_DELEGATE(...)` inside a class body parses as a
+/// `declaration` with a `function_declarator` and **no `type`** — which is exactly how a
+/// constructor or destructor parses too, since those have no return type either. The one
+/// thing that separates them is the name: a constructor is named for its class, a
+/// destructor is a `destructor_name`, and anything else with that shape is a macro.
+///
+/// This matters beyond cosmetics. Treated as a member, such a macro becomes an "exported
+/// symbol" of the header, and `tilth_deps` then reports every *other* file that invokes
+/// the same macro as a dependent — a code-generating C++ framework makes that every
+/// header in the project, none of which include the file.
+///
+/// Detection is on shape and the enclosing type's name only; no macro name is matched.
+pub(crate) fn is_cpp_macro_invocation(node: tree_sitter::Node, lines: &[&str]) -> bool {
+    if node.kind() != "declaration" || node.child_by_field_name("type").is_some() {
+        return false;
+    }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return false;
+    };
+    if declarator.kind() != "function_declarator" {
+        return false;
+    }
+    // A destructor is a member, and is unambiguous.
+    let inner = declarator.child_by_field_name("declarator");
+    if inner.is_some_and(|d| d.kind() == "destructor_name") {
+        return false;
+    }
+    let Some(name) = inner.and_then(|d| c_declarator_name(d, lines)) else {
+        return false;
+    };
+    // A constructor is named for the type that encloses it.
+    enclosing_type_name(node, lines).is_none_or(|ty| ty != name)
+}
+
+/// Name of the nearest enclosing C/C++ type specifier, if any.
+fn enclosing_type_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if SPECIFIER_KINDS.contains(&p.kind()) {
+            return p
+                .child_by_field_name("name")
+                .map(|n| node_text_simple(n, lines));
+        }
+        cur = p.parent();
+    }
+    None
+}
+
 /// True when `node` is a `declaration` for a member template inside a class body —
 /// `field_declaration_list` → `template_declaration` → `declaration`.
 fn is_cpp_member_template_declaration(node: tree_sitter::Node) -> bool {

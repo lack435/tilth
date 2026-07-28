@@ -1738,22 +1738,10 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.rs"),
-            callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers failed");
-        let toml_callers = callers::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.toml"),
-            callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers toml failed");
+        let rs_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.rs"))
+            .expect("callers failed");
+        let toml_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.toml"))
+            .expect("callers toml failed");
 
         assert!(
             !rs_callers.is_empty(),

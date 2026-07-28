@@ -1,6 +1,7 @@
 use crate::lang::treesitter::{
     c_declarator_name, cpp_misparsed_class_name, declarator_chain_has_function,
-    is_bodied_specifier, is_named_bodied_specifier, node_text_simple, SPECIFIER_KINDS,
+    is_bodied_specifier, is_cpp_macro_invocation, is_named_bodied_specifier, node_text_simple,
+    SPECIFIER_KINDS,
 };
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
@@ -254,6 +255,16 @@ fn node_to_entry(
         // body parses as statements rather than as a `field_declaration_list`.
         // Language-gated — `declaration` exists in the TS, JS, Java, C# and Kotlin
         // grammars too, where surfacing it would change those outlines.
+        // A macro invocation in a class body (`GENERATED_BODY()`) is shaped exactly like
+        // a constructor declaration. Outlining it as a member also makes it an "exported
+        // symbol" for `tilth_deps`, which then reports every other file invoking the same
+        // macro as a dependent. See `is_cpp_macro_invocation`.
+        "declaration"
+            if matches!(lang, Lang::C | Lang::Cpp) && is_cpp_macro_invocation(node, lines) =>
+        {
+            return None;
+        }
+
         "declaration" if matches!(lang, Lang::C | Lang::Cpp) => {
             // `struct S { int a; } sInstance;` declares a type *and* a variable in one
             // node. The type is the more useful entry — and it is otherwise invisible,
