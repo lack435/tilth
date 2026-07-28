@@ -37,15 +37,21 @@ from fixtures.reset import reset_repo, ensure_repo_clean
 
 
 def _tilth_version() -> Optional[str]:
-    """Get installed tilth version via `tilth --version`."""
+    """Get the tilth version recorded in results, via `tilth --version`.
+
+    Resolved from PATH rather than a hardcoded `~/.cargo/bin/tilth`: that path has
+    no `.exe` suffix on Windows so it never resolved there, silently recording a
+    null `tilth_version` in every result row. `tilth_mcp.json` invokes `tilth` from
+    PATH too, so this reports the version of the binary the run actually used.
+    """
     try:
         result = subprocess.run(
-            [str(Path.home() / ".cargo" / "bin" / "tilth"), "--version"],
+            ["tilth", "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"
         return result.stdout.strip().removeprefix("tilth ") if result.returncode == 0 else None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
 
 

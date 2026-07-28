@@ -129,7 +129,20 @@ pub(crate) fn is_definition_node(node: tree_sitter::Node, lang: Option<Lang>) ->
     // C/C++ `declaration` is a local variable or a prototype, not a definition, and
     // `declaration` is not in `DEFINITION_KINDS` for exactly that reason.
     if kind == "declaration" {
-        return is_cpp_misparsed_class_head(node);
+        // Two shapes make a C/C++ `declaration` a definition. Everything else — a local
+        // variable, a prototype, a global — is not, which is why `declaration` is
+        // absent from `DEFINITION_KINDS`.
+        //
+        // 1. A macro in a class head can misparse a class definition into one
+        //    (see `is_cpp_misparsed_class_head`).
+        // 2. A *qualified* declarator means the declaration defines something declared
+        //    elsewhere: `int Widget::sCount = 0;`, the out-of-line definition of a
+        //    static member. A local or global variable never has a qualified
+        //    declarator, so this cannot pull ordinary declarations in. (A variable
+        //    whose *type* is qualified — `Foo::Bar x;` — keeps the qualifier on the
+        //    `type` field, not the declarator chain.)
+        return is_cpp_misparsed_class_head(node)
+            || declarator_chain_has_kind(node, "qualified_identifier");
     }
     if !DEFINITION_KINDS.contains(&kind) {
         return false;
@@ -349,18 +362,23 @@ fn has_error_child(node: tree_sitter::Node) -> bool {
     found
 }
 
-/// True when `node`'s C/C++ declarator chain declares a function — the marker that
-/// separates a real definition (`class Foo bar() { … }`) from a misparsed class head.
-/// Walks the chain so pointer- and reference-returning forms are recognised too.
-pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
+/// True when `node`'s C/C++ declarator chain contains a node of `kind`.
+/// Walks the chain, so layers added by pointers, references and arrays are seen too.
+fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
     let mut current = node.child_by_field_name("declarator");
     while let Some(n) = current {
-        if n.kind() == "function_declarator" {
+        if n.kind() == kind {
             return true;
         }
         current = n.child_by_field_name("declarator");
     }
     false
+}
+
+/// True when `node`'s C/C++ declarator chain declares a function — the marker that
+/// separates a real definition (`class Foo bar() { … }`) from a misparsed class head.
+pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
+    declarator_chain_has_kind(node, "function_declarator")
 }
 
 /// Extract the name defined by a tree-sitter definition node.
@@ -1356,6 +1374,46 @@ mod tests {
                 definition_weight(node.kind()),
                 100,
                 "{src:?} (parsed as {}) should weigh 100",
+                node.kind()
+            );
+        }
+    }
+
+    /// `int Widget::sCount = 0;` is the out-of-line definition of a static member — a
+    /// real definition, but a `declaration` node, so it did not register and only the
+    /// in-class declaration was findable. A *qualified* declarator is what marks it:
+    /// ordinary locals and globals never have one, and a variable whose *type* is
+    /// qualified keeps the qualifier on the `type` field instead.
+    #[test]
+    fn is_definition_node_accepts_out_of_line_static_member_definition() {
+        let src = "int Widget::sCount = 0;\n";
+        let tree = parse(src, Lang::Cpp);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = tree.root_node().named_child(0).expect("declaration");
+        assert_eq!(node.kind(), "declaration");
+        assert!(is_definition_node(node, Some(Lang::Cpp)));
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("sCount".to_string())
+        );
+    }
+
+    #[test]
+    fn is_definition_node_rejects_ordinary_declarations() {
+        // The guard on the rule above: none of these may become definitions, or every
+        // local variable in every C++ function would be reported as one.
+        for src in [
+            "int gGlobal = 1;\n",
+            "Holder h;\n",
+            "Foo::Bar qualifiedType;\n", // qualifier is on `type`, not the declarator
+            "void Prototype(int x);\n",
+            "static const char* kName = \"x\";\n",
+        ] {
+            let tree = parse(src, Lang::Cpp);
+            let node = tree.root_node().named_child(0).expect("top-level node");
+            assert!(
+                !is_definition_node(node, Some(Lang::Cpp)),
+                "{src:?} (kind {}) must not be a definition",
                 node.kind()
             );
         }
