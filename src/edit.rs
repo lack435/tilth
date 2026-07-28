@@ -1211,6 +1211,94 @@ mod tests {
 
     // ------------------------------------------------- parse check
 
+    /// A C++ header whose class head carries an export macro cannot be parsed cleanly —
+    /// tree-sitter-cpp leaves an `ERROR` node in it no matter what. Editing such a file
+    /// must stay silent, or every edit to a header in a codebase that uses export macros
+    /// (i.e. most Windows C++) would report a parse error the edit did not cause and
+    /// cannot fix.
+    ///
+    /// This became reachable when `.h` moved to the C++ grammar: under the C grammar the
+    /// same file produced a different error set, so the baselining had never been
+    /// exercised against this shape.
+    #[test]
+    fn apply_batch_no_parse_block_when_header_error_is_pre_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("Widget.h");
+        let content = "\
+class MYLIB_API Widget final : public Base
+{
+public:
+\tvoid Work();
+};
+";
+        std::fs::write(&f, content).unwrap();
+
+        // Sanity: the file really is un-parseable as it stands, so the assertion below
+        // is about baselining rather than about a file that happens to be clean.
+        let grammar = crate::lang::outline::outline_language(crate::types::Lang::Cpp).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&grammar).unwrap();
+        assert!(
+            parser.parse(content, None).unwrap().root_node().has_error(),
+            "fixture must contain a pre-existing parse error"
+        );
+
+        // Edit a line inside the class body — nothing to do with the malformed head.
+        let h = hash_at(content, 4);
+        let tasks = vec![ready_task(
+            f.clone(),
+            vec![Edit {
+                start_line: 4,
+                start_hash: h,
+                end_line: 4,
+                end_hash: h,
+                content: "\tvoid Work(int Times);".into(),
+            }],
+        )];
+
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("edit applies");
+        assert!(
+            !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "a pre-existing header parse error must not be reported as introduced: {out}"
+        );
+    }
+
+    /// The other half of the guarantee: a genuinely broken edit to such a header is still
+    /// reported. Baselining pre-existing errors must not amount to silencing the file.
+    #[test]
+    fn apply_batch_still_reports_new_error_in_header_with_pre_existing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("Widget.h");
+        let content = "\
+class MYLIB_API Widget final : public Base
+{
+public:
+\tvoid Work();
+};
+";
+        std::fs::write(&f, content).unwrap();
+
+        // Drop the semicolon and the parameter list — a new, distinct breakage.
+        let h = hash_at(content, 4);
+        let tasks = vec![ready_task(
+            f.clone(),
+            vec![Edit {
+                start_line: 4,
+                start_hash: h,
+                end_line: 4,
+                end_hash: h,
+                content: "\tvoid Work(".into(),
+            }],
+        )];
+
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("edit applies");
+        assert!(
+            out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "a newly introduced error must still surface even in a file that already \
+             had one: {out}"
+        );
+    }
+
     #[test]
     fn apply_batch_surfaces_parse_block_on_introduced_error() {
         // Edit drops the closing brace on a Rust line → new ERROR node →
