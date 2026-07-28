@@ -19,7 +19,24 @@ pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Same as `resolve_related_files` but takes pre-read content to avoid a redundant file read.
+///
+/// Capped at `MAX_SUGGESTIONS` — this feeds the "related files" hint after a read, where
+/// a short list is the point. Callers that need the *complete* set (dependency analysis)
+/// must use `resolve_local_imports`; truncating there loses dependencies entirely, since
+/// an import that resolved is also excluded from the external bucket.
 pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf> {
+    let mut resolved = resolve_local_imports(file_path, content);
+    resolved.truncate(MAX_SUGGESTIONS);
+    resolved
+}
+
+/// Every import in `content` that resolves to a local file. Uncapped.
+///
+/// `resolve_related_files_with_content` is the capped view for display. Dependency
+/// analysis needs all of them: it classifies an import as external only when it does
+/// *not* resolve, so an import dropped by a cap here would appear in neither the local
+/// nor the external list and vanish from the report.
+pub(crate) fn resolve_local_imports(file_path: &Path, content: &str) -> Vec<PathBuf> {
     let FileType::Code(lang) = detect_file_type(file_path) else {
         return Vec::new();
     };
@@ -30,9 +47,6 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 
     let mut results = Vec::new();
     for line in content.lines() {
-        if results.len() >= MAX_SUGGESTIONS {
-            break;
-        }
         if !is_import_line(line, lang) {
             continue;
         }
@@ -242,14 +256,127 @@ fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
 
 // --- C/C++ ---
 
+/// How far up to look for an include root.
+///
+/// Sized from evidence rather than caution: over all 524 quoted includes in the leveldb
+/// fixture, 310 resolve at one hop and 7 at two, none beyond. `Source/<Module>/A/B/C.h`
+/// including `A/Other.h` — the deepest layout worth supporting — is three. Every hop
+/// past that buys nothing measurable and only widens the surface for a wrong match.
+const MAX_INCLUDE_ROOT_HOPS: usize = 4;
+
+/// Conventional include-root directory names, tried as *siblings* at each ancestor.
+///
+/// The ancestor walk alone only finds roots that are ancestors of the including file.
+/// The canonical C++ layout puts the root beside the sources instead — `include/leveldb/db.h`
+/// included from `db/db_impl.cc` — which is `-Iinclude` to a compiler and invisible to a
+/// pure upward walk. These two names cover that layout; anything more exotic needs real
+/// build metadata.
+const CONVENTIONAL_INCLUDE_ROOTS: &[&str] = &["include", "inc"];
+
+/// Resolve a quoted `#include` to a file, trying the including directory first and
+/// then ancestor directories as candidate include roots.
+///
+/// A quoted include is only *sometimes* relative to the including file. Far more often
+/// it is written relative to an include root — a module source directory, or a project's
+/// `include/` — which a compiler learns from `-I` flags that live in the build system.
+/// tilth has no build metadata, so it approximates by testing ancestors, nearest first.
+///
+/// This is what the two real cases look like, and one hop resolves both:
+///   `include/leveldb/env.h`            includes `leveldb/status.h`
+///     → `include/` + `leveldb/status.h`
+///   `Source/Game/Character/Comp.h`     includes `Character/PawnComponent.h`
+///     → `Source/Game/` + `Character/PawnComponent.h`
+///
+/// The ancestor walk only applies to multi-segment includes. A bare `"config.h"` is
+/// either a sibling — already found by the first check — or something outside the
+/// project, and walking up for it is how you match an unrelated same-named file several
+/// directories away. Requiring a separator keeps the guess specific.
+///
+/// The walk is confined to the enclosing repository: it only runs when a `.git` ancestor
+/// is found, and every candidate must normalise to a path inside that repository. Without
+/// those two conditions a `..` in the include, or a tree with no `.git` at all, would let
+/// resolution reach files outside the project entirely.
 fn resolve_c_include(dir: &Path, source: &str) -> Option<PathBuf> {
     let clean = source.trim_matches('"');
-    let candidate = dir.join(clean);
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
+
+    // The standard `""` search: relative to the including file. This is also the only
+    // correct place for a `..`-relative include, which is by definition anchored to the
+    // including file rather than to any include root.
+    let direct = dir.join(clean);
+    if direct.is_file() {
+        return Some(direct);
     }
+
+    if !is_include_root_relative(clean) {
+        return None;
+    }
+
+    // Confine the search to the enclosing repository. This replaces an earlier
+    // "stop when you see `.git`" break, which still tested one directory beyond the
+    // root and did nothing at all in a tree without `.git`.
+    let repo_root = enclosing_repo_root(dir)?;
+
+    let mut base = dir;
+    for _ in 0..MAX_INCLUDE_ROOT_HOPS {
+        let Some(parent) = base.parent() else { break };
+        for candidate in candidates_at(parent, clean) {
+            let normalized = normalize_path(&candidate);
+            if normalized.starts_with(&repo_root) && normalized.is_file() {
+                return Some(normalized);
+            }
+        }
+        if base == repo_root {
+            break;
+        }
+        base = parent;
+    }
+    None
+}
+
+/// The include-root candidates to try at `parent`: the root itself, then the
+/// conventional sibling roots (see `CONVENTIONAL_INCLUDE_ROOTS`).
+fn candidates_at(parent: &Path, clean: &str) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(1 + CONVENTIONAL_INCLUDE_ROOTS.len());
+    out.push(parent.join(clean));
+    for root in CONVENTIONAL_INCLUDE_ROOTS {
+        out.push(parent.join(root).join(clean));
+    }
+    out
+}
+
+/// True when an include path is worth resolving against an include root.
+///
+/// Requires at least two real path components and no `..`:
+///   * A single real component (`"config.h"`, and equally `"./config.h"`) is either a
+///     sibling — already found by the direct check — or outside the project. Walking up
+///     for it is how an unrelated same-named file several directories away gets matched.
+///   * A `..` is anchored to the including file, so joining it onto an ancestor is
+///     meaningless, and it can climb back out of the repository.
+fn is_include_root_relative(clean: &str) -> bool {
+    let mut real = 0;
+    for part in clean.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return false,
+            _ => real += 1,
+        }
+    }
+    real >= 2
+}
+
+/// Nearest ancestor of `dir` (inclusive) containing `.git`, if any.
+///
+/// `.git` is a directory in a normal clone and a *file* in a linked worktree or
+/// submodule, so presence rather than kind is what matters.
+fn enclosing_repo_root(dir: &Path) -> Option<PathBuf> {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(".git").exists() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
 }
 
 // --- Bash ---
@@ -328,6 +455,185 @@ mod tests {
             from_sibling, from_cousin,
             "different spellings should normalize to the same PathBuf"
         );
+    }
+
+    /// A quoted include is usually written relative to an *include root*, not to the
+    /// including file: `include/leveldb/env.h` includes `"leveldb/status.h"`, which lives
+    /// at `include/leveldb/status.h`. Compilers learn those roots from `-I` flags; with
+    /// no build metadata, ancestors are tested nearest-first.
+    ///
+    /// Before this, such an include resolved to nothing, so a header's project-local
+    /// dependencies were reported as external.
+    #[test]
+    fn c_include_resolves_against_an_ancestor_include_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("include/lib")).unwrap();
+        fs::write(root.join("include/lib/status.h"), "struct S {};\n").unwrap();
+
+        // Included from include/lib/env.h as "lib/status.h" — one hop up.
+        let from = root.join("include/lib");
+        let got = resolve_c_include(&from, "\"lib/status.h\"").expect("should resolve");
+        assert_eq!(got, root.join("include/lib/status.h"));
+    }
+
+    #[test]
+    fn c_include_prefers_the_including_directory() {
+        // The standard `""` search still wins when the file is a sibling, even if an
+        // ancestor also has a same-named path.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a/b/a")).unwrap();
+        fs::write(root.join("a/b/a/x.h"), "// near\n").unwrap();
+        fs::write(root.join("a/x.h"), "// far\n").unwrap();
+
+        let got = resolve_c_include(&root.join("a/b"), "\"a/x.h\"").expect("resolves");
+        assert_eq!(got, root.join("a/b/a/x.h"), "nearest match must win");
+    }
+
+    #[test]
+    fn c_include_does_not_walk_for_a_bare_filename() {
+        // A single-segment include is either a sibling (found directly) or outside the
+        // project. Walking up for it is how an unrelated same-named file several
+        // directories away gets picked up, so it is deliberately not attempted.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("deep/nested")).unwrap();
+        fs::write(root.join("config.h"), "// unrelated\n").unwrap();
+
+        assert!(
+            resolve_c_include(&root.join("deep/nested"), "\"config.h\"").is_none(),
+            "a bare filename must not resolve to a same-named file up the tree"
+        );
+    }
+
+    /// The canonical C++ layout puts the include root *beside* the sources —
+    /// `include/lib/db.h` included from `src/db.cc` — which is `-Iinclude` to a compiler
+    /// and invisible to a pure upward walk. Without this, 40% of leveldb's quoted
+    /// includes still resolved to nothing and were reported as external.
+    #[test]
+    fn c_include_resolves_against_a_sibling_include_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("include/lib")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("include/lib/db.h"), "struct DB {};\n").unwrap();
+
+        let got = resolve_c_include(&root.join("src"), "\"lib/db.h\"").expect("resolves");
+        assert_eq!(got, root.join("include/lib/db.h"));
+    }
+
+    /// A `..` include is anchored to the including file — `"../shared.h"` from `a/b`
+    /// means `a/shared.h` and nothing else. Joining it onto an ancestor changes what it
+    /// means, so the walk must refuse it: here `a/shared.h` does not exist, and walking
+    /// would silently "resolve" the include to the unrelated `shared.h` at the repo root.
+    /// It also let resolution climb back out of the repository despite the `.git` bound.
+    ///
+    /// The direct check still honours `..` — that is the include's real meaning, and a
+    /// compiler resolves it the same way.
+    #[test]
+    fn c_include_refuses_parent_relative_paths_for_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        // Only the repo-root copy exists; `a/shared.h` — what the include actually names
+        // — does not.
+        fs::write(root.join("shared.h"), "// wrong target\n").unwrap();
+
+        assert!(
+            resolve_c_include(&root.join("a/b"), "\"../shared.h\"").is_none(),
+            "a `..` include must not be re-anchored onto an ancestor"
+        );
+
+        // With the file where the include actually points, the direct check finds it.
+        fs::write(root.join("a/shared.h"), "// right target\n").unwrap();
+        let got = resolve_c_include(&root.join("a/b"), "\"../shared.h\"").expect("resolves");
+        assert_eq!(normalize_path(&got), root.join("a/shared.h"));
+    }
+
+    /// `"./cfg.h"` is semantically identical to `"cfg.h"`, which the guard exists to
+    /// refuse — counting separators rather than real components let it through.
+    #[test]
+    fn c_include_treats_dot_slash_as_a_bare_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("cfg.h"), "// unrelated\n").unwrap();
+
+        assert!(
+            resolve_c_include(&root.join("a/b"), "\"./cfg.h\"").is_none(),
+            "./name is a bare filename and must not trigger the walk"
+        );
+    }
+
+    /// With no `.git` anywhere — a tarball checkout, a vendored drop — there is nothing to
+    /// bound the walk, so it must not run at all. Previously it ran the full hop budget
+    /// and could resolve a file outside the intended tree, then leak that absolute path
+    /// into `tilth_deps` output.
+    #[test]
+    fn c_include_does_not_walk_without_a_repository_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("proj/a/b")).unwrap();
+        fs::create_dir_all(root.join("x")).unwrap();
+        fs::write(root.join("x/leak.h"), "// outside proj\n").unwrap();
+
+        assert!(
+            resolve_c_include(&root.join("proj/a/b"), "\"x/leak.h\"").is_none(),
+            "without a .git bound the walk must not run"
+        );
+    }
+
+    /// An include root at the top of the repository must still resolve — the boundary is
+    /// "do not go above the root", not "do not test the root".
+    #[test]
+    fn c_include_resolves_when_the_repo_root_is_the_include_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src/a")).unwrap();
+        fs::write(root.join("src/shared.h"), "// at src/\n").unwrap();
+
+        let got = resolve_c_include(&root.join("src/a"), "\"src/shared.h\"").expect("resolves");
+        assert_eq!(got, root.join("src/shared.h"));
+    }
+
+    #[test]
+    fn c_include_walk_stops_at_the_repo_root() {
+        // Resolution must not wander out of the project.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("proj/.git")).unwrap();
+        fs::create_dir_all(root.join("proj/src")).unwrap();
+        // The only match is *outside* the repo, one level above `proj/`.
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(root.join("outside/leak.h"), "// outside\n").unwrap();
+
+        assert!(
+            resolve_c_include(&root.join("proj/src"), "\"outside/leak.h\"").is_none(),
+            "the walk must not resolve outside the repository"
+        );
+    }
+
+    /// A linked worktree and a submodule both have `.git` as a *file*, not a directory, so
+    /// the root check must test presence rather than kind.
+    #[test]
+    fn c_include_treats_a_git_file_as_a_repository_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("wt/include/lib")).unwrap();
+        fs::create_dir_all(root.join("wt/src")).unwrap();
+        // `.git` as a file, the linked-worktree / submodule form.
+        fs::write(root.join("wt/.git"), "gitdir: ../real/.git/worktrees/wt\n").unwrap();
+        fs::write(root.join("wt/include/lib/db.h"), "struct DB {};\n").unwrap();
+
+        let got = resolve_c_include(&root.join("wt/src"), "\"lib/db.h\"")
+            .expect("a .git file must still establish the root");
+        assert_eq!(got, root.join("wt/include/lib/db.h"));
     }
 
     #[test]

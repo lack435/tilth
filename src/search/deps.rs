@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
-use crate::read::imports::{is_external, is_import_line, resolve_related_files_with_content};
+use crate::read::imports::{is_external, is_import_line, resolve_local_imports};
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
 use crate::types::{FileType, OutlineKind};
@@ -138,7 +138,11 @@ pub fn analyze_deps(
 
     // Merge in import-resolved files (may not have resolved callees if symbols
     // weren't matched, but the import relationship itself is meaningful)
-    let import_files = resolve_related_files_with_content(path, &content);
+    // Uncapped: `resolve_related_files_with_content` truncates to 8 for the read-time
+    // hint, and truncating here loses dependencies outright — an import that resolves is
+    // excluded from the external bucket below, so one dropped by a cap would appear in
+    // neither list. A C++ translation unit with more than 8 project includes is ordinary.
+    let import_files = resolve_local_imports(path, &content);
     for import_path in import_files {
         local_by_file.entry(import_path).or_default();
     }
@@ -777,6 +781,109 @@ mod tests {
                 .iter()
                 .any(|d| d.path.to_string_lossy().contains("Faraway")),
             "unresolvable include must not appear as a local dep"
+        );
+    }
+
+    /// End-to-end for the include-root case, which is the common layout: a header
+    /// including `"lib/other.h"` where that path is relative to an include root one level
+    /// up. Such includes previously resolved to nothing and were therefore reported as
+    /// *external* — a project header misfiled as a third-party dependency, with local
+    /// deps stuck at zero.
+    #[test]
+    fn cpp_include_relative_to_an_include_root_is_local_not_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("include/lib")).unwrap();
+        std::fs::write(
+            root.join("include/lib/status.h"),
+            "struct Status { int V; };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("include/lib/env.h"),
+            "#pragma once\n\
+             #include <vector>\n\
+             #include \"lib/status.h\"\n\
+             class Env { public: void Sync(); };\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("include/lib/env.h"), root, &bloom).unwrap();
+
+        assert!(
+            result
+                .uses_local
+                .iter()
+                .any(|d| d.path.ends_with("status.h")),
+            "an include-root-relative header must be local, got local={:?} external={:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>(),
+            result.uses_external
+        );
+        assert!(
+            !result.uses_external.iter().any(|e| e.contains("status.h")),
+            "it must not also be reported as external, got {:?}",
+            result.uses_external
+        );
+        // The genuine system header is still external.
+        assert!(result.uses_external.iter().any(|e| e == "vector"));
+    }
+
+    /// Every resolvable include must be reported, however many there are.
+    ///
+    /// `resolve_related_files_with_content` caps at 8 for the read-time hint. deps used
+    /// that capped view, and because an include that *resolves* is excluded from the
+    /// external bucket, everything past the eighth appeared in neither list and vanished
+    /// from the report entirely — on leveldb's `db/db_impl.cc` that was 10 real
+    /// dependencies, fewer total names than before include-root resolution existed. A C++
+    /// translation unit with more than 8 project includes is completely ordinary.
+    #[test]
+    fn cpp_reports_every_local_include_past_the_suggestion_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+
+        // 12 project headers — comfortably past MAX_SUGGESTIONS (8).
+        let count = 12;
+        let mut includes = String::from("#include <vector>\n");
+        for i in 0..count {
+            std::fs::write(
+                root.join(format!("lib/h{i}.h")),
+                format!("struct S{i} {{ int V; }};\n"),
+            )
+            .unwrap();
+            includes.push_str(&format!("#include \"lib/h{i}.h\"\n"));
+        }
+        std::fs::write(
+            root.join("lib/user.cc"),
+            format!("{includes}void Use() {{}}\n"),
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("lib/user.cc"), root, &bloom).unwrap();
+
+        assert_eq!(
+            result.uses_local.len(),
+            count,
+            "all {count} local includes must be reported, got {:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+        // None of them may have leaked into the external bucket either.
+        assert_eq!(
+            result.uses_external,
+            vec!["vector".to_string()],
+            "only the system header is external"
         );
     }
 
