@@ -470,6 +470,105 @@ public:
         );
     }
 
+    /// `#include` is `preproc_include`, which no outline arm matched — so a C or C++
+    /// outline showed a header's types but never what it included, even though
+    /// `extract_import_source` already knew how to parse the directive. The `<…>` /
+    /// `"…"` delimiters are kept in the rendered group because they are what tells a
+    /// system header from a project-relative one.
+    #[test]
+    fn cpp_outline_includes_preprocessor_includes() {
+        let cpp_code = "#include <vector>\n\
+                        #include <memory>\n\
+                        #include \"Local.h\"\n\
+                        \n\
+                        class Widget { public: void Work(); };\n";
+        let outline = outline(cpp_code, Lang::Cpp, 1000);
+        assert!(
+            outline.contains("imports:"),
+            "C++ outline must surface #include lines:\n{outline}"
+        );
+        assert!(outline.contains("vector"), "actual:\n{outline}");
+        assert!(outline.contains("memory"), "actual:\n{outline}");
+        assert!(outline.contains("Local.h"), "actual:\n{outline}");
+        // The types still render alongside.
+        assert!(outline.contains("class Widget"), "actual:\n{outline}");
+    }
+
+    /// `struct S { int a; } sInstance;` declares a type and a variable in one node. The
+    /// outline used to show only `sInstance`, leaving the type invisible even though
+    /// symbol search found it — an outline/symbol disagreement on ordinary C.
+    #[test]
+    fn cpp_outline_surfaces_type_declared_with_a_variable() {
+        let outline = outline("struct S { int a; } sInstance;\n", Lang::Cpp, 1000);
+        assert!(
+            outline.contains("struct S"),
+            "the type must be outlined:\n{outline}"
+        );
+    }
+
+    /// The type-over-variable preference must not fire for an *anonymous* specifier:
+    /// `<anonymous>` is not searchable, whereas the variable name is, so preferring the
+    /// type there trades a usable identifier for a placeholder.
+    #[test]
+    fn cpp_outline_keeps_variable_name_for_anonymous_specifier() {
+        let anon = outline("struct { int a; } anonInst;\n", Lang::Cpp, 1000);
+        assert!(
+            anon.contains("anonInst"),
+            "an anonymous struct must keep the searchable variable name:\n{anon}"
+        );
+        assert!(
+            !anon.contains("<anonymous>"),
+            "must not degrade to a placeholder:\n{anon}"
+        );
+        // The `typedef struct { … } Foo;` idiom — the dominant C spelling — is named by
+        // the typedef and must be unaffected.
+        let td = outline("typedef struct { int b; } Named;\n", Lang::Cpp, 1000);
+        assert!(td.contains("Named"), "actual:\n{td}");
+        assert!(!td.contains("<anonymous>"), "actual:\n{td}");
+    }
+
+    /// Platform guards are the dominant use of `#ifdef` in C/C++ headers, so anything
+    /// inside one was invisible in the outline while `tilth_deps` — which reads lines
+    /// rather than the AST — reported it. Conditional blocks are now transparent.
+    #[test]
+    fn cpp_outline_descends_into_conditional_compilation_blocks() {
+        let cpp_code = "#include <always.h>\n\
+                        #ifdef _WIN32\n\
+                        #include <windows.h>\n\
+                        class WinOnly { public: void Work(); };\n\
+                        #else\n\
+                        class PosixOnly { public: void Work(); };\n\
+                        #endif\n";
+        let outline = outline(cpp_code, Lang::Cpp, 1000);
+        assert!(outline.contains("always.h"), "actual:\n{outline}");
+        assert!(
+            outline.contains("windows.h"),
+            "a guarded include must be surfaced:\n{outline}"
+        );
+        assert!(
+            outline.contains("class WinOnly"),
+            "a guarded declaration must be surfaced:\n{outline}"
+        );
+        // Both arms are shown — tilth does not evaluate the preprocessor, and both
+        // exist in the source.
+        assert!(
+            outline.contains("class PosixOnly"),
+            "the #else arm must be surfaced too:\n{outline}"
+        );
+    }
+
+    #[test]
+    fn c_outline_includes_preprocessor_includes() {
+        // Same arm serves C, whose outlines were equally include-blind.
+        let outline = outline(
+            "#include <stdio.h>\nstruct Point { int x; };\n",
+            Lang::C,
+            1000,
+        );
+        assert!(outline.contains("imports:"), "actual:\n{outline}");
+        assert!(outline.contains("stdio.h"), "actual:\n{outline}");
+    }
+
     /// A *braced* PHP namespace is a Module entry whose body is a
     /// `compound_statement` — the same kind a macro-misparsed C++ class body uses. When
     /// `collect_children`'s body finder matched that kind ungated, PHP namespace

@@ -30,10 +30,14 @@ const DEFINITION_KINDS: &[&str] = &[
     "struct_specifier",
     "union_specifier",
     "enum_specifier",
-    // C++ templates (`template <typename T> class Foo`) and `using` aliases.
-    // Both C++-only. `template_declaration` carries no name of its own —
-    // `extract_definition_name` unwraps the declaration it encloses.
-    "template_declaration",
+    // C++ `using` aliases. C++-only.
+    //
+    // `template_declaration` is deliberately NOT here. It carries no name of its own
+    // and wraps a declaration that is already a definition kind, so registering both
+    // reported one template twice whenever the `template <…>` clause sat on its own
+    // line — the normal spelling in real C++. It is a transparent wrapper instead
+    // (`is_transparent_wrapper`), so the walk reaches the inner declaration without
+    // spending a depth level and only that inner node registers.
     "alias_declaration",
     // Interfaces & types (TS)
     "interface_declaration",
@@ -99,6 +103,15 @@ pub(crate) fn is_bodied_specifier(node: tree_sitter::Node) -> bool {
     SPECIFIER_KINDS.contains(&node.kind()) && node.child_by_field_name("body").is_some()
 }
 
+/// True when `node` is a bodied specifier that also has a `name`.
+///
+/// An anonymous one (`struct { int a; } inst;`, `typedef struct { … } Foo;`) has a body
+/// but nothing to call it, so preferring it over the declarator would trade a
+/// searchable identifier for `<anonymous>`.
+pub(crate) fn is_named_bodied_specifier(node: tree_sitter::Node) -> bool {
+    is_bodied_specifier(node) && node.child_by_field_name("name").is_some()
+}
+
 /// C/C++ declarator node kinds — the chain wrapping a declared name.
 ///
 /// `void Holder::Work()` nests as `function_declarator` → `qualified_identifier`
@@ -129,29 +142,51 @@ pub(crate) fn is_definition_node(node: tree_sitter::Node, lang: Option<Lang>) ->
     // C/C++ `declaration` is a local variable or a prototype, not a definition, and
     // `declaration` is not in `DEFINITION_KINDS` for exactly that reason.
     if kind == "declaration" {
-        return is_cpp_misparsed_class_head(node);
+        // Two shapes make a C/C++ `declaration` a definition. Everything else — a local
+        // variable, a prototype, a global — is not, which is why `declaration` is
+        // absent from `DEFINITION_KINDS`.
+        //
+        // 1. A macro in a class head can misparse a class definition into one
+        //    (see `is_cpp_misparsed_class_head`).
+        // 2. A *qualified data* declarator means the declaration defines something
+        //    declared elsewhere: `int Widget::sCount = 0;` (or without an initialiser,
+        //    which is equally a definition), the out-of-line definition of a static
+        //    member.
+        //
+        // No language gate is needed, but only by cross-grammar coincidence, so it is
+        // worth spelling out: `declaration` also exists in the JS, TS, TSX, Java, C#
+        // and Kotlin grammars. Kotlin has no `declarator` field at all, so the chain
+        // walk stops immediately; Java has a `declarator` field but no
+        // `qualified_identifier` kind; the rest have neither. C and C++ are the only
+        // grammars where both exist, so the test below can only ever fire for them.
+        //
+        // Case 2 needs both extra conditions. A qualified *function* declarator is not
+        // a definition — it is `friend void Helper::Assist();`, which declares a
+        // member of another class that is defined elsewhere; counting it made the
+        // scope annotator attribute `Assist` to the befriending class. And an `extern`
+        // storage class marks a declaration of something defined elsewhere by
+        // definition. (A variable whose *type* is qualified — `Foo::Bar x;` — keeps
+        // the qualifier on the `type` field, not the declarator chain, so it never
+        // reaches this test.)
+        if is_cpp_misparsed_class_head(node) {
+            return true;
+        }
+        // 3. A member template declared inside a class body: `template <typename T> void
+        //    Apply(T V);` nests as `field_declaration_list` → `template_declaration` →
+        //    `declaration`, where a plain member would be a `field_declaration` (already
+        //    covered by `C_FAMILY_DEFINITION_KINDS`). The wrapper is transparent, so this
+        //    is the only place such a member can be recognised. Anchored on
+        //    `field_declaration_list` so a *free* template prototype at namespace scope
+        //    stays a declaration, consistent with plain prototypes.
+        if is_cpp_member_template_declaration(node) {
+            return true;
+        }
+        return declarator_chain_has_kind(node, "qualified_identifier")
+            && !declarator_chain_has_function(node)
+            && !has_extern_storage_class(node);
     }
     if !DEFINITION_KINDS.contains(&kind) {
         return false;
-    }
-    // `template <typename T> class Fwd;` is a forward declaration just as much as
-    // `class Fwd;` is, but the `template_declaration` wrapper is not itself a
-    // specifier — so apply the body gate to the declaration it encloses, or every
-    // forward-declared template in a header would register a definition that ties
-    // the real one on weight.
-    if kind == "template_declaration" {
-        let mut cursor = node.walk();
-        let gated = node
-            .children(&mut cursor)
-            .any(|c| SPECIFIER_KINDS.contains(&c.kind()) || c.kind() == "function_definition");
-        if gated {
-            let mut inner = node.walk();
-            return node
-                .children(&mut inner)
-                .filter(|c| SPECIFIER_KINDS.contains(&c.kind()))
-                .all(|c| c.child_by_field_name("body").is_some());
-        }
-        return true;
     }
     if SPECIFIER_KINDS.contains(&kind) {
         return node.child_by_field_name("body").is_some();
@@ -342,6 +377,26 @@ fn first_identifier_child(node: tree_sitter::Node, lines: &[&str]) -> Option<Str
     found
 }
 
+/// True when `node` is a `declaration` for a member template inside a class body —
+/// `field_declaration_list` → `template_declaration` → `declaration`.
+fn is_cpp_member_template_declaration(node: tree_sitter::Node) -> bool {
+    node.parent().is_some_and(|p| {
+        p.kind() == "template_declaration"
+            && p.parent()
+                .is_some_and(|g| g.kind() == "field_declaration_list")
+    })
+}
+
+/// True when `node` carries an `extern` storage class. Such a declaration names
+/// something defined in another translation unit, so it is never itself a definition.
+fn has_extern_storage_class(node: tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|c| {
+        c.kind() == "storage_class_specifier" && c.child(0).is_some_and(|k| k.kind() == "extern")
+    });
+    found
+}
+
 /// True when any `ERROR` node sits directly inside `node`.
 fn has_error_child(node: tree_sitter::Node) -> bool {
     let mut cursor = node.walk();
@@ -349,18 +404,23 @@ fn has_error_child(node: tree_sitter::Node) -> bool {
     found
 }
 
-/// True when `node`'s C/C++ declarator chain declares a function — the marker that
-/// separates a real definition (`class Foo bar() { … }`) from a misparsed class head.
-/// Walks the chain so pointer- and reference-returning forms are recognised too.
-pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
+/// True when `node`'s C/C++ declarator chain contains a node of `kind`.
+/// Walks the chain, so layers added by pointers, references and arrays are seen too.
+fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
     let mut current = node.child_by_field_name("declarator");
     while let Some(n) = current {
-        if n.kind() == "function_declarator" {
+        if n.kind() == kind {
             return true;
         }
         current = n.child_by_field_name("declarator");
     }
     false
+}
+
+/// True when `node`'s C/C++ declarator chain declares a function — the marker that
+/// separates a real definition (`class Foo bar() { … }`) from a misparsed class head.
+pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
+    declarator_chain_has_kind(node, "function_declarator")
 }
 
 /// Extract the name defined by a tree-sitter definition node.
@@ -388,19 +448,6 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
                 return Some(name);
             }
         }
-    }
-
-    // C++ `template <typename T> class Foo` / `template <typename T> void bar()`:
-    // `template_declaration` has no name of its own and wraps the real declaration,
-    // the same shape as `export_statement` below.
-    if node.kind() == "template_declaration" {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(name) = extract_definition_name(child, lines) {
-                return Some(name);
-            }
-        }
-        return None;
     }
 
     // A C++ class nested inside another class is a `field_declaration` whose `type`
@@ -684,13 +731,18 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "struct_specifier"
         | "union_specifier"
         | "enum_specifier"
-        | "template_declaration"
         | "alias_declaration"
-        // A `declaration` only ever reaches this table as a macro-misparsed class
-        // head (`is_definition_node` admits no other shape), so it weighs the same as
-        // the `function_definition` the same construct produces without multiple
-        // inheritance. Left at the default 50 it would have given one construct two
-        // different weights depending on its base-class count.
+        // `declaration` reaches this table in the two shapes `is_definition_node`
+        // admits: a macro-misparsed class head, and an out-of-line static member
+        // definition. 100 is chosen for the class head — the same construct without
+        // multiple inheritance parses as a `function_definition`, and leaving it at
+        // the default 50 would give one construct two weights depending on its
+        // base-class count. The static-member case inherits that 100, which is
+        // higher than the 80 tier its closest analogues in other languages sit at
+        // (`static_item`, `const_declaration`); distinguishing them would require
+        // weighting per node rather than per kind string. Harmless in practice: both
+        // shapes are genuine definitions, and the ranking that matters — out-of-line
+        // definition above the in-class `field_declaration` (70) — holds either way.
         | "declaration"
         | "decorated_definition" => 100,
         "impl_item" | "object_declaration" => 90,
@@ -747,12 +799,14 @@ mod tests {
             "struct_specifier",
             "union_specifier",
             "enum_specifier",
-            "template_declaration",
             "alias_declaration",
             "type_definition",
         ] {
             assert_eq!(definition_weight(kind), 100, "{kind} should be a 100-tier");
         }
+        // `template_declaration` is intentionally NOT a definition kind — it is a
+        // transparent wrapper, so its weight is never consulted.
+        assert!(!DEFINITION_KINDS.contains(&"template_declaration"));
         // A C++ member *declaration* sits below the out-of-line definition (100)
         // that usually accompanies it, but above the doc-heading tier (30).
         assert_eq!(definition_weight("field_declaration"), 70);
@@ -832,7 +886,6 @@ mod tests {
             "struct_specifier",
             "union_specifier",
             "enum_specifier",
-            "template_declaration",
             "alias_declaration",
         ] {
             assert!(
@@ -1015,23 +1068,29 @@ mod tests {
         );
     }
 
+    /// `template_declaration` is a transparent wrapper, not a definition: it carries no
+    /// name of its own and encloses a declaration that is already a definition kind.
+    /// Registering both reported one template *twice* whenever the `template <…>`
+    /// clause sat on its own line — the normal spelling in real C++ — so only the inner
+    /// declaration counts, and it is the inner one that carries the name.
     #[test]
-    fn extract_definition_name_cpp_template_unwraps_to_inner_declaration() {
-        // `template_declaration` carries no name — it must unwrap to the class or
-        // function it encloses, the same shape as `export_statement`.
-        assert_eq!(
-            cpp_name(
-                "template <typename T> class Vector { public: void Push(T V); };\n",
-                "template_declaration"
-            ),
-            Some("Vector".to_string())
+    fn template_declaration_is_a_transparent_wrapper_not_a_definition() {
+        let src = "template <typename T>\nclass Vector { public: void Push(T V); };\n";
+        let tree = parse(src, Lang::Cpp);
+        let lines: Vec<&str> = src.lines().collect();
+
+        let wrapper = tree.root_node().named_child(0).expect("template");
+        assert_eq!(wrapper.kind(), "template_declaration");
+        assert!(
+            !is_definition_node(wrapper, Some(Lang::Cpp)),
+            "the wrapper must not register a definition of its own"
         );
+
+        let inner = find_by_kind(tree.root_node(), "class_specifier");
+        assert!(is_definition_node(inner, Some(Lang::Cpp)));
         assert_eq!(
-            cpp_name(
-                "template <typename T> void Swap(T& A, T& B) {}\n",
-                "template_declaration"
-            ),
-            Some("Swap".to_string())
+            extract_definition_name(inner, &lines),
+            Some("Vector".to_string())
         );
     }
 
@@ -1278,25 +1337,66 @@ mod tests {
     /// body gate has to reach through it. Forward-declared templates fill
     /// `<iosfwd>`-style headers and any codebase with a container library; each one
     /// used to register a definition that tied the real one at weight 100.
+    /// A forward-declared template is a forward declaration exactly as `class Fwd;` is.
+    /// Since the wrapper is transparent, the body gate on the inner specifier is what
+    /// rejects it — asserted here on the inner node, because that is where the decision
+    /// is now made. Forward-declared templates fill `<iosfwd>`-style headers, and each
+    /// one used to register a definition that tied the real one at weight 100.
     #[test]
-    fn is_definition_node_rejects_forward_declared_template() {
-        let src = "template <typename T> class Fwd;\n\
-                   template <typename T> struct TIsArray;\n\
-                   template <typename T> class TArray { public: void Add(T V); };\n\
-                   template <typename T> void Swap(T& A, T& B) {}\n";
+    fn forward_declared_template_is_not_a_definition() {
+        let cases: &[(&str, bool)] = &[
+            ("template <typename T> class Fwd;\n", false),
+            ("template <typename T> struct TIsArray;\n", false),
+            (
+                "template <typename T> class TArray { public: void Add(T V); };\n",
+                true,
+            ),
+        ];
+        for (src, want) in cases {
+            let tree = parse(src, Lang::Cpp);
+            let inner = find_by_kind(
+                tree.root_node(),
+                if src.contains("struct") {
+                    "struct_specifier"
+                } else {
+                    "class_specifier"
+                },
+            );
+            assert_eq!(is_definition_node(inner, Some(Lang::Cpp)), *want, "{src:?}");
+        }
+        // A templated *function* definition still registers, via `function_definition`.
+        let src = "template <typename T> void Swap(T& A, T& B) {}\n";
         let tree = parse(src, Lang::Cpp);
-        let root = tree.root_node();
-        let expected = [false, false, true, true];
-        for (i, want) in expected.iter().enumerate() {
-            let node = root
-                .named_child(u32::try_from(i).expect("small index"))
-                .expect("top-level template");
-            assert_eq!(node.kind(), "template_declaration");
-            assert_eq!(
-                is_definition_node(node, Some(Lang::Cpp)),
-                *want,
-                "template #{i} ({:?}) definition-ness",
-                node.utf8_text(src.as_bytes()).unwrap_or("")
+        let inner = find_by_kind(tree.root_node(), "function_definition");
+        assert!(is_definition_node(inner, Some(Lang::Cpp)));
+    }
+
+    /// A qualified *function* declarator is a `friend` declaration — it declares a
+    /// member of another class, defined elsewhere — not a definition. Counting it made
+    /// the scope annotator attribute the function to the befriending class. `extern`
+    /// likewise names something defined in another translation unit.
+    #[test]
+    fn qualified_declarator_rule_rejects_friends_and_extern() {
+        let cases = [
+            "struct S { friend void Helper::Assist(); };\n",
+            "struct S { friend int Other::Compute(int); };\n",
+            "extern int Widget::sExtern;\n",
+            "void Foo::Bar();\n",
+        ];
+        for src in cases {
+            let tree = parse(src, Lang::Cpp);
+            let mut found_definition = false;
+            let mut stack = vec![tree.root_node()];
+            let mut cursor = tree.root_node().walk();
+            while let Some(n) = stack.pop() {
+                if n.kind() == "declaration" && is_definition_node(n, Some(Lang::Cpp)) {
+                    found_definition = true;
+                }
+                stack.extend(n.children(&mut cursor));
+            }
+            assert!(
+                !found_definition,
+                "{src:?} must not produce a definition-bearing `declaration`"
             );
         }
     }
@@ -1356,6 +1456,46 @@ mod tests {
                 definition_weight(node.kind()),
                 100,
                 "{src:?} (parsed as {}) should weigh 100",
+                node.kind()
+            );
+        }
+    }
+
+    /// `int Widget::sCount = 0;` is the out-of-line definition of a static member — a
+    /// real definition, but a `declaration` node, so it did not register and only the
+    /// in-class declaration was findable. A *qualified* declarator is what marks it:
+    /// ordinary locals and globals never have one, and a variable whose *type* is
+    /// qualified keeps the qualifier on the `type` field instead.
+    #[test]
+    fn is_definition_node_accepts_out_of_line_static_member_definition() {
+        let src = "int Widget::sCount = 0;\n";
+        let tree = parse(src, Lang::Cpp);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = tree.root_node().named_child(0).expect("declaration");
+        assert_eq!(node.kind(), "declaration");
+        assert!(is_definition_node(node, Some(Lang::Cpp)));
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("sCount".to_string())
+        );
+    }
+
+    #[test]
+    fn is_definition_node_rejects_ordinary_declarations() {
+        // The guard on the rule above: none of these may become definitions, or every
+        // local variable in every C++ function would be reported as one.
+        for src in [
+            "int gGlobal = 1;\n",
+            "Holder h;\n",
+            "Foo::Bar qualifiedType;\n", // qualifier is on `type`, not the declarator
+            "void Prototype(int x);\n",
+            "static const char* kName = \"x\";\n",
+        ] {
+            let tree = parse(src, Lang::Cpp);
+            let node = tree.root_node().named_child(0).expect("top-level node");
+            assert!(
+                !is_definition_node(node, Some(Lang::Cpp)),
+                "{src:?} (kind {}) must not be a definition",
                 node.kind()
             );
         }

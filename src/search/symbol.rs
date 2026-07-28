@@ -499,7 +499,7 @@ fn walk_for_definitions(
     // put `Count` at depth 5 and made it unfindable. Not consuming a level here
     // mirrors how `outline::node_to_entry` already treats namespaces, and keeps C++
     // at parity with the languages whose members sit two levels under the file.
-    let child_depth = if namespace_is_transparent(kind, lang) {
+    let child_depth = if is_transparent_wrapper(kind, lang) {
         depth
     } else {
         depth + 1
@@ -520,16 +520,24 @@ fn walk_for_definitions(
     }
 }
 
-/// True for the C/C++ namespace wrapper nodes that should not consume a depth level.
+/// True for the C/C++ wrapper nodes that should not consume a depth level.
+///
+/// Namespaces cost two AST levels (`namespace_definition` + `declaration_list`) while
+/// adding no nesting an agent cares about. `template_declaration` is transparent for a
+/// second reason as well: it is not a definition kind (see `DEFINITION_KINDS`), so the
+/// walk has to reach the declaration it wraps for a member template to resolve at all.
 ///
 /// Scoped to C/C++ so no other grammar's budget changes: `namespace_definition` is
 /// also a PHP kind, and `declaration_list` is also C#'s class body — where it is the
 /// single body level those languages already spend, not an extra one.
-fn namespace_is_transparent(kind: &str, lang: Option<crate::types::Lang>) -> bool {
+fn is_transparent_wrapper(kind: &str, lang: Option<crate::types::Lang>) -> bool {
     matches!(lang, Some(crate::types::Lang::C | crate::types::Lang::Cpp))
         && matches!(
             kind,
-            "namespace_definition" | "declaration_list" | "linkage_specification"
+            "namespace_definition"
+                | "declaration_list"
+                | "linkage_specification"
+                | "template_declaration"
         )
 }
 
@@ -1521,6 +1529,60 @@ using MyAlias = float;
         let joined = "namespace A::B::C { class Target { public: void Method(); }; }\n";
         assert_eq!(cpp_find(joined, "Target").len(), 1);
         assert_eq!(cpp_find(joined, "Method").len(), 1);
+    }
+
+    /// A template whose `template <…>` clause sits on its own line — the normal spelling
+    /// in real C++ — was reported twice, once for the `template_declaration` wrapper and
+    /// once for the declaration it wraps. Their spans differ, so
+    /// `dedupe_same_span_definitions` could not collapse them; only the single-line
+    /// spelling happened to coincide and dedupe, which is why the original tests missed
+    /// it. Fixed by making the wrapper transparent rather than a definition.
+    #[test]
+    fn cpp_multi_line_template_is_reported_once() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "template <typename T>\nclass Vector { public: void Add(T V); };\n",
+                "Vector",
+            ),
+            (
+                "template <typename T> class Vector { public: void Add(T V); };\n",
+                "Vector",
+            ),
+            ("template <typename T>\nstruct Holder { T V; };\n", "Holder"),
+            ("template <typename T>\nvoid Swap(T& A, T& B) {}\n", "Swap"),
+        ];
+        for (src, name) in cases {
+            let defs = cpp_find(src, name);
+            assert_eq!(
+                defs.len(),
+                1,
+                "{name} should be reported once for {src:?}, got {defs:?}"
+            );
+        }
+
+        // An explicit specialization is a *different* entity from the in-class member it
+        // specializes, so two definitions here are correct — what must not happen is two
+        // reports of the same one. Assert distinct spans rather than a count of 1.
+        let spec = "template <typename T> class Foo { public: static int v; };\n\
+                    template<>\n\
+                    int Foo<int>::v = 0;\n";
+        let defs = cpp_find(spec, "v");
+        assert_eq!(defs.len(), 2, "expected the member and its specialization");
+        let spans: std::collections::HashSet<_> = defs.iter().map(|m| m.def_range).collect();
+        assert_eq!(
+            spans.len(),
+            2,
+            "the two definitions must have distinct spans"
+        );
+    }
+
+    /// A member template must still resolve. The wrapper being transparent is what makes
+    /// this work: it costs no depth level, so the walk reaches the declaration inside a
+    /// class body rather than exhausting its budget on the wrapper.
+    #[test]
+    fn cpp_member_template_resolves() {
+        let src = "class Holder {\npublic:\ntemplate <typename T>\nvoid Apply(T V);\n};\n";
+        assert_eq!(cpp_find(src, "Apply").len(), 1);
     }
 
     #[test]

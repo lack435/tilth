@@ -40,7 +40,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
         if source.is_empty() || is_external(&source, lang) {
             continue;
         }
-        if let Some(path) = resolve(dir, &source, lang) {
+        if let Some(path) = resolve_import_to_file(dir, &source, lang) {
             if !results.contains(&path) {
                 results.push(path);
             }
@@ -91,7 +91,10 @@ pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
     }
 }
 
-fn resolve(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
+/// Resolve an import source to an existing file on disk, or `None` when it does not
+/// name one. Shared with `search::deps`, which needs to distinguish "resolved to a
+/// local file" from "names something we cannot see" rather than only collecting hits.
+pub(crate) fn resolve_import_to_file(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
     let raw = match lang {
         Lang::Rust => resolve_rust(dir, source),
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => resolve_js(dir, source),
@@ -315,10 +318,11 @@ mod tests {
         fs::create_dir_all(root.join("a/c")).unwrap();
         fs::write(root.join("a/b/target.ts"), "").unwrap();
 
-        let from_sibling =
-            resolve(&root.join("a/b"), "./target", Lang::TypeScript).expect("sibling");
+        let from_sibling = resolve_import_to_file(&root.join("a/b"), "./target", Lang::TypeScript)
+            .expect("sibling");
         let from_cousin =
-            resolve(&root.join("a/c"), "../b/target", Lang::TypeScript).expect("cousin");
+            resolve_import_to_file(&root.join("a/c"), "../b/target", Lang::TypeScript)
+                .expect("cousin");
 
         assert_eq!(
             from_sibling, from_cousin,

@@ -20,6 +20,13 @@ const MAX_EXPORTED_SYMBOLS: usize = 25;
 /// Maximum number of dependents to show before truncation.
 const MAX_DEPENDENTS: usize = 15;
 
+/// Maximum number of external dependencies to list before truncating.
+///
+/// The list was unbounded, which was tolerable while it only held `<system>` headers.
+/// Reporting unresolvable quoted includes as external enlarged the population — a
+/// framework header can pull in dozens — so it needs the same bound `used_by` has.
+const MAX_EXTERNAL_DEPS: usize = 20;
+
 /// Result of a full dependency analysis for a single file.
 pub struct DepsResult {
     pub target: PathBuf,
@@ -160,7 +167,25 @@ pub fn analyze_deps(
         if source.is_empty() {
             continue;
         }
-        if !is_external(&source, lang) || is_stdlib(&source, lang) {
+        // A quoted C/C++ include is "local" only in the sense that it is not a system
+        // header — whether tilth can *see* the file is a separate question, and the
+        // answer depends on include paths that live in the build system. When it does
+        // not resolve on disk the dependency is real but outside scope, so surface it
+        // here instead of dropping it: previously `#include "Engine/Widget.h"` appeared
+        // in neither `uses_local` (unresolvable) nor `uses_external` (not a system
+        // header), silently under-reporting a header's forward dependencies.
+        //
+        // Scoped to C/C++ deliberately. Other languages' relative imports normally do
+        // resolve on disk, so applying the same fallback there would reclassify genuine
+        // resolution failures as external deps.
+        let external = is_external(&source, lang);
+        let unresolved_local = !external
+            && matches!(lang, crate::types::Lang::C | crate::types::Lang::Cpp)
+            && path.parent().is_none_or(|dir| {
+                crate::read::imports::resolve_import_to_file(dir, &source, lang).is_none()
+            });
+
+        if (!external && !unresolved_local) || is_stdlib(&source, lang) {
             continue;
         }
         // C/C++ `extract_import_source` deliberately keeps the `<…>` / `"…"`
@@ -516,8 +541,15 @@ fn format_uses_external(externals: &[String]) -> String {
         return String::new();
     }
     let mut out = String::from("## Uses (external)");
-    for ext in externals {
+    for ext in externals.iter().take(MAX_EXTERNAL_DEPS) {
         let _ = write!(out, "\n{ext}");
+    }
+    if externals.len() > MAX_EXTERNAL_DEPS {
+        let _ = write!(
+            out,
+            "\n... and {} more",
+            externals.len() - MAX_EXTERNAL_DEPS
+        );
     }
     out
 }
@@ -690,6 +722,83 @@ mod tests {
                 .iter()
                 .map(|d| &d.path)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A quoted include that does not resolve on disk used to vanish from both lists:
+    /// not a system header, so not "external", and unresolvable, so not "local". Any
+    /// project whose headers sit behind a build-system include path — most non-trivial
+    /// C++ builds — therefore had its forward dependencies under-reported.
+    #[test]
+    fn cpp_unresolvable_quoted_include_is_reported_as_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Sibling.h"), "struct Sibling { int V; };\n").unwrap();
+        std::fs::write(
+            root.join("Consumer.cpp"),
+            "#include <vector>\n\
+             #include \"Sibling.h\"\n\
+             #include \"Engine/Faraway.h\"\n\
+             void F() {}\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("Consumer.cpp"), root, &bloom).unwrap();
+
+        // Resolvable quoted include stays local.
+        assert!(
+            result
+                .uses_local
+                .iter()
+                .any(|d| d.path.ends_with("Sibling.h")),
+            "resolvable quoted include should be local, got {:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+        // System header and the unresolvable quoted one are both reported.
+        assert!(
+            result.uses_external.iter().any(|e| e == "vector"),
+            "expected `vector`, got {:?}",
+            result.uses_external
+        );
+        assert!(
+            result.uses_external.iter().any(|e| e == "Engine/Faraway.h"),
+            "unresolvable quoted include must still be reported, got {:?}",
+            result.uses_external
+        );
+        // It must not be double-counted as local.
+        assert!(
+            !result
+                .uses_local
+                .iter()
+                .any(|d| d.path.to_string_lossy().contains("Faraway")),
+            "unresolvable include must not appear as a local dep"
+        );
+    }
+
+    /// The fallback above is C/C++-only. Other languages' relative imports normally do
+    /// resolve on disk, so applying it there would reclassify genuine resolution
+    /// failures as external dependencies.
+    #[test]
+    fn unresolvable_relative_import_stays_unreported_for_other_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("app.ts"),
+            "import { x } from './missing';\nexport const y = 1;\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("app.ts"), root, &bloom).unwrap();
+        assert!(
+            !result.uses_external.iter().any(|e| e.contains("missing")),
+            "a TS relative import must not be reclassified as external, got {:?}",
+            result.uses_external
         );
     }
 

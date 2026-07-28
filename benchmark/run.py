@@ -37,15 +37,21 @@ from fixtures.reset import reset_repo, ensure_repo_clean
 
 
 def _tilth_version() -> Optional[str]:
-    """Get installed tilth version via `tilth --version`."""
+    """Get the tilth version recorded in results, via `tilth --version`.
+
+    Resolved from PATH rather than a hardcoded `~/.cargo/bin/tilth`: that path has
+    no `.exe` suffix on Windows so it never resolved there, silently recording a
+    null `tilth_version` in every result row. `tilth_mcp.json` invokes `tilth` from
+    PATH too, so this reports the version of the binary the run actually used.
+    """
     try:
         result = subprocess.run(
-            [str(Path.home() / ".cargo" / "bin" / "tilth"), "--version"],
+            ["tilth", "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"
         return result.stdout.strip().removeprefix("tilth ") if result.returncode == 0 else None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -326,6 +332,25 @@ Examples:
         ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
         if args.verbose:
             print(f"Cleaned repo: {repo_name}")
+
+    # Fail fast when a tilth mode is requested but no tilth binary is reachable.
+    #
+    # Without this the run completes and looks fine: the MCP server simply fails to
+    # start, the agent falls back to built-in tools, and every row is recorded under
+    # mode "tilth" while actually measuring baseline — silently invalid results that
+    # are indistinguishable from real ones except for a null `tilth_version`. Better
+    # to refuse than to emit numbers nobody can trust.
+    if any("tilth" in m for m in modes) and _tilth_version() is None:
+        print(
+            "ERROR: a tilth mode was requested but `tilth` is not runnable from PATH.\n"
+            "       The MCP server would fail to start and the run would silently\n"
+            "       measure baseline tooling instead.\n"
+            "       Install it with `cargo install --path .` from the repo root.",
+            file=sys.stderr,
+        )
+        # `sys.exit`, not `return`: `main()`'s value is discarded at the call site, so
+        # returning would let the run continue. Matches the other guards above.
+        sys.exit(1)
 
     # Create results directory
     RESULTS_DIR.mkdir(exist_ok=True)
