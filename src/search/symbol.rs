@@ -8,7 +8,7 @@ use super::file_metadata;
 use crate::lang::treesitter::{
     definition_weight, elixir_definition_weight, extract_definition_name,
     extract_elixir_definition_name, extract_impl_trait, extract_impl_type,
-    extract_implemented_interfaces, is_elixir_definition, DEFINITION_KINDS,
+    extract_implemented_interfaces, is_definition_node, is_elixir_definition,
 };
 
 use crate::error::TilthError;
@@ -317,7 +317,44 @@ fn find_defs_treesitter(
         root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
     );
 
+    dedupe_same_span_definitions(&mut defs);
+
     defs
+}
+
+/// Collapse definition matches that describe the same definition at the same span,
+/// keeping the most specific one.
+///
+/// Two nodes can name one definition: in C++ a nested class is reachable both as the
+/// `field_declaration` wrapping it and as the `class_specifier` inside it, and in
+/// TS/JS an exported declaration is reachable both as the `export_statement` and as
+/// the `class_declaration` it wraps. Both pairs share a span, so without this the
+/// class is reported twice.
+///
+/// Keeping the *highest `def_weight`* rather than the first is what makes this safe
+/// across languages. The walk is depth-first pre-order, so the first of a run is the
+/// enclosing node — which for TS/JS is the `export_statement` wrapper, deliberately
+/// the lowest definition tier (30) precisely because it is not the interesting node.
+/// Keeping it would demote every exported definition below an unrelated local `let`
+/// (weight 40) in `rank::sort`, which multiplies `def_weight` by 10.
+fn dedupe_same_span_definitions(defs: &mut Vec<Match>) {
+    if defs.len() < 2 {
+        return;
+    }
+    // Pre-order emission puts an enclosing node adjacent to the node it wraps, so a
+    // single pass over adjacent runs is sufficient.
+    let mut out: Vec<Match> = Vec::with_capacity(defs.len());
+    for m in defs.drain(..) {
+        match out.last_mut() {
+            Some(prev) if prev.def_range == m.def_range && prev.def_name == m.def_name => {
+                if m.def_weight > prev.def_weight {
+                    *prev = m;
+                }
+            }
+            _ => out.push(m),
+        }
+    }
+    *defs = out;
 }
 
 /// Recursively walk AST nodes looking for definitions of the queried symbol.
@@ -338,7 +375,7 @@ fn walk_for_definitions(
 
     let kind = node.kind();
 
-    if DEFINITION_KINDS.contains(&kind) {
+    if is_definition_node(node, lang) {
         // Check if this node defines the queried symbol
         if let Some(name) = extract_definition_name(node, lines) {
             if name == query {
@@ -453,7 +490,20 @@ fn walk_for_definitions(
         }
     }
 
-    // Recurse into children (for nested definitions, class bodies, impl blocks, etc.)
+    // Recurse into children (for nested definitions, class bodies, impl blocks, etc.).
+    //
+    // A C/C++ namespace is a transparent wrapper: it costs two AST levels
+    // (`namespace_definition` + `declaration_list`) while adding no nesting an agent
+    // cares about, so counting it against the depth budget spends the whole allowance
+    // before reaching a class's members. `namespace NS { class Holder { int Count; } }`
+    // put `Count` at depth 5 and made it unfindable. Not consuming a level here
+    // mirrors how `outline::node_to_entry` already treats namespaces, and keeps C++
+    // at parity with the languages whose members sit two levels under the file.
+    let child_depth = if namespace_is_transparent(kind, lang) {
+        depth
+    } else {
+        depth + 1
+    };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_for_definitions(
@@ -465,9 +515,22 @@ fn walk_for_definitions(
             mtime,
             defs,
             lang,
-            depth + 1,
+            child_depth,
         );
     }
+}
+
+/// True for the C/C++ namespace wrapper nodes that should not consume a depth level.
+///
+/// Scoped to C/C++ so no other grammar's budget changes: `namespace_definition` is
+/// also a PHP kind, and `declaration_list` is also C#'s class body — where it is the
+/// single body level those languages already spend, not an extra one.
+fn namespace_is_transparent(kind: &str, lang: Option<crate::types::Lang>) -> bool {
+    matches!(lang, Some(crate::types::Lang::C | crate::types::Lang::Cpp))
+        && matches!(
+            kind,
+            "namespace_definition" | "declaration_list" | "linkage_specification"
+        )
 }
 
 /// Keyword heuristic fallback for files without tree-sitter grammars.
@@ -1313,6 +1376,197 @@ Body to end.
             matches.iter().all(|m| m.def_weight >= 60),
             "displayed slice after cap must be all code defs, got {:?}",
             matches.iter().map(|m| m.def_weight).collect::<Vec<_>>()
+        );
+    }
+
+    /// Helper: search for a C++ definition by name in a `.h` snippet.
+    fn cpp_find(code: &str, name: &str) -> Vec<Match> {
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Cpp).unwrap();
+        find_defs_treesitter(
+            std::path::Path::new("Probe.h"),
+            name,
+            &ts_lang,
+            Some(crate::types::Lang::Cpp),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn cpp_type_definitions_detected() {
+        let code = "\
+class PlainThing { public: void DoPlainWork(); };
+class BaseThing {};
+class FinalWithBase final : public BaseThing {};
+struct PlainStruct { int A; };
+enum class ScopedEnum : uint8_t { SA, SB };
+template <typename T> class TemplateThing { public: void Work(); };
+typedef int MyTypedef;
+using MyAlias = float;
+";
+        for name in [
+            "PlainThing",
+            "BaseThing",
+            "FinalWithBase",
+            "PlainStruct",
+            "ScopedEnum",
+            "TemplateThing",
+            "MyTypedef",
+            "MyAlias",
+        ] {
+            let defs = cpp_find(code, name);
+            assert!(!defs.is_empty(), "should find C++ definition of {name}");
+            assert!(defs[0].is_definition, "{name} should be a definition");
+            assert!(defs[0].def_range.is_some(), "{name} needs a def_range");
+        }
+    }
+
+    #[test]
+    fn cpp_class_definition_is_reported_once() {
+        // A nested class is reachable both as the `field_declaration` wrapping it and
+        // as the `class_specifier` inside it, both starting on the same line. Only one
+        // match may survive, or every C++ class would be reported twice.
+        let code = "class Outer { public: class Inner { void Deep(); }; };\n";
+        let inner = cpp_find(code, "Inner");
+        assert_eq!(
+            inner.len(),
+            1,
+            "nested class must be reported once, got {inner:?}"
+        );
+        let outer = cpp_find(code, "Outer");
+        assert_eq!(outer.len(), 1, "class must be reported once, got {outer:?}");
+    }
+
+    /// `dedupe_same_span_definitions` must keep the *highest-weight* node of a
+    /// same-span run, not the first. The walk is pre-order, so the first is the
+    /// enclosing node — for TS/JS that is the `export_statement` wrapper, weight 30,
+    /// the lowest definition tier. Keeping it demoted every exported definition below
+    /// an unrelated local `let` (weight 40), because `rank::sort` multiplies
+    /// `def_weight` by 10. This is the run the dedup actually fires on; the C++ nested
+    /// class it was written for is depth-limited out of reach.
+    #[test]
+    fn exported_ts_definition_survives_dedup_with_its_real_weight() {
+        let code = "export class Widget {}\nexport function handle() {}\n";
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::TypeScript)
+            .expect("ts grammar");
+        for (name, want_weight) in [("Widget", 100u16), ("handle", 100)] {
+            let defs = find_defs_treesitter(
+                std::path::Path::new("thing.ts"),
+                name,
+                &ts_lang,
+                Some(crate::types::Lang::TypeScript),
+                code,
+                2,
+                SystemTime::now(),
+            );
+            assert_eq!(
+                defs.len(),
+                1,
+                "{name} should be reported once, got {defs:?}"
+            );
+            assert_eq!(
+                defs[0].def_weight, want_weight,
+                "{name} must keep the inner declaration's weight, not export_statement's 30"
+            );
+        }
+    }
+
+    #[test]
+    fn exported_definition_outranks_unrelated_local_binding() {
+        // End-to-end consequence of the above: the real definition must still lead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path();
+        std::fs::create_dir_all(scope.join("deep")).expect("mkdir");
+        std::fs::write(
+            scope.join("deep").join("thing.ts"),
+            "export class Widget {}\n",
+        )
+        .expect("write");
+        std::fs::write(scope.join("local.ts"), "let Widget = 1;\n").expect("write");
+
+        let result = search("Widget", scope, None, None, false).expect("search");
+        let top = result.matches.first().expect("a match");
+        assert!(
+            top.path.ends_with("thing.ts"),
+            "`export class Widget` must outrank a local `let Widget`, got {:?}",
+            result
+                .matches
+                .iter()
+                .map(|m| (m.path.file_name(), m.def_weight))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A C++ namespace costs two AST levels while adding no nesting an agent cares
+    /// about, so counting it against the walk's depth budget spent the whole allowance
+    /// before reaching a class's members — `namespace NS { class Holder { int Count; } }`
+    /// made `Count` unfindable, which undercuts resolving C++ *members* at all.
+    #[test]
+    fn cpp_members_inside_namespaces_are_findable() {
+        let code = "namespace N0 {\n\
+                    namespace N1 {\n\
+                    class Target { public: void Method(); int Count; };\n\
+                    }\n\
+                    }\n";
+        for name in ["Target", "Method", "Count"] {
+            let defs = cpp_find(code, name);
+            assert_eq!(
+                defs.len(),
+                1,
+                "{name} should be found exactly once inside nested namespaces, got {defs:?}"
+            );
+        }
+        // C++17 nested-namespace form resolves the same way.
+        let joined = "namespace A::B::C { class Target { public: void Method(); }; }\n";
+        assert_eq!(cpp_find(joined, "Target").len(), 1);
+        assert_eq!(cpp_find(joined, "Method").len(), 1);
+    }
+
+    #[test]
+    fn cpp_forward_declaration_is_not_a_definition() {
+        // `class Fwd;` declares nothing; a definition match here would put a bogus
+        // hit at every forward declaration in every header.
+        let code = "class Fwd;\nclass Fwd* Global;\n";
+        assert!(
+            cpp_find(code, "Fwd").is_empty(),
+            "forward declaration must not be a definition"
+        );
+    }
+
+    #[test]
+    fn cpp_class_definition_outranks_its_usages() {
+        // The day-to-day payoff: a class definition used to be reported as a *usage*
+        // (its `class_specifier` was in no definition table), so search results led
+        // with mentions rather than with the declaration.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path();
+        std::fs::write(
+            scope.join("Types.h"),
+            "class BaseThing {};\nclass Derived final : public BaseThing {};\n",
+        )
+        .expect("write header");
+        std::fs::write(
+            scope.join("Use.cpp"),
+            "#include \"Types.h\"\nvoid Take(BaseThing* T) {}\nvoid Also(BaseThing& R) {}\n",
+        )
+        .expect("write source");
+
+        let result = search("BaseThing", scope, None, None, false).expect("search");
+        assert_eq!(
+            result.definitions, 1,
+            "expected exactly one definition, got {result:?}"
+        );
+        let top = result.matches.first().expect("at least one match");
+        assert!(
+            top.is_definition,
+            "the definition must rank first, got {top:?}"
+        );
+        assert_eq!(top.line, 1, "the definition is on line 1 of Types.h");
+        assert!(
+            result.usages >= 2,
+            "expected the parameter mentions as usages, got {}",
+            result.usages
         );
     }
 

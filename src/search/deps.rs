@@ -160,9 +160,20 @@ pub fn analyze_deps(
         if source.is_empty() {
             continue;
         }
-        if is_external(&source, lang) && !is_stdlib(&source, lang) && is_valid_module_path(&source)
-        {
-            external_set.insert(source.clone());
+        if !is_external(&source, lang) || is_stdlib(&source, lang) {
+            continue;
+        }
+        // C/C++ `extract_import_source` deliberately keeps the `<…>` / `"…"`
+        // delimiters so `is_external` can tell a system header from a
+        // project-relative one. Strip them before recording: `is_valid_module_path`
+        // requires an alphanumeric first character, so a leading `<` silently
+        // dropped every `#include <…>` and left `uses_external` permanently empty
+        // for C and C++. Other languages' sources never carry these delimiters
+        // (`extract_import_source` already strips JS/TS quotes), so this is a no-op
+        // for them.
+        let module = source.trim_matches(|c| c == '<' || c == '>' || c == '"');
+        if is_valid_module_path(module) {
+            external_set.insert(module.to_string());
         }
     }
     let mut uses_external: Vec<String> = external_set.into_iter().collect();
@@ -638,6 +649,120 @@ fn assemble(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `extract_import_source` keeps the `<…>` / `"…"` delimiters on a C/C++ include
+    /// so `is_external` can tell a system header from a project-relative one — but
+    /// `is_valid_module_path` requires an alphanumeric first character, so a leading
+    /// `<` silently dropped every `#include <…>` and left `uses_external` permanently
+    /// empty for C and C++.
+    /// Pins the delimiter-stripping through the real `analyze_deps` path rather than by
+    /// re-implementing it: asserting `is_valid_module_path("<vector>") == false` and
+    /// then trimming inline would pass with the production fix reverted.
+    #[test]
+    fn cpp_system_includes_are_reported_as_external_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Uses.cpp"),
+            "#include <vector>\n#include <memory>\n#include \"Local.h\"\nvoid F() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Local.h"), "struct S { int V; };\n").unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("Uses.cpp"), root, &bloom).unwrap();
+
+        assert_eq!(
+            result.uses_external,
+            vec!["memory".to_string(), "vector".to_string()],
+            "angle-bracket includes must survive module-path validation, stripped of \
+             their delimiters"
+        );
+        // The quoted include is a local dep, not an external one.
+        assert!(
+            result
+                .uses_local
+                .iter()
+                .any(|d| d.path.ends_with("Local.h")),
+            "quoted include should resolve as local, got {:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// End-to-end: a C++ header reported `0 local, 0 external, 0 dependents`. Local
+    /// and dependent counts depend on the outline naming the class and its members,
+    /// and the dependent is reached through a qualified static call.
+    #[test]
+    fn cpp_header_reports_local_external_and_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Shared.h"),
+            "struct SharedThing { int Value; };\n",
+        )
+        .unwrap();
+        // A header in the shape a code-generating C++ framework produces: an export
+        // macro in the class head, call-shaped annotation macros, and static helpers
+        // reached only through qualified calls. Every identifier is invented — the
+        // point is the AST shape, not any particular framework.
+        std::fs::write(
+            root.join("LogUtil.h"),
+            "#pragma once\n\
+             #include <vector>\n\
+             #include \"Shared.h\"\n\
+             \n\
+             ANNOTATE()\n\
+             class MYLIB_API LogUtilities final : public HelperLibraryBase\n\
+             {\n\
+             \tBODY_MACRO()\n\
+             public:\n\
+             \tstatic const char* GetLogNameSafe(const Actor* Subject);\n\
+             };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Consumer.cpp"),
+            "#include \"LogUtil.h\"\n\
+             void DoSomething(const Actor* Subject)\n\
+             {\n\
+             \tLogUtilities::GetLogNameSafe(Subject);\n\
+             }\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("LogUtil.h"), root, &bloom).unwrap();
+
+        assert!(
+            result
+                .uses_local
+                .iter()
+                .any(|d| d.path.ends_with("Shared.h")),
+            "expected Shared.h as a local dep, got {:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.uses_external.iter().any(|e| e == "vector"),
+            "expected `vector` as an external dep, got {:?}",
+            result.uses_external
+        );
+        assert!(
+            result
+                .used_by
+                .iter()
+                .any(|d| d.path.ends_with("Consumer.cpp")),
+            "expected Consumer.cpp as a dependent, got {:?}",
+            result.used_by.iter().map(|d| &d.path).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn go_stdlib_fmt_is_stdlib() {
