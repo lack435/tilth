@@ -61,6 +61,19 @@ class LevelDBStatusTypeTask(Task):
         return "leveldb"
 
     @property
+    def requires_tool_use(self) -> list[str]:
+        # Type resolution is the path under test, reachable through either a
+        # structural symbol search or grok. Reading the header with tilth_read alone
+        # does not exercise it — that is just `cat`.
+        #
+        # `kind!=content` matters: a bare tilth_search requirement is satisfied by
+        # `kind="content"`, which is a ripgrep literal search that touches no C++ AST
+        # code at all. Stated negatively rather than as `kind=symbol` because symbol is
+        # the default and the argument is usually omitted, so the positive form would
+        # fail on exactly the calls it means to accept.
+        return ["mcp__tilth__tilth_grok|mcp__tilth__tilth_search:kind!=content"]
+
+    @property
     def prompt(self) -> str:
         return (
             "Describe leveldb's `Status` class: which header declares it, what "
@@ -109,14 +122,31 @@ class LevelDBCorruptionCallersTask(Task):
     ones; a run that listed eight correct sites failed because none of them
     happened to be in db/repair.cc.
 
-    Pinning the files removes the search, though, so the enclosing-function
-    names alone are a weak signal — `ReportCorruption` is also declared at
-    db/log_reader.h:85 and every name appears in a plain outline of the file
-    the prompt names, so an agent could outline and guess. The two message
-    literals close that hole: they exist only at the call sites themselves, and
-    `missing files` covers the db/db_impl.cc:360 site in `DBImpl::Recover` that
-    the enclosing-name strings otherwise miss. `Recover` cannot be required
-    directly — under substring grading it is satisfied by `RecoverLogFile`.
+    Pinning the files keeps the graded detail stable, but on its own it removed
+    the search entirely: with the files named, the task is answerable by reading
+    three files, and a `tilth_forced` run confirmed the agent did exactly that —
+    eight plain symbol searches and nine reads, never a `kind="callers"` search.
+    A task that never enters the code path it guards is not a guard.
+
+    So the prompt asks for a repo-wide survey of the call sites before narrowing
+    to the three graded files. That phrasing is load-bearing and was measured: of
+    six runs under the pinned-files-only phrasing, *none* used `kind="callers"` or
+    grok; of eight runs with the survey, five reached the caller-detection path
+    (four via `kind="callers"`, one via grok). It costs roughly 40% more turns.
+    Route adherence is therefore better but still not reliable, which is why the
+    deterministic check lives in a Rust test
+    (`cpp_qualified_static_callers_on_real_fixture`) rather than here. The survey
+    is not itself graded — see `ground_truth`. `requires_tool_use` does not force
+    the route; it makes a run that skipped it stop counting as coverage.
+
+    The enclosing-function names alone are a weak signal — `ReportCorruption` is
+    also declared at db/log_reader.h:85 and every name appears in a plain outline
+    of the file the prompt names, so an agent could outline and guess. The two
+    message literals close that hole: they exist only at the call sites
+    themselves, and `missing files` covers the db/db_impl.cc:360 site in
+    `DBImpl::Recover` that the enclosing-name strings otherwise miss. `Recover`
+    cannot be required directly — under substring grading it is satisfied by
+    `RecoverLogFile`.
 
     The prompt also warns that a same-named `Corruption` method exists on the
     log reporter. tilth's callers search cannot filter by qualification, so
@@ -131,6 +161,17 @@ class LevelDBCorruptionCallersTask(Task):
         return "leveldb_corruption_callers"
 
     @property
+    def requires_tool_use(self) -> list[str]:
+        # The whole point of this task. Caller detection for C++ qualified statics is
+        # the path being guarded, and it runs for a `kind="callers"` search or for
+        # grok (which assembles callers itself). Without this requirement the task
+        # passed on Glob + Bash + Read with zero tilth calls — a green result that
+        # said nothing about the code it was written to protect.
+        return [
+            "mcp__tilth__tilth_search:kind=callers|mcp__tilth__tilth_grok",
+        ]
+
+    @property
     def repo(self) -> str:
         return "leveldb"
 
@@ -139,13 +180,14 @@ class LevelDBCorruptionCallersTask(Task):
         return (
             "leveldb signals a corrupt database by building a `Status` through "
             "the static factory `Status::Corruption`. Find where that factory "
-            "is declared and which `Code` enum value it stores. Then find its "
-            "call sites in these three files — db/db_impl.cc, db/log_reader.cc "
-            "and db/repair.cc — and for every one of those sites give the "
-            "enclosing function or method that contains the call and the "
-            "message string passed to the factory. Note that an unrelated "
-            "`Corruption` method exists on the log reporter; count only calls "
-            "to `Status::Corruption` itself."
+            "is declared and which `Code` enum value it stores. Then survey its "
+            "call sites across the whole repository to see which files contain "
+            "them. From that survey, report on the call sites in db/db_impl.cc, "
+            "db/log_reader.cc and db/repair.cc specifically: for each, give the "
+            "enclosing function or method that contains the call and the message "
+            "string passed to the factory. Note that an unrelated `Corruption` "
+            "method exists on the log reporter; count only calls to "
+            "`Status::Corruption` itself."
         )
 
     @property
@@ -159,6 +201,20 @@ class LevelDBCorruptionCallersTask(Task):
         # "log record too small" (db_impl.cc:435 and repair.cc:186) and
         # "missing files" (db_impl.cc:358, snprintf'd into the buf passed at
         # :360 inside DBImpl::Recover — the site the scope names miss).
+        # Deliberately no repo-wide count here, though the prompt asks for the survey.
+        #
+        # Note what is and is not obtainable. The callers *total* IS printed in the
+        # header before the display cap, so "33 call sites" is readable — that is what
+        # the Rust fixture test asserts. What cannot be derived is the number of
+        # distinct *files* (only 10 call-site blocks are shown) or the qualification-
+        # filtered count of 30 (the header's 33 includes 3 unrelated
+        # `Reporter::Corruption` calls, and tilth cannot filter callers by qualifier).
+        #
+        # Measured: both `tilth_forced` runs used `kind="callers"` as intended and still
+        # answered "6 files", while hybrid runs answered 12 because they had grep. So
+        # grading a count would penalise using tilth. The survey stays in the prompt
+        # because it steers the route (see the class docstring); the *graded* facts are
+        # the per-file details, unchanged from when this task was introduced.
         return GroundTruth(
             required_strings=[
                 "kCorruption",
@@ -197,6 +253,13 @@ class LevelDBEnvHeaderDepsTask(Task):
     @property
     def name(self) -> str:
         return "leveldb_env_header_deps"
+
+    @property
+    def requires_tool_use(self) -> list[str]:
+        # Both directions of the include graph come from tilth_deps; nothing else
+        # computes dependents. A grep can list `#include` lines but not what includes
+        # this header, so an answer without tilth_deps did not test the path.
+        return ["mcp__tilth__tilth_deps"]
 
     @property
     def repo(self) -> str:

@@ -47,6 +47,28 @@ class Task(ABC):
         return "synthetic"
 
     @property
+    def requires_tool_use(self) -> list[str]:
+        """Tilth tool calls this task must make for its result to mean anything.
+
+        Some tasks exist to measure cost and accuracy; others exist to detect a
+        regression in a specific tilth code path. For the second kind, a correct
+        answer reached with Bash and grep proves nothing about the path under
+        test — the task passes while the thing it guards is broken. Declaring the
+        requirement here makes such a run fail loudly instead.
+
+        Each entry is a tool name, optionally with one required argument:
+
+            "mcp__tilth__tilth_deps"                    # tool was called
+            "mcp__tilth__tilth_search:kind=callers"     # ...with kind="callers"
+
+        Checked only in tilth modes — a baseline run has no tilth tools and is
+        never held to this. Empty (the default) means the task is a
+        cost/accuracy measurement and the agent is free to solve it any way it
+        likes, which is how every pre-existing task behaves.
+        """
+        return []
+
+    @property
     def mutations(self) -> list[Mutation]:
         """Mutations to apply before the agent runs. Empty for non-mutation tasks."""
         return []

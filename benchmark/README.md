@@ -185,6 +185,14 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 
 **Grading semantics**: correctness is a case-insensitive, backtick-stripped substring match — every `required_strings` entry for a task must appear somewhere in the graded text (`benchmark/tasks/base.py`'s `check_correctness`). The graded text is the agent's text output *accumulated across every assistant turn in the run*, not just the final one — a short wrap-up turn at the end of a run adds to, rather than replaces, the substantive answer from an earlier turn (`benchmark/parse.py`'s `parse_stream_json`).
 
+A task may additionally declare `requires_tool_use`, and for those tasks `correct`
+means "answered correctly **and** took the intended route" — see
+[Tasks that guard a specific tilth path](#tasks-that-guard-a-specific-tilth-path). The
+answer verdict on its own is preserved as `answer_correct` in every row, so accuracy
+can still be compared against a `baseline` row (which is never held to a route
+requirement). Compare `answer_correct` across modes; compare `correct` only within
+tilth modes.
+
 **Repos (pinned commits):**
 
 | Repo | Language | Description |
@@ -241,6 +249,42 @@ python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb 
 python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models sonnet --reps 1 --modes tilth
 ```
 
+**Tasks that guard a specific tilth path:**
+
+Most tasks measure cost and accuracy, and the agent is free to solve them however
+it likes — reaching the right answer with `Bash` and grep is a legitimate data
+point about tool adoption.
+
+A few tasks exist instead to detect a regression in one tilth code path. For those,
+a correct answer obtained by grepping proves nothing: the task goes green while the
+path it guards is broken. Such a task declares what it must exercise via
+`requires_tool_use` (see `tasks/base.py`), and a run in a tilth mode that does not
+satisfy it is reported as **incorrect**, with the reason naming what was missed.
+
+The three `leveldb_*` tasks are the C++ regression signal and all declare a
+requirement — `leveldb_corruption_callers` was added for C++ qualified-static call
+sites and originally passed using `Glob`, `Bash` and `Read` with zero tilth calls.
+`tool_requirements_met` in each result row records the outcome (`null` when the task
+declares no requirement, or in `baseline` mode where there are no tilth tools).
+
+Requirements are satisfiable by any legitimate entry point to the path, so
+`kind="callers"` search and `tilth_grok` both count for caller detection.
+
+Two consequences worth knowing before reading such a row:
+
+- `correct` for these tasks means answer **and** route. `answer_correct` holds the
+  answer verdict alone, so cross-mode accuracy comparisons should use that — a
+  `baseline` row is never held to a route requirement, so comparing its `correct`
+  against a tilth row's would be apples to oranges.
+- Route adherence is not reliable, so this is **not** a gate. Measured on
+  `leveldb_corruption_callers`: the agent reached the caller-detection path in five
+  runs out of eight, even with tilth as its only tool. It makes a grep-derived answer
+  stop counting as coverage; it cannot make the agent take the path. Deterministic
+  guarding belongs in a Rust test — see
+  `cpp_qualified_static_callers_on_real_fixture` in `src/search/callers.rs`.
+
+The harness's own logic is tested: `python -m unittest discover -s benchmark -p 'test_*.py'`.
+
 **Analyze:**
 
 ```bash
@@ -268,6 +312,7 @@ We welcome benchmark contributions — more data makes the results more reliable
 - `prompt`: the code navigation question
 - `ground_truth`: list of strings that must appear in a correct answer
 - `task_type`: `"read"`, `"navigate"` or `"edit"` (defaults to `"read"`); note the easy/medium/hard tier in the class docstring
+- `requires_tool_use` (optional): only if the task exists to guard a specific tilth code path rather than to measure cost and accuracy — see [Tasks that guard a specific tilth path](#tasks-that-guard-a-specific-tilth-path). Leave it unset for a normal task, so the agent stays free to solve it however it likes
 
 Good tasks have unambiguous correct answers that can be verified by string matching. Avoid tasks where the answer depends on interpretation.
 

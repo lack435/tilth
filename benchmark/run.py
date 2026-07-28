@@ -31,7 +31,7 @@ from config import (
     DEFAULT_REPS,
     TILTH_MCP_CODEX_ARGS,
 )
-from parse import parse_stream_json, parse_codex_json, tool_call_counts
+from parse import RunResult, parse_stream_json, parse_codex_json, tool_call_counts
 from tasks import TASKS
 from fixtures.reset import reset_repo, ensure_repo_clean
 
@@ -53,6 +53,80 @@ def _tilth_version() -> Optional[str]:
         return result.stdout.strip().removeprefix("tilth ") if result.returncode == 0 else None
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
+
+
+def _scalar(value) -> str:
+    """Normalise a tool-argument value for comparison against a requirement.
+
+    Requirements are written in the JSON/MCP spelling an author would naturally
+    reach for (`full=true`), while the parsed input holds a Python value (`True`).
+    Lowercasing bridges that and makes matching case-insensitive, which is what an
+    author expects of `kind=callers`.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).strip().lower()
+
+
+def _unmet_tool_requirements(
+    run_result: RunResult, requirements: list[str]
+) -> list[str]:
+    """Return the entries of `requirements` this run did not satisfy.
+
+    Requirement syntax (see `Task.requires_tool_use`):
+      "tool_name"                — the tool was called at least once
+      "tool_name:key=value"      — ...with `key` equal to `value` in its input
+      "tool_name:key!=value"     — ...with `key` NOT equal to `value`
+      "alt_a|alt_b"              — either alternative satisfies the requirement
+
+    `!=` exists because the interesting constraint is often negative: a *structural*
+    search is any `tilth_search` that is not `kind="content"`, and stating it
+    positively would fail whenever the agent omits the argument and takes the
+    default. For the same reason an absent argument compares as the empty string,
+    so `kind!=content` is satisfied by a call that never passes `kind`.
+
+    Alternation exists because a code path usually has more than one legitimate
+    entry point — caller detection runs for both `tilth_search kind="callers"` and
+    `tilth_grok`, and pinning one would fail a run that exercised the path via the
+    other. A consequence is that `|` cannot appear inside a required value.
+
+    Raises ValueError on a malformed requirement rather than silently never matching:
+    a typo like `"tool:kind"` (no `=`) would otherwise be satisfied by exactly the
+    calls it was meant to exclude, permanently mis-grading a task.
+    """
+    calls = [tc for turn in run_result.turns for tc in turn.tool_calls]
+
+    def satisfied(alternative: str) -> bool:
+        tool_name, sep, arg_spec = alternative.strip().partition(":")
+        tool_name = tool_name.strip()
+        if not tool_name:
+            raise ValueError(f"requirement has no tool name: {alternative!r}")
+        matching = [tc for tc in calls if tc.name == tool_name]
+        if sep:
+            arg_spec = arg_spec.strip()
+            if "=" not in arg_spec:
+                raise ValueError(
+                    f"requirement {alternative!r} has an argument spec with no "
+                    f"'=' — write 'key=value' or 'key!=value'"
+                )
+            negated = "!=" in arg_spec
+            key, _, value = arg_spec.partition("!=" if negated else "=")
+            key, value = key.strip(), _scalar(value)
+            if negated:
+                matching = [
+                    tc for tc in matching if _scalar(tc.input.get(key, "")) != value
+                ]
+            else:
+                matching = [
+                    tc for tc in matching if _scalar(tc.input.get(key, "")) == value
+                ]
+        return bool(matching)
+
+    return [
+        requirement
+        for requirement in requirements
+        if not any(satisfied(alt) for alt in requirement.split("|"))
+    ]
 
 
 def get_repo_path(repo_name: str) -> Path:
@@ -192,6 +266,34 @@ def run_single(
         run_result.result_text,
         str(repo_path),
     )
+
+    # Enforce declared tool-use requirements (see Task.requires_tool_use).
+    #
+    # A task that exists to guard a tilth code path is only a guard if that path
+    # actually ran. Without this, an agent that answers correctly via Bash and grep
+    # records `correct: true` while the path under test could be entirely broken —
+    # which is exactly what happened to leveldb_corruption_callers, the task written
+    # for C++ qualified-static call sites: it passed using Glob, Bash and Read, and
+    # zero tilth calls.
+    # The answer verdict is kept separately. `correct` becomes "answered correctly AND
+    # took the intended route", which is what a regression guard needs, but collapsing
+    # the two would make the rows unanalysable: a baseline row is graded on the answer
+    # alone, so comparing its accuracy against a tilth row graded on both would be
+    # apples to oranges, and "wrong answer" would be indistinguishable from "right
+    # answer, wrong route" without re-grading `result_text` by hand.
+    answer_correct, answer_reason = correct, reason
+
+    requirements_met: Optional[bool] = None
+    if "tilth" in mode_name and task.requires_tool_use:
+        missing = _unmet_tool_requirements(run_result, task.requires_tool_use)
+        requirements_met = not missing
+        if missing:
+            correct = False
+            reason = (
+                "tilth path not exercised (answer may be correct but proves nothing "
+                f"about it): {', '.join(missing)}"
+            )
+
     run_result.correct = correct
     run_result.correctness_reason = reason
 
@@ -210,6 +312,12 @@ def run_single(
         "model": model_name,
         "repetition": repetition,
         "tilth_version": _tilth_version() if "tilth" in mode_name else None,
+        # None when the task declares no requirement or the mode has no tilth.
+        "tool_requirements_met": requirements_met,
+        # The answer verdict on its own, unaffected by the route requirement. Equal to
+        # `correct` for every task that declares no requirement.
+        "answer_correct": answer_correct,
+        "answer_correctness_reason": answer_reason,
         "num_turns": run_result.num_turns,
         "num_tool_calls": sum(tool_breakdown.values()),
         "tool_calls": tool_breakdown,
@@ -459,6 +567,11 @@ Examples:
                                 "error": "timeout",
                                 "correct": False,
                                 "correctness_reason": "Subprocess timed out",
+                                # Present so consumers see None rather than KeyError on
+                                # rows that never got far enough to be graded.
+                                "answer_correct": False,
+                                "answer_correctness_reason": "Subprocess timed out",
+                                "tool_requirements_met": None,
                             }
                             f.write(json.dumps(error_result) + "\n")
                             f.flush()
@@ -476,6 +589,9 @@ Examples:
                                 "error": str(e),
                                 "correct": False,
                                 "correctness_reason": f"Exception: {e}",
+                                "answer_correct": False,
+                                "answer_correctness_reason": f"Exception: {e}",
+                                "tool_requirements_met": None,
                             }
                             f.write(json.dumps(error_result) + "\n")
                             f.flush()
