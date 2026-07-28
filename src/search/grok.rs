@@ -12,7 +12,7 @@ use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use crate::search::callers::{find_callers_batch, CallerMatch};
 use crate::search::search_symbol_raw;
 use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
@@ -432,7 +432,7 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
+    let raw_callers = find_callers_batch(&symbols, scope, bloom, None)?;
 
     let prod_and_test: Vec<CallerMatch> = raw_callers
         .into_iter()
@@ -440,9 +440,19 @@ pub fn grok(
         .filter(|m| !is_recursive_call_site(m, &canonical_target, &target))
         .collect();
 
-    let (prod_callers, test_callers): (Vec<_>, Vec<_>) = prod_and_test
+    let (mut prod_callers, mut test_callers): (Vec<_>, Vec<_>) = prod_and_test
         .into_iter()
         .partition(|m| !is_test_file(&m.path));
+    // `find_callers_batch` returns matches in walk order — thread-scheduling order. The
+    // caps below truncate without ranking, so without a total order here grok showed a
+    // different "5 of 40" on each run for the same symbol. Order by location: stable,
+    // and it groups a file's call sites together, which is how the section reads.
+    prod_callers.sort_by(|a, b| {
+        (&a.path, a.line, &a.calling_function).cmp(&(&b.path, b.line, &b.calling_function))
+    });
+    test_callers.sort_by(|a, b| {
+        (&a.path, a.line, &a.calling_function).cmp(&(&b.path, b.line, &b.calling_function))
+    });
     let total_callers = prod_callers.len();
     let total_tests = test_callers.len();
 
@@ -935,6 +945,56 @@ mod tests {
             children: Vec::new(),
             doc: None,
         }
+    }
+
+    /// grok truncates its caller list to `max_callers` with no ranking, straight off
+    /// `find_callers_batch`'s vector — which is in walk order, i.e. thread order. With more
+    /// callers than the cap, identical runs therefore showed a different "5 of 40" each
+    /// time (measured: 3 distinct top-5 subsets in 6 runs). Making the walk's *total*
+    /// deterministic did not fix that; a total order before the truncation does.
+    #[test]
+    fn grok_caller_list_is_stable_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.rs"), "pub fn target_fn() {}\n").unwrap();
+        // Well past GrokCaps::default().max_callers, spread over files so the walk order
+        // varies run to run.
+        for i in 0..40 {
+            std::fs::write(
+                dir.path().join(format!("c{i}.rs")),
+                format!("fn caller_{i}() {{ target_fn(); }}\n"),
+            )
+            .unwrap();
+        }
+
+        let bloom = BloomFilterCache::new();
+        let shown: Vec<Vec<String>> = (0..6)
+            .map(|_| {
+                let session = crate::session::Session::new();
+                let r = grok(
+                    "target_fn",
+                    dir.path(),
+                    &bloom,
+                    &session,
+                    GrokCaps::default(),
+                )
+                .expect("grok failed");
+                r.callers
+                    .iter()
+                    .map(|c| format!("{}:{}", c.path.display(), c.line))
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(
+            shown[0].len(),
+            GrokCaps::default().max_callers,
+            "fixture must overflow the cap so truncation has to choose: {:?}",
+            shown[0]
+        );
+        assert!(
+            shown.windows(2).all(|w| w[0] == w[1]),
+            "grok's caller list must not vary run to run:\n{shown:#?}"
+        );
     }
 
     // -- parse_target_spec -----------------------------------------------

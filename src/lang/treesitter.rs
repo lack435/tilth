@@ -377,6 +377,100 @@ fn first_identifier_child(node: tree_sitter::Node, lines: &[&str]) -> Option<Str
     found
 }
 
+/// True when a C/C++ `declaration` is really a macro invocation rather than a member.
+///
+/// A *zero-argument* macro invocation inside a class body — `GENERATED_BODY()` — parses as
+/// a `declaration` with a `function_declarator` and **no `type`**, which is exactly how a
+/// constructor or destructor parses too, since those have no return type either. The one
+/// thing that separates them is the name: a constructor is named for its class, a
+/// destructor is a `destructor_name`, and anything else with that shape is a macro.
+///
+/// Only that form. An argument-carrying macro (`DECLARE_DELEGATE(FOnHit);`) parses with the
+/// macro name as the `type` and a `parenthesized_declarator`, so it never reaches the name
+/// comparison below — it is excluded from outlines for unrelated reasons.
+///
+/// This matters beyond cosmetics. Treated as a member, such a macro becomes an "exported
+/// symbol" of the header, and `tilth_deps` then reports every *other* file that invokes
+/// the same macro as a dependent — a code-generating C++ framework makes that every
+/// header in the project, none of which include the file.
+///
+/// Detection is on shape and the enclosing type's name only; no macro name is matched.
+pub(crate) fn is_cpp_macro_invocation(node: tree_sitter::Node, lines: &[&str]) -> bool {
+    if node.kind() != "declaration" || node.child_by_field_name("type").is_some() {
+        return false;
+    }
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return false;
+    };
+    if declarator.kind() != "function_declarator" {
+        return false;
+    }
+    // A destructor is a member, and is unambiguous.
+    let inner = declarator.child_by_field_name("declarator");
+    if inner.is_some_and(|d| d.kind() == "destructor_name") {
+        return false;
+    }
+    let Some(name) = inner.and_then(|d| c_declarator_name(d, lines)) else {
+        return false;
+    };
+    // A constructor is named for the type that encloses it. Every branch that cannot
+    // establish that comparison answers "not a macro", because the cost is asymmetric:
+    // a macro left in an outline is noise, a constructor dropped from one is a member
+    // that vanishes from search, deps' exported symbols and blast radius.
+    match enclosing_type_specifier(node) {
+        // No enclosing type at all — a constructor is impossible here, so a typeless
+        // declaration shaped like a call is a macro.
+        None => true,
+        Some(spec) => match spec.child_by_field_name("name") {
+            // Anonymous type, or a class head tree-sitter repaired into something with
+            // no `name` field. Nothing to compare against. Defensive rather than
+            // observed: an anonymous type cannot have a constructor, and in the known
+            // export-macro misparse the constructor becomes an `expression_statement`
+            // that never reaches this predicate. Kept because the asymmetry above says
+            // to keep the member whenever the comparison cannot be made.
+            None => false,
+            Some(name_node) => match trailing_type_identifier(name_node, lines) {
+                Some(ty) => ty != name,
+                // Unrecognised name shape.
+                None => false,
+            },
+        },
+    }
+}
+
+/// The nearest enclosing C/C++ type specifier node, if any.
+fn enclosing_type_specifier(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if SPECIFIER_KINDS.contains(&p.kind()) {
+            return Some(p);
+        }
+        cur = p.parent();
+    }
+    None
+}
+
+/// The bare identifier at the end of a type name.
+///
+/// A specifier's `name` field is not always a plain `type_identifier`: an explicit or
+/// partial specialization names a `template_type` (`Box<int>`, `Box<T*>`) and an
+/// out-of-namespace definition names a `qualified_identifier` (`Outer::Inner`). Comparing
+/// a constructor's bare `Box` or `Inner` against that whole text never matches, which
+/// classified those constructors as macros and dropped them.
+fn trailing_type_identifier(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut cur = node;
+    for _ in 0..MAX_DECLARATOR_DEPTH {
+        match cur.kind() {
+            "type_identifier" | "identifier" => return Some(node_text_simple(cur, lines)),
+            "template_type" | "qualified_identifier" => {
+                cur = cur.child_by_field_name("name")?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// True when `node` is a `declaration` for a member template inside a class body —
 /// `field_declaration_list` → `template_declaration` → `declaration`.
 fn is_cpp_member_template_declaration(node: tree_sitter::Node) -> bool {

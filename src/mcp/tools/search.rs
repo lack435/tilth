@@ -347,21 +347,18 @@ mod tests {
         );
     }
 
-    /// MED finding from PR review: `BATCH_EARLY_QUIT` (50 raw matches) is a
-    /// walk-wide budget shared by every target in a batch search. The walker
-    /// (`find_callers_batch`) checks this budget once per **file** visited
-    /// (an `AtomicUsize` compared before each file read — see
-    /// `src/search/callers.rs`'s `found_count.load(..) >= early_quit_threshold`
-    /// gate), so it only starves later files, not later matches within one
-    /// already-open file. To reproduce real starvation this test spreads 60
-    /// `alpha` call sites across 60 separate files (one call site per file:
-    /// `a_00.rs`..`a_59.rs`) — comfortably above the un-scaled 50-match
-    /// walk-wide budget — and puts `beta`'s lone call site in a file that
-    /// sorts after all of them (`z_beta.rs`). With an unscaled budget the
-    /// walk can quit after visiting ~50 of the `a_*.rs` files, before
-    /// `z_beta.rs` is ever read, starving beta entirely. Scaling the budget
-    /// by target count (2x for 2 targets = 100) gives the walk enough
-    /// headroom to reach `z_beta.rs`.
+    /// A rare target must not be starved by a hit-rich one sharing the walk.
+    ///
+    /// This originally guarded `BATCH_EARLY_QUIT`, a walk-wide raw-match budget shared by
+    /// every target and checked once per file visited: 60 `alpha` sites across 60 files
+    /// could exhaust it before `z_beta.rs` — which sorts after all of them — was ever
+    /// read, so `beta` reported nothing. Scaling the budget by target count was the fix
+    /// then; removing the budget is the fix now, because a count-based cutoff over a
+    /// parallel walk cannot be deterministic (see `src/search/callers.rs`).
+    ///
+    /// Kept as a scenario-level guard rather than deleted with the mechanism: starvation
+    /// of a later file by an earlier one is exactly what any future reintroduction of a
+    /// walk-wide cutoff would cause, and this fixture reproduces it.
     #[test]
     fn callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target() {
         let tmp = tempfile::tempdir().unwrap();
@@ -373,8 +370,8 @@ mod tests {
             )
             .unwrap();
         }
-        // Sorts after every "a_*.rs" file — only reached if the walk's
-        // early-quit budget has enough headroom to visit all 61 prior files.
+        // Sorts after every "a_*.rs" file — only reached by a walk that visits every
+        // candidate rather than stopping on a match count.
         std::fs::write(tmp.path().join("z_beta.rs"), "fn uses_beta() { beta(); }\n").unwrap();
 
         let cache = OutlineCache::new();
@@ -390,8 +387,8 @@ mod tests {
 
         assert!(
             out.contains("uses_beta"),
-            "beta call site starved by alpha's hit-rich budget consumption \
-             (early-quit budget was not scaled by target count): {out}"
+            "beta's call site was starved by alpha's — the walk stopped before reaching \
+             z_beta.rs, which means a match-count cutoff is back: {out}"
         );
     }
 
