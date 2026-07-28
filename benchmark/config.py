@@ -93,6 +93,20 @@ REPOS = {
         language="javascript",
         description="Express.js web framework",
     ),
+    # C++ coverage. leveldb is small (~1.4MB checked out, 75 .cc / 56 .h) but
+    # structurally representative: classes declared in headers behind an
+    # export/visibility macro (`class LEVELDB_EXPORT DB`), base classes in the
+    # class head (`class LEVELDB_EXPORT EnvWrapper : public Env`), a `leveldb`
+    # namespace throughout, templates with out-of-line member definitions
+    # (db/skiplist.h), and static member functions called qualified across
+    # files (`Status::Corruption(...)`). Pinned at the 1.23 release tag.
+    "leveldb": RepoConfig(
+        name="leveldb",
+        url="https://github.com/google/leveldb.git",
+        commit_sha="99b3c03b3284f5886f9ef9a4ef703d57373e61be",
+        language="cpp",
+        description="LevelDB embedded key-value store",
+    ),
 }
 
 MODES = {

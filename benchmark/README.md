@@ -193,6 +193,14 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 | [FastAPI](https://github.com/tiangolo/fastapi) | Python | Async web framework |
 | [Gin](https://github.com/gin-gonic/gin) | Go | HTTP framework |
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | Rust | Line-oriented search |
+| [leveldb](https://github.com/google/leveldb) | C++ | Embedded key-value store |
+
+leveldb covers the C++ constructs the other four repos have no analogue for:
+classes declared in headers behind an export macro (`class LEVELDB_EXPORT
+Status`), base classes in the class head (`class LEVELDB_EXPORT EnvWrapper :
+public Env`), member functions defined out-of-line in a `.cc`, qualified static
+member calls (`Status::Corruption(...)`), and `#include` graphs instead of
+module imports. The results tables above predate these tasks.
 
 **Difficulty tiers (7 tasks each, Sonnet only):**
 - **Easy** — Single-file lookups, finding definitions, tracing short paths
@@ -218,19 +226,19 @@ python benchmark/fixtures/setup_repos.py
 
 ```bash
 # All tasks, baseline + tilth, 3 reps, Sonnet
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models sonnet --reps 3
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models sonnet --reps 3
 
 # Specific tasks
 python benchmark/run.py --tasks fastapi_depends_processing,gin_middleware_chain --models sonnet --reps 3
 
 # Opus on all tasks
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models opus --reps 3
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models opus --reps 3
 
 # Haiku forced mode (built-in search tools removed)
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models haiku --reps 1 --modes tilth_forced
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models haiku --reps 1 --modes tilth_forced
 
 # Single mode only (skip baseline comparison)
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models sonnet --reps 1 --modes tilth
+python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express,leveldb --models sonnet --reps 1 --modes tilth
 ```
 
 **Analyze:**

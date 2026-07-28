@@ -111,7 +111,7 @@ Releases publish **two npm names** from the same `npm/` wrapper: the canonical u
 
 ## Benchmarks
 
-26 code navigation tasks across 4 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings.
+Code navigation tasks across 5 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust, leveldb/C++). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings. The published result tables in `benchmark/README.md` cover a 26-task subset from the first four repos.
 
 **Setup** (one-time — clones repos at pinned commits):
 
@@ -149,7 +149,7 @@ Results written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each
 
 Key metric: **cost per correct answer** = total_spend / correct_count. This is the expected cost under retry (geometric model: `avg_cost / accuracy`).
 
-Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`.
+Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`, `leveldb_corruption_callers`.
 
 ## MCP instructions
 
