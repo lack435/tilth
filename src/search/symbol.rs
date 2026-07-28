@@ -109,10 +109,12 @@ pub fn search(
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each
-    // stratum, so the relevance ordering from rank::sort is preserved. Code
-    // defs (def_weight >= 60) come first, doc-heading defs (def_weight 30)
-    // second, usages last. Display-side only — pre-cap totals below and the
-    // underlying ranking semantics for `--json` callers are unchanged.
+    // stratum, so the relevance ordering from rank::sort is preserved.
+    // Primary defs (def_weight >= 60) come first; the lower stratum holds
+    // doc-heading defs (30) alongside definitions that are really variables —
+    // JS `lexical_declaration` and C++ data members, both 40 — then usages
+    // last. Display-side only: pre-cap totals below and the underlying
+    // ranking semantics for `--json` callers are unchanged.
     merged.sort_by_key(stratum_for_display);
 
     // Compute per-subfacet totals on the *pre-cap* set so the renderer can
@@ -253,8 +255,8 @@ fn find_definitions(
             //   docs are NOT treated as definitions; they're usages, because
             //   the keyword heuristic would false-positive on every snippet
             //   that quotes the real source. Heading defs carry a lower
-            //   `def_weight` (30) than code definitions (60-80) so the real
-            //   source still ranks first.
+            //   `def_weight` (30) than a primary code definition (60-100) so
+            //   the real source still ranks first.
             // * Structured data / tabular / log / other: no fallback.
             //   Mentions are config values, data, or noise — not definitions.
             //   (A future patch could treat top-level config keys matching
@@ -1592,13 +1594,19 @@ using MyAlias = float;
     fn cpp_data_member_ranks_below_a_real_type_of_the_same_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let scope = dir.path();
+        // The member lives in the file whose *basename* matches the query, so
+        // `rank::basename_boost` pushes it up. That boost is what made the old weight of
+        // 70 win: with it, a fixture where the member sits in an unrelated file cannot
+        // distinguish 70 from 40 — the class led either way. Here the boost and the
+        // weight gap pull against each other, so the ordering actually depends on the
+        // member being demoted to the data tier.
         std::fs::write(
-            scope.join("Component.h"),
+            scope.join("AbilityLevel.h"),
             "class HeroComponent\n{\nprivate:\n\tint AbilityLevel;\n};\n",
         )
         .expect("write");
         std::fs::write(
-            scope.join("AbilityLevel.h"),
+            scope.join("GameTypes.h"),
             "class AbilityLevel { public: int Value; };\n",
         )
         .expect("write");
@@ -1606,8 +1614,9 @@ using MyAlias = float;
         let result = search("AbilityLevel", scope, None, None, false).expect("search");
         let top = result.matches.first().expect("a match");
         assert!(
-            top.path.ends_with("AbilityLevel.h"),
-            "the class must outrank the same-named data member, got {:?}",
+            top.path.ends_with("GameTypes.h"),
+            "the class must outrank the same-named data member even when the member's \
+             file wins the basename boost, got {:?}",
             result
                 .matches
                 .iter()
@@ -1619,7 +1628,7 @@ using MyAlias = float;
             result
                 .matches
                 .iter()
-                .any(|m| m.path.ends_with("Component.h") && m.is_definition),
+                .any(|m| m.path.ends_with("AbilityLevel.h") && m.is_definition),
             "the data member should still be reported as a definition"
         );
     }

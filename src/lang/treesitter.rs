@@ -726,21 +726,36 @@ pub(crate) fn elixir_definition_weight(node: tree_sitter::Node, lines: &[&str]) 
 ///     `const_declaration` use in other languages).
 pub(crate) fn definition_weight_for(node: tree_sitter::Node) -> u16 {
     match node.kind() {
-        "field_declaration" => {
-            if declarator_chain_has_function(node) {
-                70
-            } else {
-                40
-            }
-        }
+        "field_declaration" => member_weight(node),
         "declaration" => {
             if is_cpp_misparsed_class_head(node) {
                 100
+            } else if is_cpp_member_template_declaration(node) {
+                // A member template — `template <typename T> void Apply(T V);` — is a
+                // member declaration that happens to arrive as a `declaration` rather
+                // than a `field_declaration`. Weigh it as the member it is, not as the
+                // out-of-line data definition the arm below covers.
+                member_weight(node)
             } else {
                 80
             }
         }
         kind => definition_weight(kind),
+    }
+}
+
+/// Weight for a C/C++ class member: 70 for a method declaration, 40 for data.
+///
+/// A `parenthesized_declarator` in the chain means the function part belongs to the
+/// *type*, not to the declaration — `void (*Cb)(int);` is a function-pointer data member,
+/// not a method — so it is data despite containing a `function_declarator`.
+fn member_weight(node: tree_sitter::Node) -> u16 {
+    let is_method = declarator_chain_has_function(node)
+        && !declarator_chain_has_kind(node, "parenthesized_declarator");
+    if is_method {
+        70
+    } else {
+        40
     }
 }
 
@@ -770,25 +785,16 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "union_specifier"
         | "enum_specifier"
         | "alias_declaration"
-        // `declaration` reaches this table in the two shapes `is_definition_node`
-        // admits: a macro-misparsed class head, and an out-of-line static member
-        // definition. 100 is chosen for the class head — the same construct without
-        // multiple inheritance parses as a `function_definition`, and leaving it at
-        // the default 50 would give one construct two weights depending on its
-        // base-class count. The static-member case inherits that 100, which is
-        // higher than the 80 tier its closest analogues in other languages sit at
-        // (`static_item`, `const_declaration`); distinguishing them would require
-        // weighting per node rather than per kind string. Harmless in practice: both
-        // shapes are genuine definitions, and the ranking that matters — out-of-line
-        // definition above the in-class `field_declaration` (70) — holds either way.
+        // `declaration` and `field_declaration` are listed here as a safe default only.
+        // Production never reads their value from this table: `definition_weight_for`
+        // intercepts both, because each covers two constructs that must rank differently
+        // (a class head vs an out-of-line data definition; a method declaration vs a data
+        // member). Anything reaching these arms is a caller that bypassed
+        // `definition_weight_for` — prefer that function whenever a node is available.
         | "declaration"
         | "decorated_definition" => 100,
         "impl_item" | "object_declaration" => 90,
         "const_item" | "const_declaration" | "static_item" => 80,
-        // A C/C++ `field_declaration` is a member *declaration* — the `void Work();`
-        // in a header, whose out-of-line `function_definition` in the .cpp is the
-        // real definition. Ranked below that (100) so grok prefers the definition,
-        // but well above a usage so a header-only or pure-virtual member still wins.
         "field_declaration" | "mod_item" | "namespace_definition" | "property_declaration" => 70,
         "lexical_declaration" | "variable_declaration" => 40,
         "variable_assignment" => 60,
@@ -881,9 +887,18 @@ mod tests {
 
     #[test]
     fn definition_weight_for_separates_class_heads_from_static_members() {
-        let head = "class API Widget { public: void W(); };\n";
+        // Multiple inheritance on purpose: that is the recovery shape that actually
+        // parses as a `declaration`, so this exercises the branch. The single-base form
+        // parses as a `function_definition` and would take its 100 from the kind table,
+        // testing nothing about `definition_weight_for`.
+        let head = "class API Widget : public B1, public B2 { public: void W(); };\n";
         let tree = parse(head, Lang::Cpp);
         let node = tree.root_node().named_child(0).expect("top-level node");
+        assert_eq!(
+            node.kind(),
+            "declaration",
+            "fixture must hit the declaration arm"
+        );
         assert_eq!(
             definition_weight_for(node),
             100,
@@ -898,6 +913,40 @@ mod tests {
             80,
             "an out-of-line static member is data — the tier static_item uses"
         );
+    }
+
+    /// A member template is a member declaration that arrives as a `declaration` rather
+    /// than a `field_declaration`, so it must be weighed as the member it is — otherwise
+    /// a templated method lands in the out-of-line data tier (80) and outranks the plain
+    /// method declarations beside it.
+    #[test]
+    fn definition_weight_for_member_template_is_weighed_as_a_member() {
+        let src = "class Holder {\npublic:\ntemplate <typename T>\nvoid Apply(T V);\n};\n";
+        let tree = parse(src, Lang::Cpp);
+        let node = find_by_kind(tree.root_node(), "declaration");
+        assert_eq!(
+            definition_weight_for(node),
+            70,
+            "a member template is a method"
+        );
+    }
+
+    /// A `function_declarator` inside a `parenthesized_declarator` belongs to the *type*,
+    /// not to the declaration: `void (*Cb)(int);` is a function-pointer data member, not a
+    /// method. Callback members are common in C-ish headers.
+    #[test]
+    fn definition_weight_for_function_pointer_member_is_data() {
+        let cases: &[(&str, u16)] = &[
+            ("class H { void (*Cb)(int); };\n", 40),
+            ("class H { void Work(); };\n", 70),
+            ("class H { int Arr[10]; };\n", 40),
+            ("class H { Widget* Get(); };\n", 70),
+        ];
+        for (src, want) in cases {
+            let tree = parse(src, Lang::Cpp);
+            let node = find_by_kind(tree.root_node(), "field_declaration");
+            assert_eq!(definition_weight_for(node), *want, "{src:?}");
+        }
     }
 
     #[test]
@@ -1551,8 +1600,11 @@ mod tests {
         for src in cases {
             let tree = parse(src, Lang::Cpp);
             let node = tree.root_node().named_child(0).expect("top-level node");
+            // `definition_weight_for`, not `definition_weight(kind)`: the kind table
+            // cannot tell a class head from an out-of-line data definition, so asking it
+            // would stop exercising the production path this test exists to pin.
             assert_eq!(
-                definition_weight(node.kind()),
+                definition_weight_for(node),
                 100,
                 "{src:?} (parsed as {}) should weigh 100",
                 node.kind()
