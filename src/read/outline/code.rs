@@ -376,6 +376,138 @@ fun main() {
     }
 
     #[test]
+    fn cpp_outline_constructs() {
+        // Before C++ type support the outline for this file was almost entirely
+        // `<anonymous>`: no type specifier had an arm, and C/C++ name their
+        // declarations through a declarator chain rather than a `name` field, so even
+        // the functions came out unnamed.
+        let cpp_code = r"
+#include <vector>
+
+struct Point { int X; };
+union Value { int I; float F; };
+enum class Mode : uint8_t { On, Off };
+typedef unsigned int Handle;
+using Callback = void(*)(int);
+
+template <typename T> class Vector { public: void Push(T V); };
+
+namespace Outer {
+class Widget final : public Base
+{
+public:
+    void Work();
+    int Count;
+};
+}
+
+void Widget::Work() {}
+";
+
+        let outline = outline(cpp_code, Lang::Cpp, 1000);
+
+        assert!(outline.contains("struct Point"), "actual:\n{outline}");
+        assert!(outline.contains("struct Value"), "actual:\n{outline}");
+        assert!(outline.contains("enum Mode"), "actual:\n{outline}");
+        assert!(outline.contains("type Handle"), "actual:\n{outline}");
+        assert!(outline.contains("type Callback"), "actual:\n{outline}");
+        // `template <typename T> class Vector` renders as the class it declares, not
+        // as an unnamed template wrapper.
+        assert!(outline.contains("class Vector"), "actual:\n{outline}");
+        assert!(outline.contains("mod Outer"), "actual:\n{outline}");
+        assert!(outline.contains("class Widget"), "actual:\n{outline}");
+        // Class members, reached through the `field_declaration_list` body.
+        assert!(outline.contains("fn Work"), "actual:\n{outline}");
+        assert!(outline.contains("prop Count"), "actual:\n{outline}");
+        // The out-of-line definition resolves to the bare member name.
+        assert!(
+            !outline.contains("<anonymous>"),
+            "no entry should be anonymous:\n{outline}"
+        );
+    }
+
+    #[test]
+    fn cpp_outline_names_class_behind_export_macro() {
+        // `class MYLIB_API Widget : public Base` does not parse as a class —
+        // tree-sitter-cpp reads the macro as the class name. The outline must still
+        // name the class, and must not surface the macro as a type of its own.
+        //
+        // The bare `ANNOTATE()` / `BODY_MACRO()` call-shaped macros around and inside
+        // the head are what code-generating C++ frameworks emit; they are here because
+        // they change nothing, which is the point worth pinning.
+        let cpp_code = "\
+ANNOTATE()
+class MYLIB_API Widget final : public Base
+{
+    BODY_MACRO()
+public:
+    void Work();
+};
+";
+        let outline = outline(cpp_code, Lang::Cpp, 1000);
+        assert!(outline.contains("class Widget"), "actual:\n{outline}");
+        assert!(
+            !outline.contains("MYLIB_API"),
+            "the export macro must not appear as a type:\n{outline}"
+        );
+        // Members of the misparsed body are still collected.
+        assert!(outline.contains("fn Work"), "actual:\n{outline}");
+    }
+
+    #[test]
+    fn cpp_outline_omits_forward_declarations() {
+        // A specifier with no body is an elaborated type specifier — a forward
+        // declaration or a type reference, not a definition.
+        let outline = outline(
+            "class Fwd;\nclass Fwd* Global;\nclass Real { int X; };\n",
+            Lang::Cpp,
+            1000,
+        );
+        assert!(outline.contains("class Real"), "actual:\n{outline}");
+        assert!(
+            !outline.contains("class Fwd"),
+            "forward declaration must not be outlined:\n{outline}"
+        );
+    }
+
+    /// A *braced* PHP namespace is a Module entry whose body is a
+    /// `compound_statement` — the same kind a macro-misparsed C++ class body uses. When
+    /// `collect_children`'s body finder matched that kind ungated, PHP namespace
+    /// members started appearing with placeholder names (`prop <property>`,
+    /// `const <const>`) and a `trait` mislabelled as an interface.
+    #[test]
+    fn php_braced_namespace_outline_unaffected_by_cpp_body_kinds() {
+        let php_code = "<?php\nnamespace App {\n    class A { public $p = 1; }\n    trait T {}\n    const C = 1;\n}\n";
+        let outline = outline(php_code, Lang::Php, 1000);
+        assert!(outline.contains("mod App"), "actual:\n{outline}");
+        assert!(
+            !outline.contains("<property>") && !outline.contains("<const>"),
+            "no placeholder member names should leak into PHP outlines:\n{outline}"
+        );
+        assert!(
+            !outline.contains("interface T"),
+            "a PHP trait must not be outlined as an interface:\n{outline}"
+        );
+    }
+
+    /// `field_declaration` and `declaration` are outlined for C/C++ only — both kind
+    /// strings also exist in the Rust, Go, Java and C# grammars, where surfacing
+    /// every struct field would change those outlines.
+    #[test]
+    fn rust_outline_still_omits_struct_fields() {
+        let outline = outline(
+            "pub struct Holder {\n    count: u32,\n}\n",
+            Lang::Rust,
+            1000,
+        );
+        assert!(outline.contains("struct Holder"), "actual:\n{outline}");
+        assert!(
+            !outline.contains("count"),
+            "Rust struct fields must stay out of the outline:\n{outline}"
+        );
+    }
+
+    #[test]
     fn ts_export_outline_no_doubled_keyword() {
         // Regression: `export_statement` must recurse into the wrapped
         // declaration (function/class/lexical) and render with that

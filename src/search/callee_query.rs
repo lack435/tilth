@@ -39,9 +39,26 @@ pub(super) fn callee_query_str(lang: Lang) -> Option<&'static str> {
             "(call_expression function: (field_expression field: (identifier) @callee))\n",
             "(infix_expression operator: (identifier) @callee)\n",
         )),
-        Lang::C | Lang::Cpp => Some(concat!(
+        Lang::C => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
+        )),
+        // C++ needs its own string rather than sharing C's: the patterns below use
+        // node kinds that exist only in tree-sitter-cpp, and `Query::new` fails
+        // wholesale on an unknown kind — a shared string would silently disable
+        // caller detection for C entirely.
+        //
+        // `qualified_identifier` is the missing case that made every static and
+        // base-class call site invisible: `Class::Func()` and `Super::Func()` are
+        // `call_expression → qualified_identifier`, not the `field_expression` a
+        // `obj.Func()` member call produces. Capturing `name:` yields the bare
+        // `Func`, matching how tilth names the definition.
+        Lang::Cpp => Some(concat!(
+            "(call_expression function: (identifier) @callee)\n",
+            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
+            "(call_expression function: (qualified_identifier name: (identifier) @callee))\n",
+            "(call_expression function: (template_function name: (identifier) @callee))\n",
+            "(call_expression function: (field_expression field: (template_method name: (field_identifier) @callee)))\n",
         )),
         Lang::Ruby => Some(
             "(call method: (identifier) @callee)\n",
@@ -170,5 +187,46 @@ mod tests {
         let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();
         let query_str = callee_query_str(Lang::Bash).unwrap();
         tree_sitter::Query::new(&lang, query_str).expect("bash callee query should compile");
+    }
+
+    /// Every query string must compile against its own grammar. `Query::new` fails
+    /// for the *whole* string on a single unknown node kind or impossible pattern,
+    /// and `with_callee_query` then returns `None` — silently disabling caller and
+    /// callee detection for that entire language rather than losing one pattern. C
+    /// and C++ share a call syntax but not a grammar, so both are pinned here: an
+    /// early draft of the C++ patterns above put them in a `Lang::C | Lang::Cpp` arm
+    /// and broke C completely.
+    #[test]
+    fn every_callee_query_compiles_against_its_own_grammar() {
+        let cases: Vec<(Lang, tree_sitter::Language)> = vec![
+            (Lang::Rust, tree_sitter_rust::LANGUAGE.into()),
+            (
+                Lang::TypeScript,
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            (Lang::Tsx, tree_sitter_typescript::LANGUAGE_TSX.into()),
+            (Lang::JavaScript, tree_sitter_javascript::LANGUAGE.into()),
+            (Lang::Python, tree_sitter_python::LANGUAGE.into()),
+            (Lang::Go, tree_sitter_go::LANGUAGE.into()),
+            (Lang::Java, tree_sitter_java::LANGUAGE.into()),
+            (Lang::C, tree_sitter_c::LANGUAGE.into()),
+            (Lang::Cpp, tree_sitter_cpp::LANGUAGE.into()),
+            (Lang::Ruby, tree_sitter_ruby::LANGUAGE.into()),
+            (Lang::Php, tree_sitter_php::LANGUAGE_PHP.into()),
+            (Lang::Scala, tree_sitter_scala::LANGUAGE.into()),
+            (Lang::CSharp, tree_sitter_c_sharp::LANGUAGE.into()),
+            (Lang::Swift, tree_sitter_swift::LANGUAGE.into()),
+            (Lang::Kotlin, tree_sitter_kotlin_ng::LANGUAGE.into()),
+            (Lang::Elixir, tree_sitter_elixir::LANGUAGE.into()),
+            (Lang::Bash, tree_sitter_bash::LANGUAGE.into()),
+        ];
+        for (lang, ts_lang) in &cases {
+            let Some(query_str) = callee_query_str(*lang) else {
+                continue;
+            };
+            if let Err(e) = tree_sitter::Query::new(ts_lang, query_str) {
+                panic!("callee query for {lang:?} does not compile: {e}");
+            }
+        }
     }
 }

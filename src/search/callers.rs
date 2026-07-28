@@ -756,6 +756,51 @@ mod tests {
             "glob-driven hint should appear when glob is Some: {msg}"
         );
     }
+    /// A qualified static call — `Class::Func()` — is a `call_expression` whose
+    /// function is a `qualified_identifier`, not the `field_expression` an
+    /// `obj.Func()` member call produces. Only the member-call pattern was in the
+    /// C/C++ callee query, so every static helper and every `Super::` call site
+    /// reported "no direct call sites found" while symbol search plainly showed one.
+    /// The member call is asserted alongside it to pin that adding the C++-only
+    /// patterns did not cost the case that already worked.
+    #[test]
+    fn cpp_finds_qualified_static_and_member_call_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        std::fs::write(
+            dir.path().join("Probe.h"),
+            "class Holder\n{\npublic:\n\tstatic void StaticWork();\n\tvoid MemberWork();\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Probe.cpp"),
+            "#include \"Probe.h\"\n\
+             void Holder::StaticWork() {}\n\
+             void Holder::MemberWork() {}\n\
+             void CallEverything()\n\
+             {\n\
+             \tHolder::StaticWork();\n\
+             \tHolder H;\n\
+             \tH.MemberWork();\n\
+             }\n",
+        )
+        .unwrap();
+
+        for target in ["StaticWork", "MemberWork"] {
+            let out =
+                search_callers_expanded(target, dir.path(), &bloom, 0, None, None, false).unwrap();
+            assert!(
+                out.contains("1 call site"),
+                "expected exactly one call site for {target}, got:\n{out}"
+            );
+            assert!(
+                out.contains("[caller: CallEverything]"),
+                "call site for {target} should be attributed to CallEverything \
+                 (the enclosing function had to resolve by name too), got:\n{out}"
+            );
+        }
+    }
+
     /// Regression test: when there are more than MAX_MATCHES (10) hop-1 call
     /// sites but still <= IMPACT_FANOUT_THRESHOLD unique callers, the footer
     /// "N functions affected across 2 hops" must use the pre-truncation unique

@@ -17,8 +17,25 @@ pub fn detect_file_type(path: &Path) -> FileType {
         Some("go") => FileType::Code(Lang::Go),
         Some("java") => FileType::Code(Lang::Java),
         Some("scala" | "sc") => FileType::Code(Lang::Scala),
-        Some("c" | "h") => FileType::Code(Lang::C),
-        Some("cpp" | "hpp" | "cc" | "cxx") => FileType::Code(Lang::Cpp),
+        Some("c") => FileType::Code(Lang::C),
+        // `.h` is parsed with the C++ grammar, not the C one. `.h` is the header
+        // extension virtually all C++ projects use, and a C++ header parsed as C
+        // misparses catastrophically: `class Foo { … };` becomes a
+        // `function_definition` named `Foo` (the C grammar has no `class` keyword), so
+        // every class in a header resolved as an anonymous function, and any form the
+        // accident didn't cover — `class Foo final : public Bar` — failed to parse at
+        // all.
+        //
+        // C++ is not a strict superset of C, so this is a trade, not a free win. For
+        // outline and symbol purposes it is heavily one-sided: of the C-only
+        // constructs, only a K&R-style definition (`int add(a, b) int a; int b; {…}`,
+        // which tree-sitter-cpp reads as a variable) and an identifier that is a C++
+        // keyword (`int template;`) resolve worse. `restrict`, `_Generic`, `_Atomic`,
+        // designated initialisers, compound literals, VLAs, bitfields and anonymous
+        // unions all parse identically under both grammars — and C headers gain
+        // named structs, enums, typedefs and prototypes that the C-grammar path
+        // reported as `<anonymous>`.
+        Some("cpp" | "hpp" | "hh" | "hxx" | "cc" | "cxx" | "h") => FileType::Code(Lang::Cpp),
         Some("rb") => FileType::Code(Lang::Ruby),
         Some("php" | "phtml") => FileType::Code(Lang::Php),
         Some("swift") => FileType::Code(Lang::Swift),
@@ -72,5 +89,38 @@ pub(crate) fn package_root(path: &Path) -> Option<&Path> {
             }
         }
         dir = dir.parent()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.h` must resolve to the C++ grammar. tree-sitter-cpp is a superset of
+    /// tree-sitter-c, so routing C headers through it is harmless, while routing C++
+    /// headers through the C grammar is not: the C grammar has no `class` keyword, so
+    /// `class Widget { … };` misparses into a `function_definition` and every class
+    /// declared in a header — which is where C++ declares them — became invisible.
+    #[test]
+    fn header_extensions_use_the_cpp_grammar() {
+        for name in ["Probe.h", "Probe.hpp", "Probe.hh", "Probe.hxx"] {
+            assert_eq!(
+                detect_file_type(Path::new(name)),
+                FileType::Code(Lang::Cpp),
+                "{name} should be parsed as C++"
+            );
+        }
+        // Implementation extensions are unchanged; only `.c` stays on the C grammar.
+        assert_eq!(
+            detect_file_type(Path::new("probe.c")),
+            FileType::Code(Lang::C)
+        );
+        for name in ["Probe.cpp", "Probe.cc", "Probe.cxx"] {
+            assert_eq!(
+                detect_file_type(Path::new(name)),
+                FileType::Code(Lang::Cpp),
+                "{name} should be parsed as C++"
+            );
+        }
     }
 }

@@ -8,8 +8,8 @@ use std::path::Path;
 
 use crate::cache::OutlineCache;
 use crate::lang::treesitter::{
-    extract_definition_name, extract_elixir_definition_name, is_elixir_definition,
-    node_text_simple, DEFINITION_KINDS,
+    cpp_misparsed_class_name, extract_definition_name, extract_elixir_definition_name,
+    is_definition_node, is_elixir_definition, node_text_simple,
 };
 
 /// Type-like node kinds that can enclose a function definition.
@@ -27,6 +27,13 @@ const TYPE_KINDS: &[&str] = &[
     "module",
     "mod_item",
     "namespace_definition",
+    // C/C++ — qualifies a member declared inside a class body as `Holder.Work`.
+    // Kept in sync with `treesitter::SPECIFIER_KINDS`; `enum_specifier` is included so
+    // an enumerator resolves as `Mode.On` rather than bare.
+    "class_specifier",
+    "struct_specifier",
+    "union_specifier",
+    "enum_specifier",
 ];
 
 /// Resolved enclosing-definition context for a (file, line). Used by the
@@ -50,7 +57,7 @@ pub(super) fn walk_to_enclosing_definition<'a>(
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let mut current = Some(node);
     while let Some(n) = current {
-        let def_name = if DEFINITION_KINDS.contains(&n.kind()) {
+        let def_name = if is_definition_node(n, Some(lang)) {
             extract_definition_name(n, lines)
         } else if lang == crate::types::Lang::Elixir && is_elixir_definition(n, lines) {
             extract_elixir_definition_name(n, lines)
@@ -128,6 +135,11 @@ pub fn enclosing_definition_at(
 /// we handle is enumerated here, so adding a new language grammar is "add the
 /// node kind to this match" with no string heuristics elsewhere.
 fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang) -> &'static str {
+    // A C++ export macro in a class head misparses into a `function_definition` that
+    // actually declares a class — label it for what it is, not for the node kind.
+    if cpp_misparsed_class_name(node, lines).is_some() {
+        return "class";
+    }
     match node.kind() {
         "function_declaration"
         | "function_definition"
@@ -135,12 +147,21 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "method_definition"
         | "method_declaration"
         | "decorated_definition" => "function",
-        "class_declaration" | "class_definition" => "class",
-        "struct_item" => "struct",
+        // A C/C++ `field_declaration` is a class member; a `function_definition`
+        // that actually declares a class is handled by the `class` arm below.
+        "field_declaration" => "member",
+        "class_declaration" | "class_definition" | "class_specifier" => "class",
+        "struct_item" | "struct_specifier" => "struct",
+        "union_specifier" => "union",
         "interface_declaration" => "interface",
         "trait_declaration" | "trait_item" => "trait",
-        "type_alias_declaration" | "type_item" | "type_declaration" => "type",
-        "enum_item" | "enum_declaration" => "enum",
+        "type_alias_declaration"
+        | "type_item"
+        | "type_declaration"
+        | "type_definition"
+        | "alias_declaration" => "type",
+        "enum_item" | "enum_declaration" | "enum_specifier" => "enum",
+        "template_declaration" => "template",
         "lexical_declaration" | "variable_declaration" => "variable",
         "const_item" | "const_declaration" => "const",
         "static_item" => "static",

@@ -1,4 +1,7 @@
-use crate::lang::treesitter::node_text_simple;
+use crate::lang::treesitter::{
+    c_declarator_name, cpp_misparsed_class_name, declarator_chain_has_function,
+    is_bodied_specifier, node_text_simple, SPECIFIER_KINDS,
+};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
@@ -126,7 +129,29 @@ fn node_to_entry(
     let start_line = node.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
 
+    // Computed once: the macro-misparse check walks children, and it gates both the
+    // arm below and the name that arm uses.
+    let misparsed_class = cpp_misparsed_class_name(node, lines);
+
     let (kind, name, signature) = match kind_str {
+        // C++ export-macro misparse: `class LIBFOO_API Widget : public Base { … };`
+        // reaches us as a `function_definition` that actually declares a class. Must
+        // precede the function arm below, which would render it `<anonymous>`.
+        // See `cpp_misparsed_class_name`.
+        "function_definition" | "declaration" if misparsed_class.is_some() => {
+            let name = misparsed_class.unwrap_or_else(|| "<anonymous>".into());
+            (OutlineKind::Class, name, None)
+        }
+
+        // A C/C++ type specifier with no `body` is an elaborated type specifier — a
+        // forward declaration (`class Fwd;`) or a type reference (`class Fwd* p;`),
+        // not a definition. Reject before the class/struct/enum arms below so it
+        // never reaches an outline. This also keeps the macro-misparse arm above from
+        // emitting its (macro-named) bodyless specifier child as a nested class.
+        k if SPECIFIER_KINDS.contains(&k) && !is_bodied_specifier(node) => {
+            return None;
+        }
+
         // Functions
         "function_declaration"
         | "function_definition"
@@ -139,6 +164,9 @@ fn node_to_entry(
         | "protocol_function_declaration" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
+                // C/C++ put the name inside a declarator chain rather than a `name`
+                // field, so every C and C++ function outlined as `<anonymous>`.
+                .or_else(|| c_declarator_child_name(node, lines))
                 .unwrap_or_else(|| {
                     // Swift deinit has no name field — use the node kind as name
                     if kind_str == "deinit_declaration" {
@@ -152,15 +180,67 @@ fn node_to_entry(
         }
 
         // Classes & structs
-        "class_declaration" | "class_definition" => {
+        "class_declaration" | "class_definition" | "class_specifier" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Class, name, None)
         }
-        "struct_item" | "struct_declaration" => {
+        "struct_item" | "struct_declaration" | "struct_specifier" | "union_specifier" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Struct, name, None)
+        }
+
+        // C++ `template <typename T> class Foo` / `… void bar()`. Like
+        // `export_statement`, the wrapper carries no name — recurse into the
+        // declaration it encloses and render that with its real kind, widening the
+        // range to cover the `template` clause.
+        "template_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(mut inner) = node_to_entry(child, lines, lang, depth) {
+                    inner.start_line = start_line;
+                    return Some(inner);
+                }
+            }
+            return None;
+        }
+
+        // C/C++ class member: `void DoThing();` or `int Count;` inside a class body.
+        // Language-gated because `field_declaration` also exists in the Rust, Go,
+        // Java and C# grammars, where surfacing every struct field would change
+        // those outlines. A member wrapping a nested type (`class Inner { … };`)
+        // recurses so the inner type renders as itself.
+        "field_declaration" if matches!(lang, Lang::C | Lang::Cpp) => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                if is_bodied_specifier(type_node) {
+                    let mut inner = node_to_entry(type_node, lines, lang, depth)?;
+                    inner.start_line = start_line;
+                    return Some(inner);
+                }
+            }
+            let name = c_declarator_child_name(node, lines)?;
+            if declarator_chain_has_function(node) {
+                let sig = extract_signature(node, lines);
+                (OutlineKind::Function, name, Some(sig))
+            } else {
+                (OutlineKind::Property, name, None)
+            }
+        }
+
+        // C/C++ `declaration`: a function prototype (`void Utility();`) or a global.
+        // Also how a member of a macro-misparsed class body reaches us, since that
+        // body parses as statements rather than as a `field_declaration_list`.
+        // Language-gated — `declaration` exists in the TS, JS, Java, C# and Kotlin
+        // grammars too, where surfacing it would change those outlines.
+        "declaration" if matches!(lang, Lang::C | Lang::Cpp) => {
+            let name = c_declarator_child_name(node, lines)?;
+            if declarator_chain_has_function(node) {
+                let sig = extract_signature(node, lines);
+                (OutlineKind::Function, name, Some(sig))
+            } else {
+                (OutlineKind::Variable, name, None)
+            }
         }
 
         // Interfaces & traits
@@ -173,13 +253,17 @@ fn node_to_entry(
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Interface, name, None)
         }
-        "type_item" | "type_definition" | "typealias_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
+        "type_item" | "type_definition" | "typealias_declaration" | "alias_declaration" => {
+            let name = find_child_text(node, "name", lines)
+                // C/C++ `typedef int MyAlias;` names the alias in a `declarator`
+                // field, not a `name` field.
+                .or_else(|| c_declarator_child_name(node, lines))
+                .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::TypeAlias, name, None)
         }
 
         // Enums
-        "enum_item" | "enum_declaration" | "enum_definition" => {
+        "enum_item" | "enum_declaration" | "enum_definition" | "enum_specifier" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Enum, name, None)
         }
@@ -352,16 +436,41 @@ fn collect_children(
     let mut children = Vec::new();
     let mut cursor = node.walk();
 
-    // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`)
+    // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`;
+    // C/C++ class and struct bodies are a `field_declaration_list`).
+    //
+    // `compound_statement` is C/C++-only here: it is where a macro-misparsed class
+    // head keeps its members. It must stay gated, because a *braced* PHP namespace
+    // (`namespace App { … }`) is a Module entry whose body is also a
+    // `compound_statement` — matching it ungated pulled PHP namespace members into
+    // the outline with placeholder names and a trait mislabelled as an interface.
+    let cpp_family = matches!(lang, Lang::C | Lang::Cpp);
     let body = node.children(&mut cursor).find(|c| {
         let k = c.kind();
-        k.contains("body") || k.contains("block") || k == "declaration_list"
+        k.contains("body")
+            || k.contains("block")
+            || k == "declaration_list"
+            || k == "field_declaration_list"
+            || (cpp_family && k == "compound_statement")
     });
 
     let parent = body.unwrap_or(node);
     let mut cursor2 = parent.walk();
 
     for child in parent.children(&mut cursor2) {
+        // `public:` / `private:` inside a misparsed class body parse as a
+        // `labeled_statement` wrapping the members that follow it. Flatten it so
+        // those members are collected rather than hidden behind the access
+        // specifier — one labeled_statement can hold several of them.
+        if child.kind() == "labeled_statement" && matches!(lang, Lang::C | Lang::Cpp) {
+            let mut inner = child.walk();
+            for grandchild in child.children(&mut inner) {
+                if let Some(entry) = node_to_entry(grandchild, lines, lang, depth) {
+                    children.push(entry);
+                }
+            }
+            continue;
+        }
         if let Some(entry) = node_to_entry(child, lines, lang, depth) {
             children.push(entry);
         }
@@ -411,6 +520,14 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
 /// Find a named child and return its text.
 fn find_child_text(node: tree_sitter::Node, field: &str, lines: &[&str]) -> Option<String> {
     node.child_by_field_name(field).map(|n| node_text(n, lines))
+}
+
+/// Resolve the name a C/C++ node declares through its `declarator` chain.
+/// `void Holder::Work() {}` → `"Work"`, `typedef int Alias;` → `"Alias"`.
+/// Returns `None` for nodes with no `declarator` field, so grammars that name
+/// their declarations with a `name` field are unaffected.
+fn c_declarator_child_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    c_declarator_name(node.child_by_field_name("declarator")?, lines)
 }
 
 /// Resolve the variable name from an assignment `name` field, unwrapping a
@@ -490,10 +607,16 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let kind = prev.kind();
     if kind.contains("comment") || kind.contains("doc") {
         let text = node_text(prev, lines);
+        // Order matters: the longer markers must be tried before `//`, and `//` has to
+        // be stripped at all — `format_entry` re-prefixes the doc with `// `, so a
+        // plain `// comment` rendered as `class Widget  // // comment`. C and C++ use
+        // `//` far more than `///`, so the doubling became the common case once C/C++
+        // entries started carrying names (and therefore docs) at all.
         let trimmed = text
             .trim_start_matches("///")
             .trim_start_matches("//!")
             .trim_start_matches("/**")
+            .trim_start_matches("//")
             .trim_start_matches('#')
             .trim();
         if trimmed.is_empty() {
