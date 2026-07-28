@@ -113,10 +113,10 @@ Releases publish **two npm names** from the same `npm/` wrapper: the canonical u
 
 Code navigation tasks across 5 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust, leveldb/C++). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings. The published result tables in `benchmark/README.md` cover a 26-task subset from the first four repos.
 
-**Setup** (one-time — clones repos at pinned commits):
+**Setup** (one-time). `setup_repos.py` clones the five real repos at pinned commits; `setup.py` generates the separate synthetic fixture. Tasks against real repos need the first:
 
 ```bash
-python benchmark/fixtures/setup.py
+python benchmark/fixtures/setup_repos.py
 ```
 
 **Run** (from project root — works inside Conductor/Claude Code sessions, `run.py` strips `CLAUDECODE` env var):

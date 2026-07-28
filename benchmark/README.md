@@ -255,7 +255,7 @@ Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. 
 
 ### Task definitions
 
-Tasks are in `benchmark/tasks/`. Each specifies `repo`, `prompt`, `ground_truth` (correctness strings), and `difficulty`.
+Tasks are in `benchmark/tasks/`. Each specifies `repo`, `prompt`, `ground_truth` (correctness strings), and `task_type` (`"read"` / `"navigate"` / `"edit"`). There is no `difficulty` field on `Task` — the easy/medium/hard tier is recorded in the task class docstring.
 
 ### Contributing benchmarks
 
@@ -267,9 +267,14 @@ We welcome benchmark contributions — more data makes the results more reliable
 - `repo`: which benchmark repo to use
 - `prompt`: the code navigation question
 - `ground_truth`: list of strings that must appear in a correct answer
-- `difficulty`: `"easy"`, `"medium"`, or `"hard"`
+- `task_type`: `"read"`, `"navigate"` or `"edit"` (defaults to `"read"`); note the easy/medium/hard tier in the class docstring
 
 Good tasks have unambiguous correct answers that can be verified by string matching. Avoid tasks where the answer depends on interpretation.
+
+Two traps to check for, both of which have bitten real tasks:
+
+- **Grading is a bare substring match, so shorter strings are satisfied by longer ones.** Requiring `Recover` is a no-op if a correct answer says `RecoverLogFile`. Pick strings that cannot contain one another.
+- **Don't calibrate ground truth to tilth's output.** If the required strings are whatever tilth happens to print, baseline runs fail for giving a different but equally correct answer, and any tilth blind spot becomes frozen in as expected behaviour. Verify against the repo, then make the prompt determinate enough that both modes are asked the same question.
 
 ## Version history
 

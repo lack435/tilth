@@ -100,6 +100,11 @@ REPOS = {
     # namespace throughout, templates with out-of-line member definitions
     # (db/skiplist.h), and static member functions called qualified across
     # files (`Status::Corruption(...)`). Pinned at the 1.23 release tag.
+    #
+    # leveldb has submodules (third_party/googletest, third_party/benchmark) and
+    # setup_repos.py never inits them, so third_party/ stays empty and the tree
+    # cannot be built. Fine for navigation tasks; a future leveldb task cannot
+    # use `test_command`.
     "leveldb": RepoConfig(
         name="leveldb",
         url="https://github.com/google/leveldb.git",
