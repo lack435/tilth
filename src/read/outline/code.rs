@@ -9,12 +9,7 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
         return fallback_outline(content, max_lines);
     };
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&language).is_err() {
-        return fallback_outline(content, max_lines);
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::lang::parse_masked(content, Some(lang), &language) else {
         return fallback_outline(content, max_lines);
     };
 
@@ -571,6 +566,39 @@ public:
                 "doc comments on both a constructor and a destructor",
                 "class API Widget : public Base\n{\npublic:\n    // Builds it.\n    Widget();\n    // Tears it down.\n    ~Widget();\n};\n",
             ),
+            (
+                // #49. Recovery used to end the class node at the first member and
+                // spill the rest to the top level, where `Value` became a file-level
+                // global and `Work` a free function.
+                "multiple inheritance",
+                "class API Widget : public P1, public P2\n{\npublic:\n    Widget();\n    ~Widget();\n    void Work();\n    int Value;\n};\n",
+            ),
+            (
+                // #52. An inline method body used to leak its statements up into the
+                // class body, where a local read as a member and a member was pushed
+                // out to the top level.
+                "an inline method body with more than one statement",
+                "class API Widget : public Base\n{\npublic:\n    void Work()\n    {\n        int Counter;\n        Widget Temp;\n    }\n    int Value;\n};\n",
+            ),
+            (
+                // #52, the other direction: a leaked call spelled like the class used
+                // to surface as a constructor.
+                "a call spelled like the class inside an inline method body",
+                "class API Widget : public Base\n{\npublic:\n    void Reset()\n    {\n        Cleanup();\n        Widget();\n    }\n};\n",
+            ),
+            (
+                // An argument-taking macro. Blanking the name but not its arguments
+                // stranded `(16)` where the type name goes, and emptied the outline
+                // entirely — worse than the misparse it replaced.
+                "an argument-taking macro in the head",
+                "class ALIGNAS(16) Widget\n{\npublic:\n    Widget();\n    void Work();\n    int Value;\n};\n",
+            ),
+            (
+                // The shape that actually occurs: a deprecation macro carrying a
+                // string, alongside a real export macro.
+                "an argument-taking macro next to an export macro",
+                "class DEPRECATED(5.4, \"gone\") API Widget : public Base\n{\npublic:\n    Widget();\n    void Work();\n};\n",
+            ),
         ];
         for (name, src) in cases {
             let plain = src
@@ -582,6 +610,39 @@ public:
                 with_macro, without,
                 "export macro changed the outline for {name}\nwith macro:\n{with_macro}\nplain:\n{without}"
             );
+        }
+    }
+
+    /// Masking is deliberately conservative — a head whose candidate is not
+    /// macro-shaped is left alone, because structure alone cannot tell it from
+    /// `struct FVector ALIGN16 P{0,0,0};`. Those heads still misparse, so the recovery
+    /// path from #16 is still load-bearing rather than dead code, and this pins that:
+    /// a lower-case export macro gets its members back the old way.
+    #[test]
+    fn cpp_outline_unmasked_head_still_recovers_via_misparse_path() {
+        let src = "\
+class lowercase_api Widget : public Base
+{
+public:
+    Widget();
+    ~Widget();
+    void Work();
+    int Value;
+};
+";
+        assert!(
+            crate::lang::cpp_macro::mask_export_macros(src).is_none(),
+            "this head must not be masked, or the test is not exercising the fallback"
+        );
+        let rendered = outline(src, Lang::Cpp, 1000);
+        for want in [
+            "class Widget",
+            "fn Widget",
+            "fn ~Widget",
+            "fn Work",
+            "prop Value",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
         }
     }
 
@@ -617,6 +678,31 @@ public:
             1,
             "only `Value` is data:\n{rendered}"
         );
+    }
+
+    /// Parity alone would be satisfied by both sides being equally wrong, so pin the
+    /// things #49 got wrong as absolute facts: the class's range covers the whole
+    /// class, and every member is a *child* of it rather than a top-level sibling.
+    #[test]
+    fn cpp_outline_multiple_inheritance_keeps_its_members() {
+        let entries = crate::lang::outline::get_outline_entries(
+            "class API Widget : public P1, public P2\n{\npublic:\n    Widget();\n    ~Widget();\n    void Work();\n    int Value;\n};\n",
+            Lang::Cpp,
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "nothing may escape to the top level: {entries:?}"
+        );
+        let class = &entries[0];
+        assert_eq!(class.name, "Widget");
+        assert_eq!(
+            (class.start_line, class.end_line),
+            (1, 8),
+            "the class range must cover the whole class: {class:?}"
+        );
+        let members: Vec<&str> = class.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(members, ["Widget", "~Widget", "Work", "Value"], "{class:?}");
     }
 
     /// One `ERROR` can hold two constructors, and a `contains` check cannot tell one

@@ -436,12 +436,7 @@ fn compute_structural_hash(source: &str, symbol_name: &str, lang: Lang) -> u64 {
         return hash_string(source);
     };
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return hash_string(source);
-    }
-
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = crate::lang::parse_masked(source, Some(lang), &ts_lang) else {
         return hash_string(source);
     };
 

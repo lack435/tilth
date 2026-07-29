@@ -608,7 +608,7 @@ fn find_definitions_multi(
             // entire saving over calling `search` per target.
             let tree = ts_language
                 .as_ref()
-                .and_then(|ts_lang| parse_tree(ts_lang, &content));
+                .and_then(|ts_lang| parse_tree(ts_lang, &content, lang));
             // Only the tree-sitter arm needs the line index, and it needs it once for the
             // file rather than once per query. The fallbacks below work off `content`
             // directly, so a markdown or no-grammar file should not pay for this.
@@ -813,7 +813,7 @@ fn find_defs_treesitter(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
-    let Some(tree) = parse_tree(ts_lang, content) else {
+    let Some(tree) = parse_tree(ts_lang, content, lang) else {
         return Vec::new();
     };
     let lines: Vec<&str> = content.lines().collect();
@@ -824,12 +824,12 @@ fn find_defs_treesitter(
 ///
 /// Split out so `find_definitions_multi` can parse a file once and walk the resulting
 /// tree per query — parsing is the expensive half, and it does not depend on the query.
-fn parse_tree(ts_lang: &tree_sitter::Language, content: &str) -> Option<tree_sitter::Tree> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return None;
-    }
-    parser.parse(content, None)
+fn parse_tree(
+    ts_lang: &tree_sitter::Language,
+    content: &str,
+    lang: Option<crate::types::Lang>,
+) -> Option<tree_sitter::Tree> {
+    crate::lang::parse_masked(content, lang, ts_lang)
 }
 
 /// One query's definitions from an already-parsed tree.

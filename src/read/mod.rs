@@ -151,6 +151,36 @@ pub fn read_file(
     }
 
     // Canonical full-content view — shared by the small-file gate and OGATE below.
+    //
+    // A leading BOM is deliberately NOT stripped here, in *either* branch, unlike in the
+    // outline funnel (#42).
+    //
+    // The edit-mode branch has no choice. It emits `hashlines(&content, 1)`, and
+    // `edit::apply_batch` verifies an anchor by hashing the line as `fs::read_to_string`
+    // yields it — BOM included. Stripping would hand the caller a hash for `name,age` while
+    // verification computes one for `\u{feff}name,age`, so every hash-mode edit touching
+    // line 1 of a BOM'd file would be rejected with a stale-anchor error: a cosmetic defect
+    // traded for a correctness one.
+    //
+    // The plain branch *could* strip — nothing downstream of it hashes, and stripping only
+    // it was a live option. It does not, so that the two branches say the same thing about
+    // the same file. A full view that renders one way for a read and another way for an
+    // edit-mode read is a worse defect than the glyph: it makes "what does this file start
+    // with?" depend on which mode you asked in, and agents diff these outputs against each
+    // other. Consistency was the explicit call here, not a consequence of the hash
+    // constraint, which is why it gets its own test rather than riding on the edit one.
+    //
+    // Section reads (`collect_blocks`) follow the same rule for the same reasons — they
+    // slice the raw mmap and hash the slice, so a line-1 section keeps the BOM and its
+    // edit-mode anchor agrees with verification. So the rule across the read surface is:
+    // rendered file content keeps the BOM (full view, section reads), the outline funnel
+    // strips it (a derived view, no hash), and synthesised text strips it (heading
+    // suggestions, the query in `resolve_range`). Search rendering is the one rendered-content
+    // surface still leaking, tracked in #51.
+    //
+    // Pinned by `hash_mode_edits_line_one_of_a_bom_file` and
+    // `hash_mode_section_read_of_line_one_of_a_bom_file` (the hash contract) and
+    // `both_full_view_modes_agree_about_a_bom` (the consistency call).
     let full_view = || {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
@@ -210,6 +240,17 @@ pub fn would_outline(path: &Path) -> bool {
 /// fence-state tracking the previous hand-rolled scanner needed is now
 /// the parser's responsibility.
 fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
+    // Same strip as `read::outline::generate` applies before parsing, and it has to be: the
+    // outline is where an agent gets the heading anchors it then passes back here. While
+    // only the outline stripped, a doubled-BOM markdown file outlined its headings and then
+    // had every one of them rejected as "heading not found". A BOM carries no newline, so
+    // the line numbers this returns are unaffected.
+    let buf = crate::lang::outline::strip_bom_bytes(buf);
+    // The query can carry a BOM too, when it was lifted from a BOM'd file. `resolve_range`
+    // already strips it before the `#` gate, but strip here as well so a direct caller —
+    // the tests, and any future one — is not silently told the heading is absent because the
+    // BOM made `query_level` count zero `#`s.
+    let heading = crate::lang::outline::strip_bom(heading);
     let heading_trimmed = heading.trim_end();
     let query_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
     if query_level == 0 || query_level > 6 {
@@ -318,6 +359,13 @@ fn section_end_line(section: tree_sitter::Node) -> usize {
 /// matches first; this is acceptable for a hint and aligned with the rest
 /// of the project's `edit_distance` use.
 fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
+    // These suggestions are rendered verbatim as "Closest matches", and an agent pastes one
+    // straight back as `section`. Unstripped, a BOM'd file suggested `\u{feff}# Title` — and
+    // `resolve_range` gates on `range.starts_with('#')`, which the BOM defeats, so the retry
+    // did not even reach the heading resolver: tilth answered its own suggestion with
+    // "expected format: start-end or heading". A hint is a string tilth synthesised, not the
+    // file's bytes, so unlike the full view there is nothing here to preserve.
+    let buf = crate::lang::outline::strip_bom_bytes(buf);
     let q_text = query.trim_end().trim_start_matches('#').trim();
     if q_text.is_empty() {
         return Vec::new();
@@ -372,6 +420,18 @@ fn collect_atx_headings(
 /// Resolve a single range string (line range like "45-89" or heading like
 /// "## Architecture") to a 1-indexed inclusive `(start, end)` pair.
 fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> {
+    // The BOM comes off the *query* here, at the consumer, and this is the load-bearing
+    // half of #42's heading fix. Fixing only the producers — `suggest_headings`, the
+    // outline — leaves this gate rejecting any heading string that carries one, and a BOM'd
+    // heading reaches an agent from more than one place: `search::symbol`'s markdown
+    // definition matcher renders line 1 verbatim too. Whatever the source, `starts_with('#')`
+    // failed and the caller was told `expected format: "start-end" ... or heading` for a
+    // string that *is* a heading — a format error for a routing failure.
+    //
+    // Stripped before the gate rather than inside `resolve_heading` alone, because the gate
+    // decides which of the two error messages the caller gets. `resolve_heading` strips the
+    // query again for callers that reach it directly.
+    let range = crate::lang::outline::strip_bom(range);
     if range.starts_with('#') {
         resolve_heading(buf, range).ok_or_else(|| {
             let suggestions = suggest_headings(buf, range, 5);
@@ -753,6 +813,167 @@ mod tests {
 
         std::env::remove_var("TILTH_FULL_SIZE_CAP");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two full-view branches must render a BOM'd file the same way.
+    ///
+    /// Edit mode has no choice — stripping there desynchronises the anchors it hands out
+    /// from `edit::apply_edits`' verification. The plain branch could strip freely, since
+    /// nothing downstream of it hashes, and stripping only it was a live option (#42 offered
+    /// it). It is refused so that "what does this file start with?" does not depend on which
+    /// mode you asked in: agents diff these two outputs against each other, and a full view
+    /// that disagrees with itself is worse than the glyph it would have removed.
+    ///
+    /// Two assertions with different jobs. The `assert_eq!` catches a *one-way* drift — one
+    /// branch stripped and the other not — which is the regression that actually matters,
+    /// and it would hold whichever way a future both-branch reversal went. The final
+    /// `assert!(edit.contains(BOM))` additionally pins today's *keep* decision, so it is not
+    /// reversal-tolerant by design: flipping both branches to strip must edit this test,
+    /// which is the point — a reversal should be a deliberate change to the recorded call,
+    /// not something that slips through green. Without it, "neither has a BOM" would satisfy
+    /// the `assert_eq!` and the test would pass having proved nothing.
+    #[test]
+    fn both_full_view_modes_agree_about_a_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.csv");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"name,age\nalice,30\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let cache = OutlineCache::new();
+        let plain = read_file(&path, None, false, &cache, false).unwrap();
+        let edit = read_file(&path, None, false, &cache, true).unwrap();
+
+        // Small file, so both take the full-content path rather than an outline.
+        assert!(
+            plain.contains("[full]") && edit.contains("[full]"),
+            "fixture must exercise the full view, got:\n{plain}\n---\n{edit}"
+        );
+        assert_eq!(
+            plain.contains('\u{feff}'),
+            edit.contains('\u{feff}'),
+            "the two full-view modes disagree about the BOM:\nplain:\n{plain}\nedit:\n{edit}"
+        );
+        assert!(
+            edit.contains('\u{feff}'),
+            "the full view keeps the BOM in both modes; if that is reversed, reverse it in \
+             both and update this test deliberately:\n{edit}"
+        );
+    }
+
+    /// A heading tilth suggests must be one tilth accepts, on a BOM'd file.
+    ///
+    /// `suggest_headings` rendered line 1 verbatim, so a BOM'd file suggested
+    /// `\u{feff}# Title` as a "Closest match" — and `resolve_range` gates on
+    /// `range.starts_with('#')`, which the BOM defeats, so pasting that suggestion back did
+    /// not even reach the heading resolver. The agent got `expected format: "start-end" or
+    /// heading` for a string tilth had just handed it.
+    ///
+    /// Distinct from the full-view decision: a suggestion is a string tilth synthesised, not
+    /// the file's bytes, and it carries no hash anchor.
+    #[test]
+    fn a_suggested_heading_is_one_the_resolver_accepts_on_a_bom_file() {
+        // Two *same-level* headings, so `# Title` terminates at the line before `# Sub`
+        // rather than running to EOF — a level-2 `## Sub` would nest inside `# Title` and
+        // make its span the whole file, which is a far less discriminating range to assert.
+        let body = "# Title\nfoo\n# Sub\nbar\n";
+        for n in 1..=2 {
+            let mut input = Vec::new();
+            for _ in 0..n {
+                input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            input.extend_from_slice(body.as_bytes());
+
+            let suggestions = suggest_headings(&input, "# Titel", 5);
+            let suggested = suggestions
+                .iter()
+                .find(|h| h.contains("Title"))
+                .unwrap_or_else(|| {
+                    panic!("{n} BOM(s): no suggestion for 'Title': {suggestions:?}")
+                });
+            assert!(
+                !suggested.contains('\u{feff}'),
+                "{n} BOM(s): the suggestion carries a BOM: {suggested:?}"
+            );
+            // The round trip: feed the suggestion back exactly as an agent would, and check
+            // it resolves to the *right* lines — `# Title` runs to the line before `# Sub`,
+            // i.e. lines 1..=2. `is_ok()` alone would pass for a resolver returning any range.
+            assert_eq!(
+                resolve_range(&input, suggested).ok(),
+                Some((1, 2)),
+                "{n} BOM(s): the suggestion {suggested:?} resolved to the wrong range"
+            );
+        }
+    }
+
+    /// A heading query that itself carries a BOM must resolve, not error as malformed.
+    ///
+    /// This is the consumer half of #42's heading fix, and the scenario the producer tests
+    /// miss: an agent copies a heading out of *search* output — which still renders line 1
+    /// verbatim (#51) — and pastes it back as a `section`. So the query arrives as
+    /// `\u{feff}# Title`, and `resolve_range`'s `starts_with('#')` gate sees the BOM first,
+    /// routes to the line-range parser, and returns `expected format: "start-end" ... or
+    /// heading` — a format error for a string that is a perfectly good heading. The query is
+    /// echoed/synthesised text, not the file's bytes, so stripping it costs nothing.
+    ///
+    /// The file here is plain (no BOM); only the *query* carries one. That is deliberate —
+    /// it isolates the query strip from the buf strip, so this fails if and only if the
+    /// consumer-side query strip is removed.
+    #[test]
+    fn a_bom_carrying_heading_query_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readme.md");
+        std::fs::write(&path, "# Title\nfoo\n# Sub\nbar\n").unwrap();
+
+        let cache = OutlineCache::new();
+        // `\u{feff}# Title` built so the BOM leads the query, as it would off a BOM'd file.
+        let out = read_file(&path, Some("\u{feff}# Title"), false, &cache, false)
+            .expect("a BOM'd heading query must resolve, not error as malformed");
+        // Resolved to the heading's own line, and only it — `# Title` owns lines 1..=2.
+        assert!(
+            out.contains("Title") && !out.contains("Sub"),
+            "the BOM'd query resolved to the wrong section:\n{out}"
+        );
+    }
+
+    /// The outline and the section resolver must agree about which headings exist, and about
+    /// where they are.
+    ///
+    /// `read::outline::generate` strips a BOM before parsing; while `resolve_heading` did
+    /// not, a doubled-BOM markdown file outlined its headings and then had every one of them
+    /// rejected as "heading not found" — an anchor advertised by one half of the same tool
+    /// and denied by the other. The range is asserted, not just presence: the outline prints
+    /// the line span in `[start-end]`, and the resolver returning a *different* span is the
+    /// same advertise/deny mismatch wearing a subtler disguise. Same-level headings, so
+    /// `# Title` owns lines 1..=2, up to the line before `# Sub`.
+    #[test]
+    fn the_outline_and_the_heading_resolver_agree_on_a_bom_file() {
+        let body = "# Title\nfoo\n# Sub\nbar\n";
+        for n in 0..=2 {
+            let mut input = Vec::new();
+            for _ in 0..n {
+                input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            input.extend_from_slice(body.as_bytes());
+            let content = String::from_utf8(input.clone()).unwrap();
+
+            let outline = outline::generate(
+                Path::new("readme.md"),
+                FileType::Markdown,
+                &content,
+                &input,
+                false,
+            );
+            assert!(
+                outline.contains("[1-2]") && outline.contains("Title"),
+                "{n} BOM(s): the outline lost its heading or its span: {outline:?}"
+            );
+            assert_eq!(
+                resolve_heading(&input, "# Title"),
+                Some((1, 2)),
+                "{n} BOM(s): the resolver disagrees with the span the outline advertised"
+            );
+        }
     }
 
     #[test]

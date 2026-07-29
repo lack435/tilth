@@ -125,6 +125,69 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// for the next fifty calls and nothing it touches is ever admitted. In that regime the cache
 /// is dead weight — bounded, but useless. A generational reset (clear and start over when the
 /// ceiling is hit) would fix it without needing an access order; not done here.
+///
+/// #40 tracks that, and this module now carries the instrumentation and measurement for it. The
+/// regime is real and worse than the paragraph above guesses: on a ~147k-file C++ tree, five
+/// `kind: "callers"` queries scoped to one subtree after one broad query at the root score 0.0%
+/// against 80.0% for the same five queries on a cache that was never poisoned — and the subtree
+/// caches completely in 1.9 MB, so the budget is being spent keeping 32 MB that cannot be used.
+///
+/// A first attempt at the reset was written, measured, and **rejected**. What it established is
+/// worth more than the code was, because all of it is about why the obvious fixes do not work:
+///
+/// * Refusal is a *good* policy when the working set genuinely exceeds the ceiling. Hit rate
+///   degrades smoothly with the ceiling's share of the working set, because whatever got in keeps
+///   earning. Any policy that clears has to beat that, and "clear when full" does not: both the
+///   #40 regime and an overloaded cache are full, so fullness cannot be the trigger.
+/// * A fixed miss-run trigger cannot work, for two separate reasons. Peak miss run per walk, one
+///   fixture, five walks per ceiling:
+///
+///   ```text
+///   ceiling / working set   walk 0   walks 1-4              (1-f)*W   ratio
+///   0.25x                     1993   1354, 1354, 1354, 1354    1495    0.91
+///   0.50x                     1993    856,  856,  856,  856     997    0.86
+///   0.75x                     1993    384,  384,  384,  384     498    0.77
+///   1.00x                     1993      0,    0,    0,    0       -       -
+///   ```
+///
+///   `TILTH_THREADS=1`, three reps, every figure above bit-identical across all three — hit rates
+///   included. `W` is the 1993 probes one walk makes over this scope.
+///
+///   First, **walk 0 is the full probe count at every ceiling** — 1993 on a 1993-probe scope,
+///   including at 1.00x where nothing is ever refused and the cache is perfect. A first walk has no
+///   hits available to interrupt it, so this is structural, not a property of being overloaded. Any
+///   threshold below one walk's probe count fires on the first walk of every workload. (Walk 0 reads
+///   1993 in every row for that reason; the 1.00x row is the clearest illustration, not extra
+///   evidence.)
+///
+///   Second, and this is the one that kills a fixed bound: **the steady-state run is a function of
+///   walker thread count**, because `miss_run` is one counter shared by the whole walk and any
+///   thread's hit ends the run for all of them. The table above is `TILTH_THREADS=1`, where the four
+///   steady walks are identical to the probe and reproduce bit-for-bit across reps. Raise the thread
+///   count and the same cache behaviour reports a different number — roughly halving at 2 threads,
+///   and landing anywhere in a wide band at the default, which is `available_parallelism() / 2`
+///   clamped to 2..6 and therefore machine-dependent.
+///
+///   So the quantity is perfectly predictable per `(tree, ceiling fraction, thread count)` and
+///   useless as a trigger anyway: a policy thresholding on it fires according to how many threads
+///   the walker happened to start. An earlier reading of these rows claimed the run had "no stable
+///   model" and was low by up to 6x against `~(1 - ceiling/working_set) x probes_per_walk`. That was
+///   sampling noise, not a property of the run — under a fixed thread count the law holds at
+///   0.77-0.91x of prediction here, and at a constant 1.13x on a second fixture. The law is a
+///   serviceable upper bound with a tree-dependent constant; it is the thread dependence that rules
+///   the signal out.
+///
+///   Note this carries forward to any replacement: normalising against resident entry count does
+///   not help while the numerator is a thread-interleaved global count. A per-thread run, or a
+///   quantity that does not depend on interleaving at all, is what the next attempt needs.
+/// * Refused bytes measured against the ceiling also fails: at a ceiling of ~0.75x the working set
+///   the refused portion is genuinely smaller than the ceiling even though the working set is not,
+///   so it clears a cache that is earning well.
+/// * Exponential backoff on repeated resets does not rescue a bad trigger if the backoff is
+///   forgiven by any hit — an overloaded cache re-hits the block admitted just before each clear,
+///   so the penalty never accumulates and the cache resets once per walk forever.
+///
+/// `peak_miss_run` exists to feed the next attempt at this.
 pub struct BloomFilterCache {
     filters: DashMap<PathBuf, CachedFilter>,
     /// Sum of `CachedFilter::bytes` over the map.
@@ -154,6 +217,35 @@ pub struct BloomFilterCache {
     /// file, not one per target" is the whole point of `contains_any` and the only way to assert
     /// it deterministically. A timing assertion would be flaky; a build count is exact.
     builds: std::sync::atomic::AtomicUsize,
+    /// Probes answered from a cached filter with a matching mtime.
+    ///
+    /// With `builds`, this gives the hit rate. #40 needs it: the open question there is whether a
+    /// full cache still *earns* its 32 MB, and "hit rate over a realistic query sequence" is the
+    /// only way to answer that. Before this, the cache could be bounded, resident, and returning
+    /// nothing, with no way to tell from outside.
+    ///
+    /// Report-only, like `builds`. Both are `Relaxed`: they are read after the walks they describe
+    /// have joined, so no ordering is needed, and nothing branches on them.
+    hits: std::sync::atomic::AtomicUsize,
+    /// Admissions declined because the filter did not fit under `ceiling`.
+    ///
+    /// Distinguishes the two reasons a probe can miss — a cold entry, which the cache will serve
+    /// next time, from a refused one, which it never will. A cache whose misses are nearly all
+    /// refusals is full and useless, which is exactly the #40 regime; a cache whose misses are
+    /// cold is simply warming up. The hit rate alone cannot tell those apart.
+    refusals: std::sync::atomic::AtomicUsize,
+    /// Consecutive misses with no intervening hit; zeroed by every hit.
+    miss_run: std::sync::atomic::AtomicUsize,
+    /// Longest value `miss_run` has reached.
+    ///
+    /// Instrumentation only — nothing in this file acts on it. It is here because the length of a
+    /// miss run is the quantity an adaptive-eviction policy has to reason about, and #40's first
+    /// attempt failed precisely by guessing at it. A fixed run-length trigger was measured against
+    /// three fixtures on two trees and the natural run turned out to be
+    /// `~(1 - ceiling/working_set) x probes_per_pass` — proportional to tree size, so any fixed
+    /// bound is a per-tree tuning parameter in disguise. Recording the real distribution is what
+    /// lets the next attempt normalise against something scale-free instead of guessing again.
+    peak_miss_run: std::sync::atomic::AtomicUsize,
 }
 
 struct CachedFilter {
@@ -184,6 +276,10 @@ impl BloomFilterCache {
             bytes: std::sync::atomic::AtomicUsize::new(0),
             ceiling,
             builds: std::sync::atomic::AtomicUsize::new(0),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            refusals: std::sync::atomic::AtomicUsize::new(0),
+            miss_run: std::sync::atomic::AtomicUsize::new(0),
+            peak_miss_run: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -197,6 +293,60 @@ impl BloomFilterCache {
     #[must_use]
     pub fn filters_built(&self) -> usize {
         self.builds.load(Relaxed)
+    }
+
+    /// Probes served from a cached filter. Test/diagnostic accessor.
+    ///
+    /// `#[cfg(test)] pub(crate)`, unlike the older `cached_bytes` and `filters_built` above. Those
+    /// are already published and narrowing them would be a breaking change, but there is no reason
+    /// to add semver surface for counters only test code reads — and `pub(crate)` alone would trip
+    /// `dead_code` in a non-test build, which is why the older pair is `pub` at all. The fields
+    /// themselves are written unconditionally, so the counting is never compiled out.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn cache_hits(&self) -> usize {
+        self.hits.load(Relaxed)
+    }
+
+    /// Admissions refused for want of budget. Test/diagnostic accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn admissions_refused(&self) -> usize {
+        self.refusals.load(Relaxed)
+    }
+
+    /// Longest run of consecutive misses with no intervening hit. Test/diagnostic accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn peak_miss_run(&self) -> usize {
+        self.peak_miss_run.load(Relaxed)
+    }
+
+    /// Read the peak miss run and clear it, so the next interval can be measured on its own.
+    ///
+    /// The cumulative peak is dominated by the first walk over any scope, which has no hits
+    /// available to interrupt it and therefore always runs the full probe count. That single number
+    /// hides the steady-state run, and the two are what an adaptive trigger has to tell apart — so
+    /// the harness samples per walk rather than reading a running maximum.
+    ///
+    /// Clears the in-flight run as well as the peak. Without that, a walk whose first probe misses
+    /// would report `previous_tail + 1` and the intervals would not be independent. On the fixtures
+    /// measured so far it makes no difference — each walk happens to hit before it misses, so the
+    /// tail is already 0 — but that is luck, not isolation.
+    #[cfg(test)]
+    pub(crate) fn take_peak_miss_run(&self) -> usize {
+        self.miss_run.store(0, Relaxed);
+        self.peak_miss_run.swap(0, Relaxed)
+    }
+
+    /// Extend the current miss run and record it if it is the longest so far.
+    ///
+    /// `fetch_max` rather than load-compare-store: the peak is written from every walk thread, and
+    /// a read-modify-write outside a lock would lose updates and under-report exactly the long runs
+    /// this exists to catch.
+    fn note_miss(&self) {
+        let run = self.miss_run.fetch_add(1, Relaxed) + 1;
+        self.peak_miss_run.fetch_max(run, Relaxed);
     }
 
     /// Check if `symbol` might appear in the file at `path`.
@@ -313,6 +463,8 @@ impl BloomFilterCache {
         // the filter we already hold.
         if let Some(entry) = self.filters.get(path) {
             if entry.mtime == mtime {
+                self.hits.fetch_add(1, Relaxed);
+                self.miss_run.store(0, Relaxed);
                 return targets.any(|t| entry.filter.contains(t.as_ref()));
             }
         }
@@ -321,6 +473,7 @@ impl BloomFilterCache {
         // Admission may refuse; the answer is already in hand either way.
         let filter = build_filter(content, code_lang(path));
         self.builds.fetch_add(1, Relaxed);
+        self.note_miss();
         let result = targets.any(|t| filter.contains(t.as_ref()));
         self.admit(path, mtime, filter);
         result
@@ -357,6 +510,7 @@ impl BloomFilterCache {
                 } else {
                     // Its budget is already reclaimed and its mtime can never match again, so
                     // keeping it would be resident memory the counter no longer knows about.
+                    self.refusals.fetch_add(1, Relaxed);
                     occupied.remove();
                 }
             }
@@ -368,6 +522,8 @@ impl BloomFilterCache {
                         mtime,
                         bytes: cost,
                     });
+                } else {
+                    self.refusals.fetch_add(1, Relaxed);
                 }
             }
         }
@@ -616,6 +772,299 @@ fn is_ident_continue(b: u8) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Measurement harness for #40 — does a full cache still earn its ceiling?
+///
+/// `#[ignore]`d and driven by environment variables, because the question only has an answer on a
+/// tree large enough to fill 32 MB, and no such tree can live in this repository. Run it as:
+///
+/// ```text
+/// TILTH_ADAPTIVITY_ROOT=<large tree> TILTH_ADAPTIVITY_SUBTREE=<a subdir of it> \
+///   cargo test --release adaptivity -- --ignored --nocapture
+/// ```
+///
+/// It exists as a committed test rather than a throwaway script so the numbers in #40 can be
+/// reproduced, and so the *shape* of the measurement is reviewable. It asserts almost nothing —
+/// its output is the deliverable.
+///
+/// **Run every arm several times before believing any difference.** The thrash rows are noisy, and
+/// badly so at the middle ceilings. Refuse-forever behaviour, one fixture, six observations per
+/// row, no code change between them:
+///
+/// ```text
+/// ceiling / working set   observed hit rate   spread
+/// 0.25x                       14.1 - 26.1%    12.0 pts
+/// 0.50x                       33.7 - 49.6%    15.9 pts
+/// 0.75x                       58.3 - 64.7%     6.4 pts
+/// 1.00x                       80.0 - 80.0%     0
+/// ```
+///
+/// **This is a lower bound on the noise, from one fixture on one machine at its default thread
+/// count — not a floor to compare against.** An earlier version of this table quoted 0.25x as the
+/// quiet row at 2.7 points, from six samples. Nineteen samples put it at 12.0 points, with values
+/// nine points below that entire range. The spread did not converge as samples were added; it kept
+/// widening. Treat every row as "at least this noisy", and re-measure per fixture rather than
+/// reusing these numbers.
+///
+/// The mechanism is the parallel walk, and that is demonstrated rather than assumed: `TILTH_THREADS=1`
+/// makes every row reproduce bit-for-bit across reps, hit rates and per-walk miss runs alike. Once
+/// the ceiling is reached, *which* files won the race into the cache decides what hits afterwards,
+/// and thread scheduling decides that. **Set `TILTH_THREADS=1` for anything compared across builds.**
+///
+/// The 1.00x row's zero spread is arithmetic, not evidence: when the ceiling fits the working set,
+/// walk 0 is all misses and walks 1-4 are all hits, so the rate is exactly 4/5 by construction. It
+/// is a useful control precisely because it cannot vary, but it demonstrates nothing about the
+/// mechanism — the deterministic-thread result above is what does.
+///
+/// This is why the first attempt at #40 reported a "worst regression of 4.0 points" that did not
+/// survive contact with a second fixture: every delta it quoted was a single run of one build
+/// against a single run of another, and all of them were inside the band above. No numeric
+/// "is it evidence" rule is offered here, because an earlier version of this comment gave one and it
+/// was derived from the same too-narrow sample it was meant to protect against.
+#[cfg(test)]
+mod adaptivity {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Counter snapshot, so each phase can be reported as a delta rather than a running total.
+    #[derive(Clone, Copy)]
+    struct Snap {
+        hits: usize,
+        builds: usize,
+        refusals: usize,
+        bytes: usize,
+        peak_run: usize,
+    }
+
+    impl Snap {
+        fn of(c: &BloomFilterCache) -> Self {
+            Self {
+                hits: c.cache_hits(),
+                builds: c.filters_built(),
+                refusals: c.admissions_refused(),
+                bytes: c.cached_bytes(),
+                peak_run: c.peak_miss_run(),
+            }
+        }
+
+        fn since(self, before: Self) -> (usize, usize, usize) {
+            (
+                self.hits - before.hits,
+                self.builds - before.builds,
+                self.refusals - before.refusals,
+            )
+        }
+    }
+
+    /// Ratios here are printed for a human to read, never compared or asserted, so the precision
+    /// loss on the casts does not matter.
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn report(label: &str, before: Snap, after: Snap) {
+        let (hits, builds, refusals) = after.since(before);
+        let probes = hits + builds;
+        let rate = if probes == 0 {
+            f64::NAN
+        } else {
+            hits as f64 / probes as f64 * 100.0
+        };
+        let refused_share = if builds == 0 {
+            f64::NAN
+        } else {
+            refusals as f64 / builds as f64 * 100.0
+        };
+        let resident_mb = after.bytes as f64 / (1024.0 * 1024.0);
+        // `peak_run` is whatever the per-walk sampling has not already drained, so it reads 0 in the
+        // thrash arm and the per-walk list is the number to look at. Printed regardless, because the
+        // first attempt at #40 justified a threshold against a run length it never measured at all,
+        // and adding this one line falsified three separate claims immediately.
+        println!(
+            "{label:28} probes={probes:>8}  hits={hits:>8}  builds={builds:>8}  \
+             hit_rate={rate:>5.1}%  refused/build={refused_share:>5.1}%  \
+             resident={resident_mb:.1}MB  peak_miss_run={:>7}",
+            after.peak_run
+        );
+    }
+
+    /// The walker thread count these numbers were produced under.
+    ///
+    /// Printed with every run because miss-run length is a function of it — `miss_run` is one
+    /// counter for the whole walk, so any thread's hit ends the run for all of them. Two people
+    /// measuring the same cache behaviour on different machines get different miss runs, and the
+    /// default is machine-dependent. An unlabelled miss-run number is not a measurement.
+    ///
+    /// Mirrors the resolution in `search::walker`; set `TILTH_THREADS=1` for reproducible runs.
+    fn walk_threads() -> usize {
+        std::env::var("TILTH_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+            })
+    }
+
+    fn targets() -> HashSet<String> {
+        ["IsValid", "Initialize", "Reset", "Update", "Serialize"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    fn env_tree() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let root = std::env::var_os("TILTH_ADAPTIVITY_ROOT")?;
+        let sub = std::env::var_os("TILTH_ADAPTIVITY_SUBTREE")?;
+        Some((
+            std::path::PathBuf::from(root),
+            std::path::PathBuf::from(sub),
+        ))
+    }
+
+    /// The #40 regime: one broad query fills the budget, then the agent narrows to one subtree for
+    /// the next N calls.
+    ///
+    /// The **control** is the point. A low hit rate in the narrow phase means nothing on its own —
+    /// it could just as easily mean the subtree has few files probed more than once. So the same
+    /// narrow sequence also runs against a *fresh* cache, which shows what hit rate the sequence
+    /// can reach when the budget has not already been spent on unrelated files. The gap between
+    /// them is the cost of the cache not adapting; if there is no gap, #40 is not a real problem
+    /// and the honest outcome is to document it and close.
+    #[test]
+    #[ignore = "needs a tree large enough to fill the 32 MB ceiling; see module docs"]
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn adaptivity_broad_then_narrow_versus_fresh() {
+        let Some((root, sub)) = env_tree() else {
+            println!(
+                "SKIPPED (no TILTH_ADAPTIVITY_ROOT / TILTH_ADAPTIVITY_SUBTREE) — measured nothing"
+            );
+            return;
+        };
+        println!("walk threads: {}", walk_threads());
+        let narrow_calls: usize = std::env::var("TILTH_ADAPTIVITY_CALLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let t = targets();
+
+        // --- Arm A: broad query first, then narrow (the adversarial agent shape) ---
+        let poisoned = BloomFilterCache::new();
+        let a0 = Snap::of(&poisoned);
+        let _ = crate::search::callers::find_callers_batch(&t, &root, &poisoned, None);
+        let a1 = Snap::of(&poisoned);
+        report("A broad (fills budget)", a0, a1);
+
+        for i in 0..narrow_calls {
+            let before = Snap::of(&poisoned);
+            let _ = crate::search::callers::find_callers_batch(&t, &sub, &poisoned, None);
+            let after = Snap::of(&poisoned);
+            report(&format!("A narrow #{i}"), before, after);
+        }
+        let a_end = Snap::of(&poisoned);
+        report("A narrow total", a1, a_end);
+
+        // --- Arm B: the same narrow sequence against a cache that was never poisoned ---
+        let fresh = BloomFilterCache::new();
+        let b0 = Snap::of(&fresh);
+        for i in 0..narrow_calls {
+            let before = Snap::of(&fresh);
+            let _ = crate::search::callers::find_callers_batch(&t, &sub, &fresh, None);
+            let after = Snap::of(&fresh);
+            report(&format!("B narrow #{i}"), before, after);
+        }
+        let b_end = Snap::of(&fresh);
+        report("B narrow total", b0, b_end);
+
+        let (ah, ab, _) = a_end.since(a1);
+        let (bh, bb, _) = b_end.since(b0);
+        let (ar, br) = (
+            ah as f64 / (ah + ab).max(1) as f64,
+            bh as f64 / (bh + bb).max(1) as f64,
+        );
+        println!(
+            "\nnarrow-phase hit rate: poisoned {:.1}% vs fresh {:.1}%  (gap {:.1} points)",
+            ar * 100.0,
+            br * 100.0,
+            (br - ar) * 100.0
+        );
+        println!(
+            "if the gap is ~0, a full cache costs nothing here and #40 should be documented, \
+             not fixed"
+        );
+    }
+
+    /// The case that constrains the fix: a working set genuinely larger than the ceiling.
+    ///
+    /// Refusal degrades gracefully here — whatever got in keeps hitting, so the hit rate lands
+    /// somewhere between 0% and the ceiling's share of the working set. A naive "clear when full"
+    /// reset does **not**: it throws away a cache that was working, and if the clear lands near the
+    /// end of each walk it can score worse than refusing ever did. So this number is the floor any
+    /// reset policy has to beat, and the reason #40 leans toward hysteresis rather than a bare
+    /// reset.
+    ///
+    /// Uses `with_ceiling` to make the working set exceed the budget cheaply, rather than needing a
+    /// tree big enough to overflow 32 MB several times over.
+    #[test]
+    #[ignore = "needs TILTH_ADAPTIVITY_SUBTREE; see module docs"]
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn adaptivity_thrash_working_set_larger_than_ceiling() {
+        // Only the subtree is used here, so do not demand the root as well — the earlier version
+        // required both and then ignored one, which contradicted its own `#[ignore]` reason.
+        let Some(sub) = std::env::var_os("TILTH_ADAPTIVITY_SUBTREE").map(std::path::PathBuf::from)
+        else {
+            println!("SKIPPED (no TILTH_ADAPTIVITY_SUBTREE set) — this run measured nothing");
+            return;
+        };
+        let t = targets();
+
+        // First find what this subtree actually needs, so the ceilings below are fractions of a
+        // measured number rather than guesses.
+        //
+        // Effectively unbounded, not `new()`. With the default 32 MB ceiling this run would refuse
+        // admissions on any subtree needing more than that, `needed` would come back clamped to
+        // 32 MB, and every row below would silently be a fraction of the ceiling rather than of the
+        // working set — including the "1.00x" row, which the type doc leans on as the case where
+        // nothing is ever refused. The assertion makes the clamp impossible to miss if this is ever
+        // pointed at a subtree that overflows `usize`-worth of filters.
+        let sizing = BloomFilterCache::with_ceiling(usize::MAX / 2);
+        let _ = crate::search::callers::find_callers_batch(&t, &sub, &sizing, None);
+        let needed = sizing.cached_bytes();
+        assert_eq!(
+            sizing.admissions_refused(),
+            0,
+            "sizing run hit its ceiling, so `needed` is clamped and every row below is mislabelled"
+        );
+        println!(
+            "subtree needs {:.2}MB to cache fully  (walk threads: {})",
+            needed as f64 / (1024.0 * 1024.0),
+            walk_threads()
+        );
+
+        // Ceiling as a fraction of the working set. 1.0 is the adequate case for reference.
+        for frac in [0.25_f64, 0.5, 0.75, 1.0] {
+            #[allow(clippy::cast_sign_loss, reason = "frac and needed are both positive")]
+            #[allow(clippy::cast_possible_truncation, reason = "byte count fits usize")]
+            let ceiling = (needed as f64 * frac) as usize;
+            let cache = BloomFilterCache::with_ceiling(ceiling);
+            let b0 = Snap::of(&cache);
+            // Sample the peak miss run per walk, not cumulatively. Walk 0 over a fresh cache has no
+            // hits available to interrupt it, so its run is the whole probe count at *every*
+            // ceiling — including a ceiling that fits the working set entirely. Reading a running
+            // maximum therefore reports that constant and hides the steady-state run, which is the
+            // number an adaptive trigger would actually have to threshold on. Reporting both is
+            // what reconciles two measurements of "the miss run" that disagreed by 6x.
+            let mut runs = Vec::new();
+            for _ in 0..5 {
+                let _ = crate::search::callers::find_callers_batch(&t, &sub, &cache, None);
+                runs.push(cache.take_peak_miss_run());
+            }
+            let b1 = Snap::of(&cache);
+            report(&format!("ceiling={frac:.2}x working set"), b0, b1);
+            println!("{:30} per-walk peak miss run: {runs:?}", "");
+        }
+        println!(
+            "\nthese hit rates are what refusal already achieves; a reset policy that scores \
+             below them on this row is a regression, however well it does on the narrow case"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
