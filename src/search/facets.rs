@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::types::{FacetTotals, Match};
@@ -31,18 +32,44 @@ fn primary_package(matches: &[Match]) -> Option<PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
+/// Memoises "is this file's directory in the primary package?" per parent directory.
+///
+/// `package_root` stats up to ten manifest names per directory level and walks to the
+/// filesystem root, so calling it once per match is an unbounded syscall storm now that
+/// the search walks complete — the old ~80-entry early-quit bound is what previously
+/// made it free. `rank::sort` keeps an equivalent `pkg_cache` for exactly this reason.
+/// The answer depends only on the parent directory, so that is the key.
+type PkgCache = HashMap<PathBuf, bool>;
+
+fn same_package_cached(path: &Path, primary_pkg: Option<&PathBuf>, cache: &mut PkgCache) -> bool {
+    // No primary definition means no local/cross distinction to make, and
+    // `is_same_package` would return false without touching the filesystem.
+    if primary_pkg.is_none() {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if let Some(hit) = cache.get(parent) {
+        return *hit;
+    }
+    let same = is_same_package(path, primary_pkg);
+    cache.insert(parent.to_path_buf(), same);
+    same
+}
+
 /// Single source of truth for facet assignment. `facet_matches` and `facet_totals`
 /// both route through this so a count can never disagree with what gets grouped —
 /// they are rendered side by side as `shown/total`, so a drift between them would
 /// read as a truncation that did not happen.
-fn facet_of(m: &Match, primary_pkg: Option<&PathBuf>) -> Facet {
+fn facet_of(m: &Match, primary_pkg: Option<&PathBuf>, cache: &mut PkgCache) -> Facet {
     if m.is_definition && m.impl_target.is_some() {
         Facet::Implementation
     } else if m.is_definition {
         Facet::Definition
     } else if is_test_match(m) {
         Facet::Test
-    } else if is_same_package(&m.path, primary_pkg) {
+    } else if same_package_cached(&m.path, primary_pkg, cache) {
         Facet::UsageLocal
     } else {
         Facet::UsageCross
@@ -54,6 +81,7 @@ fn facet_of(m: &Match, primary_pkg: Option<&PathBuf>) -> Facet {
 pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
     // Find primary definition's package root for local/cross determination
     let primary_pkg = primary_package(&matches);
+    let mut cache = PkgCache::new();
 
     let mut definitions = Vec::new();
     let mut implementations = Vec::new();
@@ -62,7 +90,7 @@ pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
     let mut usages_cross = Vec::new();
 
     for m in matches {
-        match facet_of(&m, primary_pkg.as_ref()) {
+        match facet_of(&m, primary_pkg.as_ref(), &mut cache) {
             Facet::Implementation => implementations.push(m),
             Facet::Definition => definitions.push(m),
             Facet::Test => tests.push(m),
@@ -91,10 +119,11 @@ pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
 /// Counting borrows instead, so peak memory is unchanged by the totals.
 pub fn facet_totals(matches: &[Match], _scope: &Path) -> FacetTotals {
     let primary_pkg = primary_package(matches);
+    let mut cache = PkgCache::new();
     let mut totals = FacetTotals::default();
 
     for m in matches {
-        let slot = match facet_of(m, primary_pkg.as_ref()) {
+        let slot = match facet_of(m, primary_pkg.as_ref(), &mut cache) {
             Facet::Implementation => &mut totals.implementations,
             Facet::Definition => &mut totals.definitions,
             Facet::Test => &mut totals.tests,
@@ -175,22 +204,67 @@ mod tests {
     /// disagreement between them would read as a truncation that never happened. They share
     /// `facet_of` for exactly that reason; this asserts the sharing actually holds for every
     /// facet, so reintroducing a second copy of the classification fails here.
+    ///
+    /// The fixture is written to **disk**, with a real manifest. An earlier version used
+    /// synthetic paths that existed only in memory, which made `package_root` return `None`
+    /// for every match on both sides: the `usages_local` assertion was `0 == 0`, and the
+    /// local-vs-cross split — the one part of the classification that touches the
+    /// filesystem, and the only place the two functions derive `primary_pkg` differently
+    /// (one from a consumed `Vec`, one from a borrowed slice) — was never exercised at all.
     #[test]
     fn facet_totals_agrees_with_facet_matches_bucket_for_bucket() {
-        let scope = Path::new("/repo");
+        let root = tempfile::tempdir().unwrap();
+        let scope = root.path();
+
+        // Two packages, each with its own manifest, so `package_root` resolves differently
+        // for `inside/` than for `outside/`.
+        let inside = scope.join("inside");
+        let outside = scope.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(inside.join("Cargo.toml"), "[package]\nname = \"inside\"\n").unwrap();
+        std::fs::write(
+            outside.join("Cargo.toml"),
+            "[package]\nname = \"outside\"\n",
+        )
+        .unwrap();
+        for f in ["lib.rs", "lib_test.rs", "other.rs"] {
+            std::fs::write(inside.join(f), "fn thing() {}\n").unwrap();
+        }
+        std::fs::write(outside.join("far.rs"), "fn thing() {}\n").unwrap();
+
+        let lib = inside.join("lib.rs");
         let matches = vec![
-            m("/repo/src/lib.rs", 1, "pub fn thing() {}", true, None),
+            m(lib.to_str().unwrap(), 1, "pub fn thing() {}", true, None),
             m(
-                "/repo/src/lib.rs",
+                lib.to_str().unwrap(),
                 9,
                 "impl Trait for Thing {}",
                 true,
                 Some("Trait"),
             ),
-            m("/repo/src/lib_test.rs", 3, "thing();", false, None),
-            m("/repo/src/other.rs", 4, "    thing();", false, None),
-            m("/elsewhere/far.rs", 7, "thing();", false, None),
-            m("/repo/src/lib.rs", 12, "    thing();", false, None),
+            m(
+                inside.join("lib_test.rs").to_str().unwrap(),
+                3,
+                "thing();",
+                false,
+                None,
+            ),
+            m(
+                inside.join("other.rs").to_str().unwrap(),
+                4,
+                "    thing();",
+                false,
+                None,
+            ),
+            m(
+                outside.join("far.rs").to_str().unwrap(),
+                7,
+                "thing();",
+                false,
+                None,
+            ),
+            m(lib.to_str().unwrap(), 12, "    thing();", false, None),
         ];
 
         let totals = facet_totals(&matches, scope);
@@ -214,20 +288,20 @@ mod tests {
             "usages_cross"
         );
 
-        // And the fixture must actually exercise more than one bucket, or the assertions
-        // above pass trivially.
-        let non_empty = [
-            totals.definitions,
-            totals.implementations,
-            totals.tests,
-            totals.usages_local + totals.usages_cross,
-        ]
-        .iter()
-        .filter(|n| **n > 0)
-        .count();
-        assert!(
-            non_empty >= 3,
-            "fixture must span several facets, got {totals:?}"
-        );
+        // Every bucket must be non-empty, or an assertion above is `0 == 0`. Counted
+        // separately per usage bucket — summing them would mask the local/cross split,
+        // which is the one this test exists to cover.
+        for (label, n) in [
+            ("definitions", totals.definitions),
+            ("implementations", totals.implementations),
+            ("tests", totals.tests),
+            ("usages_local", totals.usages_local),
+            ("usages_cross", totals.usages_cross),
+        ] {
+            assert!(
+                n > 0,
+                "{label} bucket is empty — assertion would be vacuous"
+            );
+        }
     }
 }

@@ -1172,6 +1172,50 @@ fn format_search_result(
                 "usages",
             );
         }
+
+        // A facet can be allotted *zero* display slots when higher-ranked facets consume
+        // the whole `MAX_MATCHES` cap — which facet loses is decided by rank, and rank
+        // breaks ties on path, so a directory name can do it. The `!is_empty()` guards
+        // above then skip that facet entirely, taking its per-facet total and its
+        // hidden-count tail with it: no heading, no "... and N more".
+        //
+        // That was survivable while the header printed the display cap, because the whole
+        // count line was self-evidently nonsense ("10 matches (55 definitions, ...)").
+        // Now that the header states a true total, an unaccounted-for facet turns it into
+        // an arithmetic contradiction — "99 usages" over a body listing 92 — which is a
+        // worse failure than an obviously useless number. Name what was dropped so the
+        // header's arithmetic closes.
+        let omitted: Vec<String> = [
+            ("definitions", faceted.definitions.len(), totals.definitions),
+            (
+                "implementations",
+                faceted.implementations.len(),
+                totals.implementations,
+            ),
+            ("tests", faceted.tests.len(), totals.tests),
+            (
+                "same-package usages",
+                faceted.usages_local.len(),
+                totals.usages_local,
+            ),
+            (
+                "other usages",
+                faceted.usages_cross.len(),
+                totals.usages_cross,
+            ),
+        ]
+        .iter()
+        .filter(|(_, shown, total)| *shown == 0 && *total > 0)
+        .map(|(kind, _, total)| format!("{total} {kind}"))
+        .collect();
+
+        if !omitted.is_empty() {
+            let _ = write!(
+                out,
+                "\n\nNot shown: {}. Narrow with scope.",
+                omitted.join(", ")
+            );
+        }
     } else {
         // Linear display for ≤5 matches
         format_matches(
@@ -1680,11 +1724,67 @@ mod tests {
                 header.contains(&format!("{total} matches")),
                 "{label} header must report the true total {total}, got: {header}"
             );
+            // The display cap must not be what the header reports. Asserted against the
+            // number of rendered entries rather than the literal "10", which would be a
+            // decimal-substring coincidence that breaks if the fixture size is retuned.
+            let shown = out.lines().filter(|l| l.starts_with("### ")).count();
             assert!(
-                !header.contains("10 matches"),
-                "{label} header must not report the display cap as a total, got: {header}"
+                shown < total,
+                "{label} fixture must exceed the display cap for this to test anything \
+                 (shown {shown}, total {total})"
+            );
+            assert!(
+                !header.contains(&format!("{shown} matches")),
+                "{label} header must not report the {shown} rendered entries as the \
+                 total, got: {header}"
             );
         }
+    }
+
+    /// A facet that wins zero display slots must still be accounted for.
+    ///
+    /// The renderer guards each facet block on `!faceted.X.is_empty()`, which is decided
+    /// on the *post-cap* set. When higher-ranked facets consume the whole `MAX_MATCHES`
+    /// cap, a facet with a real non-zero total renders nothing at all — no heading, no
+    /// `shown/total` label, no hidden-count tail. That was tolerable while the header
+    /// printed the display cap, because the count line was self-evidently nonsense; once
+    /// the header states a true total, the body has to add up to it.
+    ///
+    /// Fixture: 1 definition, 80 same-package usages, 7 test usages. 10 display slots, so
+    /// the test facet is guaranteed to get none of them.
+    #[test]
+    fn a_facet_with_no_display_slots_is_still_accounted_for_in_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "fn target_sym() {}\n").unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                src.join(format!("u{i}.rs")),
+                format!("fn a{i}() {{ target_sym(); }}\nfn b{i}() {{ target_sym(); }}\n"),
+            )
+            .unwrap();
+        }
+        for i in 0..7 {
+            std::fs::write(src.join(format!("t{i}_test.rs")), "let x = target_sym();\n").unwrap();
+        }
+
+        let cache = OutlineCache::new();
+        let out = search_symbol("target_sym", root, &cache, None).unwrap();
+
+        let shown_test_entries = out.contains("## Tests");
+        assert!(
+            !shown_test_entries,
+            "fixture assumption broken — the tests facet won display slots, so this test \
+             no longer covers the zero-slot case:\n{out}"
+        );
+        assert!(
+            out.contains("Not shown: 7 tests"),
+            "a facet with 7 matches and no display slots vanished from the body, leaving \
+             the header's total unaccounted for:\n{out}"
+        );
     }
 
     /// Collect all file paths from a walker into a sorted Vec.

@@ -26,20 +26,28 @@ const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 // computed on the pre-cap set so the rendered `shown/total` labels are true totals.
 //
 // Cost of completing the walk, measured over MCP `tilth_search` with `kind: "content"`
-// and `expand: 0` on that tree — see the note in `symbol.rs` on why the CLI is not the
-// right harness for these defaults. Three reps each:
+// and `expand: 0` on that tree. Three reps each:
 //
 //   query                            bounded                       walk completes
 //   literal, 137 matches             0.59-0.79s, 3 of 3 distinct   2.23-2.41s / 27 MB
-//   literal in nearly every file     0.043s,     3 of 3 distinct   4.56-4.74s / 34 MB
+//   literal, 34290 matches           0.043s,     3 of 3 distinct   4.56-4.74s / 34 MB
 //
-// The second row is the worst case and the honest cost of this fix: a search for
-// something ubiquitous goes from instant to ~4.6s, because "how many are there" cannot
-// be answered without looking. It is well inside the 90s request timeout and cheaper
-// than the symbol path's hot case, and note what the bounded column actually bought —
-// 43ms for an answer that was different every single time it was asked. An agent that
-// asks the same question twice and gets two different answers cannot reason about
-// either. Per-file work is still bounded by the size gate and minified checks below.
+// Note what the bounded column bought on the second row: 43ms for an answer that was
+// different every single time it was asked. An agent that asks the same question twice
+// and gets two different answers cannot reason about either. The honest cost is that
+// a search for something common goes from instant to ~4.6s, because "how many are
+// there" cannot be answered without looking.
+//
+// Neither row is the worst case, and the worst case is NOT bounded. 34290 matches over
+// 176k files is 0.2 matches per file; nothing here caps the *total* retained. The size
+// gate below is per file, and `is_minified_by_content` only rejects files with under two
+// newlines in their first 2 KB, so a 499 KB file of short lines is searched in full and
+// can contribute ~150k matches by itself. Measured on a deliberately dense 400-file,
+// 49 MB fixture (a match on every line): 0.31s / 33 MB bounded, 36s / 457 MB complete.
+// A `kind: "content"` query for something like `return` on a large tree is that shape,
+// and it is an invited query for a tool that offers itself as a grep replacement.
+// Bounding retained matches without reintroducing the nondeterminism is tracked
+// separately — it needs a per-file or ranked-streaming cap, not a shared counter.
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -145,6 +153,8 @@ pub fn search(
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // One lock, one contiguous block per file — see the determinism note at the
+                // top of this file. Extending per match would break tie-ordering.
                 all.extend(file_matches);
             }
 

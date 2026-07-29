@@ -39,11 +39,8 @@ const FULL_MAX_MATCHES: usize = 100;
 // the tell — that was the threshold clamping, reported as if it were a total.
 //
 // Removing the bound was measured rather than assumed, because unlike `callers` this is
-// the most-used path. Measured over MCP `tilth_search` with `expand: 0` — the path an
-// agent actually takes, and the only one that exercises these default thresholds; the
-// CLI promotes `--full` whenever stdout is not a TTY (`main.rs`), which silently
-// substitutes the 300-match `--full` variants and makes piped `tilth` a poor benchmark
-// for them. Three reps each, same tree, nothing changed between reps:
+// the most-used path. Measured over MCP `tilth_search` with `expand: 0`, the path an
+// agent actually takes. Three reps each, same tree, nothing changed between reps:
 //
 //   query               bounded                        walk completes
 //   moderate symbol     5.31-5.68s / 48 MB, 3 of 3     3.55-4.06s / 56 MB, identical
@@ -61,6 +58,23 @@ const FULL_MAX_MATCHES: usize = 100;
 // the `MAX_MATCHES` / `FULL_MAX_MATCHES` caps below apply afterwards, to a fully
 // collected and ranked set — the caps now truncate a stable ranking rather than
 // deciding which matches ever got seen.
+//
+// Completing the walk is necessary but not by itself sufficient, and the rest of the
+// argument is load-bearing enough to write down. `rank::sort` is stable but its key
+// (`score`, then `path`, then `line`) is *not* a total order — two matches sharing a
+// path and line compare equal, which happens for real (two overload declarations on one
+// line whose `def_range`s differ, so `dedupe_same_span_definitions` keeps both). A
+// stable sort leaves equal elements in input order, and input order here is the order
+// the parallel walk appended them. So determinism additionally requires:
+//
+//   **each file's matches are appended as one contiguous block, in a deterministic
+//   within-file order, under a single lock acquisition.**
+//
+// That holds at every `all.extend(...)` below and in `content.rs`, so threads can only
+// interleave whole files, and ties can only ever be between matches from the same file —
+// whose relative order is fixed. `merged.sort_by_key(stratum_for_display)` inherits it.
+// Locking per match, or parallelising within a file, would reintroduce the bug without
+// touching a line of the walk logic.
 //
 // Two costs this shifts onto neighbouring code, both measured:
 //
@@ -289,6 +303,8 @@ fn find_definitions(
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // One lock, one contiguous block per file — see the determinism note at the
+                // top of this file. Extending per match would break tie-ordering.
                 all.extend(file_defs);
             }
 
@@ -677,6 +693,8 @@ fn find_usages(
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // One lock, one contiguous block per file — see the determinism note at the
+                // top of this file. Extending per match would break tie-ordering.
                 all.extend(file_matches);
             }
 
