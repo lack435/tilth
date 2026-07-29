@@ -869,8 +869,14 @@ mod tests {
             vec![root.join("Widget.h")],
             "the spaced quoted include must resolve as a local dependency"
         );
-        // And the system header still buckets as external rather than as a failed local.
-        assert!(is_external("<vector>", Lang::Cpp));
+        // The system header is detected too, and its delimiter survives extraction — which
+        // is the only thing that keeps it out of the local bucket. Asserted on the fixture's
+        // own line rather than on a literal, so reverting the fix fails this half as well.
+        let vector_line = content.lines().nth(1).expect("fixture has a second line");
+        assert!(is_import_line(vector_line, Lang::Cpp), "{vector_line}");
+        let source = crate::lang::outline::extract_import_source(vector_line, Some(Lang::Cpp));
+        assert_eq!(source, "<vector>");
+        assert!(is_external(&source, Lang::Cpp));
     }
 
     /// `is_import_line` and `extract_import_source` are separate judgements, and a mismatch

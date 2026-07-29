@@ -939,12 +939,18 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     //
     // The budget is in import *lines*, because that is the actual cost driver.
     // `resolve_related_files_with_content` is uncached and, for an unresolvable C/C++
-    // include, probes up to 13 candidate paths — so cost scales with imports per file, not
+    // include, probes up to 16 candidate paths — so cost scales with imports per file, not
     // with file count or with file size. Measured on a 100-file C++ tree of 40 unresolvable
     // includes each, whole-`fingerprint` wall time:
     //
     //   no budget at all   338-377ms warm, 705ms cold — `>250ms budget` warning every run
     //   MAX_IMPORT_LINES   112-180ms, no warning
+    //
+    // Those figures were taken when the probe count was 13, before #17 added hop 0 to the
+    // include-root walk (one `dir/…` plus one per `CONVENTIONAL_INCLUDE_ROOTS` name). Treat
+    // them as a lower bound: the shape of the argument is unchanged, but a file four or more
+    // directories below the containment root now costs ~23% more probes than measured.
+    // Shallower files are unaffected — the walk stops at the root either way.
     //
     // 100 files of 41 lines is a *small* tree, and unbudgeted it breaks the 250ms soft
     // budget `fingerprint` sets for itself by well over a factor of two.

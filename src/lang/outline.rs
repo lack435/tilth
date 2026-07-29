@@ -1129,16 +1129,18 @@ pub(crate) fn c_include_directive_rest(line: &str) -> Option<&str> {
 /// and the include took the pass-through path below and was dropped exactly as a trailing
 /// comment used to be.
 ///
-/// `#include_next` — real in glibc and gcc system headers — is accepted too. `is_import_line`
-/// matches on `#include` alone, so it arrives here regardless; recognising it costs one
-/// `strip_prefix` and the alternative is silently discarding it.
+/// `#include_next` — real in glibc and gcc system headers — is accepted too.
+/// `c_include_directive_rest` matches on `include` alone, so it arrives here regardless;
+/// recognising it costs one `strip_prefix` and the alternative is silently discarding it.
 ///
 /// Text that still does not begin with a delimiter is returned trimmed and unchanged. An
 /// `#include SOME_MACRO` has no header name to find and inventing one would be worse. Note
 /// what happens to such a value downstream, because it is not obvious: `is_external` sees no
-/// leading quote and routes it to the external bucket, where `is_valid_module_path` then
-/// rejects it — so it is dropped, not surfaced. Passing it through is honest about having
-/// no answer, but it is not the same as reporting it.
+/// leading quote and routes it to the external bucket, where `is_valid_module_path` accepts
+/// it — no space, alphanumeric first character — so `tilth_deps` reports the macro *name* as
+/// an external dependency. Passing the text through is honest about having no answer, but
+/// the result is a bogus-looking entry rather than a dropped one. Verified, not assumed:
+/// `#include SOME_MACRO` renders as `SOME_MACRO` under `## Uses (external)`.
 fn c_include_header_name(after_include: &str) -> String {
     // `#include_next "x.h"` arrives as `_next "x.h"`.
     let rest = after_include.strip_prefix("_next").unwrap_or(after_include);
