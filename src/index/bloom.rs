@@ -139,15 +139,33 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 ///   degrades smoothly with the ceiling's share of the working set, because whatever got in keeps
 ///   earning. Any policy that clears has to beat that, and "clear when full" does not: both the
 ///   #40 regime and an overloaded cache are full, so fullness cannot be the trigger.
-/// * A fixed miss-run trigger cannot work, for two compounding reasons. The *steady-state* run is
-///   `~(1 - ceiling/working_set) x probes_per_walk`, confirmed against three fixtures on two
-///   trees — proportional to tree size, so any fixed bound is a per-tree tuning parameter in
-///   disguise. Worse, the *peak* run is simply `probes_per_walk`: the first walk over any scope has
-///   no hits available to interrupt it. Measured at 1993 on a 1993-probe scope at every ceiling
-///   from 0.25x to 1.00x, four reps, identical every time — including 1.00x, where nothing is ever
-///   refused and the cache is perfect. So any threshold below one walk's probe count fires on the
-///   first walk of every workload regardless of whether the cache is useful. A trigger has to be
-///   normalised against something the cache knows; resident entry count is the candidate.
+/// * A fixed miss-run trigger cannot work, for two separate reasons. Peak miss run per walk, one
+///   fixture, five walks per ceiling:
+///
+///   ```text
+///   ceiling / working set   walk 0   walks 1-4
+///   0.25x                     1993   810, 821, 510, 1016
+///   0.50x                     1993   24, 132, 34, 152
+///   0.75x                     1993   41, 184, 186, 56
+///   1.00x                     1993   0, 0, 0, 0
+///   ```
+///
+///   First, **walk 0 is the full probe count at every ceiling** — 1993 on a 1993-probe scope,
+///   including at 1.00x where nothing is ever refused and the cache is perfect. A first walk has no
+///   hits available to interrupt it, so this is structural, not a property of being overloaded. Any
+///   threshold below one walk's probe count fires on the first walk of every workload.
+///
+///   Second, and worse for a would-be tuner: the **steady-state run has no stable model**. A review
+///   of the rejected policy fitted `~(1 - ceiling/working_set) x probes_per_walk` across two other
+///   fixtures, which would predict 1495 / 997 / 498 for the fractional rows above; the measured
+///   maxima are 1016 / 152 / 186, low by 1.5x to 6x. The likely cause is that the walk is parallel,
+///   so admitted files interleave across the tree instead of forming a contiguous prefix, and how
+///   scattered the resident set ends up depends on tree shape and thread scheduling. Two fixtures
+///   fit the law and one does not, so it is a loose upper bound at best.
+///
+///   That is the real argument: a threshold cannot be set on a quantity that has no reliable model
+///   across trees. A trigger has to be normalised against something the cache knows about itself —
+///   resident entry count is the candidate.
 /// * Refused bytes measured against the ceiling also fails: at a ceiling of ~0.75x the working set
 ///   the refused portion is genuinely smaller than the ceiling even though the working set is not,
 ///   so it clears a cache that is earning well.
@@ -288,6 +306,17 @@ impl BloomFilterCache {
     #[must_use]
     pub(crate) fn peak_miss_run(&self) -> usize {
         self.peak_miss_run.load(Relaxed)
+    }
+
+    /// Read the peak miss run and clear it, so the next interval can be measured on its own.
+    ///
+    /// The cumulative peak is dominated by the first walk over any scope, which has no hits
+    /// available to interrupt it and therefore always runs the full probe count. That single number
+    /// hides the steady-state run, and the two are what an adaptive trigger has to tell apart — so
+    /// the harness samples per walk rather than reading a running maximum.
+    #[cfg(test)]
+    pub(crate) fn take_peak_miss_run(&self) -> usize {
+        self.peak_miss_run.swap(0, Relaxed)
     }
 
     /// Extend the current miss run and record it if it is the longest so far.
@@ -828,10 +857,10 @@ mod adaptivity {
             refusals as f64 / builds as f64 * 100.0
         };
         let resident_mb = after.bytes as f64 / (1024.0 * 1024.0);
-        // `peak_run` is cumulative rather than a delta: the longest run seen so far is the quantity
-        // of interest, because it is what any adaptive trigger would have to threshold on. Printed
-        // because the first attempt at #40 justified a threshold against a run length it never
-        // measured, and adding this line falsified three separate claims immediately.
+        // `peak_run` is whatever the per-walk sampling has not already drained, so it reads 0 in the
+        // thrash arm and the per-walk list is the number to look at. Printed regardless, because the
+        // first attempt at #40 justified a threshold against a run length it never measured at all,
+        // and adding this one line falsified three separate claims immediately.
         println!(
             "{label:28} probes={probes:>8}  hits={hits:>8}  builds={builds:>8}  \
              hit_rate={rate:>5.1}%  refused/build={refused_share:>5.1}%  \
@@ -968,11 +997,20 @@ mod adaptivity {
             let ceiling = (needed as f64 * frac) as usize;
             let cache = BloomFilterCache::with_ceiling(ceiling);
             let b0 = Snap::of(&cache);
+            // Sample the peak miss run per walk, not cumulatively. Walk 0 over a fresh cache has no
+            // hits available to interrupt it, so its run is the whole probe count at *every*
+            // ceiling — including a ceiling that fits the working set entirely. Reading a running
+            // maximum therefore reports that constant and hides the steady-state run, which is the
+            // number an adaptive trigger would actually have to threshold on. Reporting both is
+            // what reconciles two measurements of "the miss run" that disagreed by 6x.
+            let mut runs = Vec::new();
             for _ in 0..5 {
                 let _ = crate::search::callers::find_callers_batch(&t, &sub, &cache, None);
+                runs.push(cache.take_peak_miss_run());
             }
             let b1 = Snap::of(&cache);
             report(&format!("ceiling={frac:.2}x working set"), b0, b1);
+            println!("{:30} per-walk peak miss run: {runs:?}", "");
         }
         println!(
             "\nthese hit rates are what refusal already achieves; a reset policy that scores \
