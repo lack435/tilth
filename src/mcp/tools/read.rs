@@ -179,10 +179,22 @@ pub(in crate::mcp) fn tool_read(
         // boundary `tilth_deps` gets from `scope`, and the only one a read has. Without
         // it, C/C++ include-root resolution here falls back to requiring a `.git`
         // ancestor, so in a non-git tree the hint omitted headers `tilth_deps` listed as
-        // local dependencies of the very file just read (#15). `resolve_c_include`
-        // ignores a root that does not contain the file, so passing it can only add
-        // resolutions, never veto the repository fallback.
-        let boundary = crate::read::imports::canonical_boundary(root);
+        // local dependencies of the very file just read (#15).
+        //
+        // This is a declared boundary, not a widening one: when `root` contains the file
+        // it *replaces* the `.git` root rather than adding to it (see `resolve_c_include`),
+        // so a `root` narrower than the repository resolves fewer includes than no `root`
+        // at all, and one above the repository can reach outside it. That is exactly how
+        // `scope` already behaves for `tilth_deps`, and making the two agree is the point
+        // of #15 — a hint that resolved by a different rule than `deps` is the bug.
+        //
+        // Only an *absolute* `root` is used. `anchor_path` refuses a relative `root` when
+        // it has to anchor a relative path, but an absolute `path` never reaches that
+        // check, so a relative `root` used to be inert here. Canonicalizing one would
+        // resolve it against the server's process cwd — frozen at spawn and possibly a
+        // different checkout — which is the precise hazard the absolute-path discipline
+        // exists to refuse. Ignoring it leaves the pre-#15 `.git` behaviour.
+        let boundary = crate::read::imports::canonical_boundary(root.filter(|r| r.is_absolute()));
         let related = crate::read::imports::resolve_related_files(&path, boundary.as_deref());
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");

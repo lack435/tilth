@@ -961,12 +961,6 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // `is_import_line` returns false for every line, so it never exercised this path at all.
     let mut import_budget = MAX_IMPORT_LINES;
 
-    // The project root is the containment boundary for C/C++ include-root resolution,
-    // canonicalized once rather than per file. Without it this scan required a `.git`
-    // ancestor and so found no include-root-relative headers at all in a non-git tree,
-    // which is the same blindness #15 fixed in the read hint and callee resolution.
-    let boundary = crate::read::imports::canonical_boundary(Some(root));
-
     for (rel_path, _) in &files {
         if import_budget == 0 {
             break;
@@ -987,12 +981,19 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             .count();
         import_budget = import_budget.saturating_sub(import_lines.max(1));
 
-        // Resolve imports to actual file paths using the proven import resolver
-        let resolved = crate::read::imports::resolve_related_files_with_content(
-            &full,
-            &content,
-            boundary.as_deref(),
-        );
+        // Resolve imports to actual file paths using the proven import resolver.
+        //
+        // Deliberately no boundary, unlike the read hint and callee resolution (#15). The
+        // obvious candidate is `root`, but `fingerprint` is called as `fingerprint(&cwd)`
+        // and every file here is `root.join(rel_path)`, so `root` would contain every
+        // candidate and always outrank the `.git` fallback: launched above a checkout the
+        // scan could count a hot file in a different repository, launched inside a
+        // subdirectory it would stop counting headers above the launch dir. Both change
+        // what the initialize fingerprint claims, and #29/#31 went to some trouble to make
+        // it say true things. So C/C++ include-root resolution stays `.git`-gated here
+        // until someone measures the alternative.
+        let resolved =
+            crate::read::imports::resolve_related_files_with_content(&full, &content, None);
         for target_path in resolved {
             *path_counts.entry(target_path).or_insert(0) += 1;
         }

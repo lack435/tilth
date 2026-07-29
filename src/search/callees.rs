@@ -213,12 +213,24 @@ pub fn resolve_callees(
         return resolved;
     }
 
-    // 2. Check imported files
-    let imported = crate::read::imports::resolve_related_files_with_content(
-        source_path,
-        source_content,
-        boundary,
-    );
+    // 2. Check imported files.
+    //
+    // Uncapped, for the reason `resolve_related_files_with_content`'s own doc gives:
+    // its `MAX_SUGGESTIONS` truncation exists to keep a *display* hint short, and a
+    // caller that needs completeness must not use it. This is such a caller — a symbol
+    // defined in the ninth import is not "less relevant", it is simply reported as
+    // external, and `search::deps` loses the per-symbol half of its `uses_local` entry
+    // for that file while still naming the file via its own uncapped import merge.
+    //
+    // Threading a boundary through made that latent cap live: an include-root-relative
+    // include used to resolve to nothing in a non-git tree and cost no slot, so filling
+    // the cap with newly-resolving includes evicted plain siblings that had been
+    // resolving all along. Pinned by `cpp_callee_resolution_sees_imports_past_the_suggestion_cap`.
+    //
+    // The extra imports are cheap to carry: the loop stops as soon as every name is
+    // resolved, and each candidate is size-gated and bloom-checked before it is read.
+    let imported =
+        crate::read::imports::resolve_local_imports(source_path, source_content, boundary);
 
     for import_path in imported {
         if remaining.is_empty() {

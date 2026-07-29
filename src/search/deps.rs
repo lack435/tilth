@@ -1196,6 +1196,12 @@ mod tests {
     /// dependency here arrives through an `#include`, so the callee-resolved half of
     /// `uses_local` cannot contribute a path the import-based hint lacks. The fixture also
     /// stays under `MAX_SUGGESTIONS`, or the hint's cap would break equality on its own.
+    ///
+    /// Scope: this asserts the two *resolvers* agree given the same boundary. It calls
+    /// `resolve_related_files` directly, so it would not notice `tools::read` reverting to
+    /// `None` — that half is pinned by
+    /// `tool_read_hint_resolves_include_root_headers_under_a_declared_root`, which drives
+    /// the real `tool_read`.
     #[test]
     fn cpp_read_hint_and_deps_agree_about_an_include_root_header_without_git() {
         let dir = tempfile::tempdir().unwrap();
@@ -1269,6 +1275,80 @@ mod tests {
             peer.symbols.iter().any(|s| s == "ConnectPeer"),
             "the local dep must carry per-symbol detail, got {:?}",
             peer.symbols
+        );
+    }
+
+    /// Callee resolution must see every import, not the first eight.
+    ///
+    /// `resolve_related_files_with_content` truncates to `MAX_SUGGESTIONS` (8) because it
+    /// feeds a display hint, and its own doc says callers needing completeness must use
+    /// `resolve_local_imports` instead. `resolve_callees` was on the wrong side of that
+    /// line, and the ninth import onwards was never opened — so a symbol defined there was
+    /// reported as external.
+    ///
+    /// #15 turned that latent bug into a live regression. Include-root-relative includes
+    /// used to resolve to nothing in a non-git tree and cost no slots; once the boundary
+    /// made them resolve, they filled the cap and *evicted* the plain sibling include that
+    /// had been resolving all along. `deps` re-merges the uncapped import list, so the file
+    /// still appears in `uses_local` — but with no symbols, which is the exact "names the
+    /// file without saying what it uses" failure #15 set out to remove. `grok` has no such
+    /// merge and calls the symbol `extern` outright.
+    ///
+    /// The sibling is asserted specifically because it is the eviction victim: it resolves
+    /// with or without a boundary, so if it loses its symbols the cap is the only cause.
+    #[test]
+    fn cpp_callee_resolution_sees_imports_past_the_suggestion_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        std::fs::create_dir_all(module.join("A")).unwrap();
+        std::fs::create_dir_all(module.join("Sub")).unwrap();
+        assert!(
+            !module.join(".git").exists() && !dir.path().join(".git").exists(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+
+        // 8 include-root-relative headers — exactly MAX_SUGGESTIONS, so they fill the cap
+        // on their own and anything after them is truncated away.
+        let mut includes = String::new();
+        let mut calls = String::new();
+        for i in 0..8 {
+            std::fs::write(
+                module.join(format!("A/a{i}.h")),
+                format!("#pragma once\nvoid AFunc{i}(int v);\n"),
+            )
+            .unwrap();
+            let _ = writeln!(includes, "#include \"A/a{i}.h\"");
+            let _ = writeln!(calls, "    AFunc{i}(1);");
+        }
+        // The plain sibling: resolves by the direct check, with or without a boundary.
+        std::fs::write(
+            module.join("Sub/Sib.h"),
+            "#pragma once\nvoid SibFunc(int v);\n",
+        )
+        .unwrap();
+        includes.push_str("#include \"Sib.h\"\n");
+        calls.push_str("    SibFunc(2);\n");
+
+        let target = module.join("Sub/Target.h");
+        std::fs::write(
+            &target,
+            format!("#pragma once\n{includes}void Run() {{\n{calls}}}\n"),
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&target, &module, &bloom).unwrap();
+
+        let sib = result
+            .uses_local
+            .iter()
+            .find(|d| d.path.ends_with("Sib.h"))
+            .expect("the sibling include must be a local dependency");
+        assert!(
+            sib.symbols.iter().any(|s| s == "SibFunc"),
+            "the 9th import must still be opened for callee resolution — got {:?}. \
+             A capped import list drops it and the symbol is reported as external.",
+            sib.symbols
         );
     }
 
