@@ -78,10 +78,10 @@ use crate::types::{FileType, Lang};
 /// #34 fixed that by hoisting the build out of the per-target loop; see `contains_any`, where the
 /// measurement lives. That measurement is a 2x2 over {pre-fix, post-fix} x {this ceiling,
 /// unbounded} on a ~147k-file tree — a different tree from this table, so the absolute numbers do
-/// not transfer, but the *ratio* asked about here does. It reproduced the ceiling's wall-time cost
-/// at +14.0% pre-fix, and measured it at +0.8% (not resolvable) post-fix. So the ~13% above was
-/// almost entirely this bug rather than an intrinsic cost of bounding the cache, and the row
-/// should no longer be read as the price of the ceiling.
+/// not transfer, but the *ratio* asked about here does. It put the ceiling's wall-time cost at
+/// +16.4% pre-fix, in the same region as the ~13% above, and at +3.4% post-fix. So most of this
+/// row was the bug rather than an intrinsic cost of bounding the cache — but not all of it, and
+/// the residual is still resolvable, so the ceiling is not free.
 ///
 /// Output is unaffected at every setting — verified byte-identical with the cache unbounded,
 /// bounded and disabled, and again across the #34 fix. It must be: a filter is only ever a
@@ -228,42 +228,54 @@ impl BloomFilterCache {
     ///
     /// Measured on a ~147k-file C++ tree, `kind: "callers"` with 5 targets, as a 2x2 over
     /// {pre-fix, post-fix} x {32 MB ceiling, unbounded}. Six sessions per arm, three reps each,
-    /// arm order shuffled per session; the reported unit is the **session mean**, because reps
-    /// share a process and therefore a warm cache and are not independent. Grand means:
+    /// arm order shuffled per session. The reported unit is the **session mean**: reps share a
+    /// process and therefore a warm cache, so they are not independent observations, and treating
+    /// them as such is how the first version of this comment claimed a p-value ~100x too small.
+    /// `p2` is an exact two-sided permutation test on session means; 0.0022 is the 6-vs-6 floor.
     ///
     /// ```text
-    ///                  pre-fix    post-fix
-    /// 32 MB ceiling    10480ms     9292ms     -11.3%   p=0.0011
-    /// unbounded         9190ms     9220ms      -0.3%   p=0.63
+    ///                  pre-fix   post-fix    delta
+    /// 32 MB ceiling    10638ms    9361ms    -12.0%   p2=0.0022  fully separated
+    /// unbounded         9142ms    9052ms     -1.0%   p2=0.21    overlapping
     /// ```
     ///
-    /// Exact one-sided permutation tests on session means; 0.0011 is 1/924, the floor for 6-vs-6,
-    /// i.e. the six post-fix sessions were all faster than all six pre-fix ones.
+    /// The second row is the evidence. Unbounded, the cache admits, so target 1 built and 2..N
+    /// hit — there was no fan-out to remove, and the fix does nothing measurable. The gain appears
+    /// only in the configuration where the bug existed. A before/after pair on one configuration
+    /// could not separate this from a general speedup; the interaction can.
     ///
-    /// The second row is the point. Unbounded, the cache admits, so target 1 built and 2..N hit —
-    /// there was no fan-out to remove, and the fix does nothing (p=0.63). The gain appears only
-    /// in the configuration where the bug existed. That interaction is the evidence; a
-    /// before/after pair on one configuration could not distinguish this from a general speedup.
+    /// Read down the columns and it answers #34's other question — what the ceiling costs now:
     ///
-    /// Read down the columns instead and it answers #34's other question — what the ceiling costs
-    /// now. Pre-fix the ceiling cost +14.0% of wall time, reproducing the ~13% recorded on
-    /// `MAX_CACHE_BYTES` from a different tree. Post-fix it costs +0.8% (p=0.77, not resolvable).
-    /// The ceiling's throughput penalty was almost entirely this bug.
+    /// ```text
+    /// ceiling cost, pre-fix    +16.4%   p2=0.0022  fully separated
+    /// ceiling cost, post-fix    +3.4%   p2=0.0043  overlapping
+    /// ```
     ///
-    /// Peak RSS: the ceiling still saves ~46% (241 MB unbounded vs 131 MB bounded, p=0.0011).
-    /// The fix itself *raises* bounded peak by ~12 MB (114-125 MB pre-fix vs 126-137 MB post-fix,
-    /// non-overlapping across six sessions). Cached bytes cannot differ — admission logic is
-    /// untouched and both fill the same 32 MB — so this is transient, and the likeliest cause is
-    /// simply that a walk 11% faster keeps more freshly-built filters in flight at once. That
-    /// mechanism is unconfirmed. It is ~12 MB against the ~110 MB the ceiling saves.
+    /// So most of the ceiling's throughput penalty was this bug, but not all of it — ~3.4% remains
+    /// and is still resolvable. "Almost entirely" would be too strong.
     ///
-    /// Two earlier runs of this measurement are worth knowing about, because one of them was
-    /// wrong in a way that survived review. A 2-session run gave -11.5%, agreeing with the table
-    /// above; a second gave +4.3% (p=0.27) and a spurious "pre-fix variance is 10x post-fix"
-    /// reading. That run had fixed arm order and visibly unstable timing — pre-fix session means
-    /// spanning 7901-11255ms, CV 14.4%, against 1.0% here. Randomised order and six sessions
-    /// supersede it, and the variance claim does not survive: here the pre-fix arm is the *most*
-    /// stable of the four. Treat -11.3% as carrying more uncertainty than its p-value suggests.
+    /// Peak RSS: the ceiling still halves it (241 MB unbounded vs 120 MB bounded, p2=0.0022, fully
+    /// separated). The fix itself does not move it (118 -> 120 MB, p2=0.47, overlapping), which is
+    /// what should happen — admission logic is untouched, both arms fill the same 32 MB, and the
+    /// fix removes redundant *transient* builds rather than retained bytes.
+    ///
+    /// The history of this measurement is worth recording, because three of its four earlier
+    /// readings were wrong and two of them survived a review round:
+    ///
+    /// * A 2-session before/after gave -11.5% and a p-value of "~0.1%", computed by treating six
+    ///   reps as six independent observations. On the session as the unit that p was 17%.
+    /// * A 5-session rerun gave +4.3% (p=0.27) — no effect at all — plus an apparent "pre-fix
+    ///   variance is 10x post-fix". Both were artifacts of fixed arm order and an unsettled
+    ///   machine, with pre-fix session means spanning 7901-11255ms (CV 14.4%, against 1.4% here).
+    ///   The variance finding does not survive randomised order and is claimed nowhere.
+    /// * The same 2x2 run against the pre-#36 base showed the fix *raising* bounded peak RSS by
+    ///   ~12 MB, fully separated. It does not reproduce here. Treat it as unexplained noise in
+    ///   that run rather than a property of the fix.
+    ///
+    /// What has replicated, on both sides of #36 and across three separate runs, is the -12% on
+    /// the bounded arm together with no effect on the unbounded arm. That pairing is the result;
+    /// the point estimate itself has moved between 11.3% and 12.0% and should not be read as
+    /// tighter than that.
     ///
     /// Output is byte-identical across all four arms — two response digests over the whole run,
     /// one per query shape. It must be: a filter is only ever a pre-filter ahead of a real
