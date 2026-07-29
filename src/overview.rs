@@ -38,11 +38,18 @@ fn fingerprint_inner(root: &Path) -> String {
     // Walk files (depth 2) — collect language counts, modules, entry points
     let walk = walk_files(root);
 
-    // Determine primary language
+    // Determine primary language.
+    //
+    // `max_by_key` returns the *last* maximum it sees, and iterating a `HashMap` visits
+    // entries in an order that `RandomState` reseeds every process. So a tie between two
+    // languages picked a different primary language run to run — and that choice cascades
+    // into the displayed language, the file count, which directories qualify as modules,
+    // and whether `hot_files` runs at all. Tie-break on the display name so the key is a
+    // total order; `Lang` is deliberately not `Ord`, and a stable string does the job.
     let primary_lang = walk
         .lang_counts
         .iter()
-        .max_by_key(|(_, count)| *count)
+        .max_by_key(|(lang, count)| (**count, std::cmp::Reverse(lang_display_name(**lang))))
         .map(|(lang, _)| *lang);
 
     let lang_name = primary_lang.map_or("Unknown", lang_display_name);
@@ -70,7 +77,16 @@ fn fingerprint_inner(root: &Path) -> String {
                 }
             })
             .collect();
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1)); // most files first
+        // Most files first, then by name.
+        //
+        // The name tie-break here is **defensive, not load-bearing** — worth saying plainly
+        // because mutation testing proved it: reverting this sort alone changes nothing,
+        // since the second sort below re-establishes the same total order before the
+        // truncation that actually matters. It is kept because everything between the two
+        // sorts (`common_dir_prefix`, the non-source `retain`) happens to be
+        // order-independent today and need not stay that way; a future step that reads
+        // `mods` in order would otherwise silently reintroduce the bug here.
+        mods.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // If all modules (or at least most) share a common top-level prefix
         // (e.g., all are "src/..."), strip it so we display short names
@@ -136,8 +152,20 @@ fn fingerprint_inner(root: &Path) -> String {
             // Check if ANY path component is a non-source dir
             !lower.split('/').any(|part| non_source.contains(&part))
         });
-        // Sort by file count descending, truncate to 10, extract names
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1));
+        // Sort by file count descending, then by name, truncate to 10, extract names.
+        //
+        // **This is the load-bearing one.** `mods` comes from iterating
+        // `module_lang_counts`, a `HashMap`; `sort_by_key` is stable, so directories with
+        // *equal* file counts kept hash-iteration order, and `truncate` then chose
+        // membership from it — `RandomState` reseeds per process, so identical runs listed
+        // different directories. Measured on a large tree: six runs, six distinct `dirs:`
+        // lines, differing in *which* directory appeared, not merely its position.
+        //
+        // The name tie-break makes the key a total order, so nothing can reorder equal
+        // counts. Note the shape rather than the specific sort: a truncation applied to a
+        // collection whose order was never pinned is the same defect fixed in `callers`,
+        // `symbol`/`content`, and `glob`.
+        mods.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         mods.truncate(10);
         mods.into_iter().map(|(name, _)| name).collect()
     };
@@ -583,6 +611,14 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
 /// Best-effort: every git failure (spawn error, non-zero exit, timeout, I/O error)
 /// is intentionally swallowed into None — git context is a cosmetic fingerprint
 /// and must never break the primary read/search path.
+///
+/// The 200ms deadline below is a **deliberate** residual source of variation, and is not
+/// the same trade as the wall-clock budget removed from `hot_files`. That one decided which
+/// of a known list of files contributed, so identical runs disagreed about work they were
+/// both perfectly able to do. This one bounds an external process that may hang, and it is
+/// all-or-nothing: `git` either answers or the line is omitted. Under heavy load a slow
+/// `git` can therefore still drop the `git:` line from an otherwise identical fingerprint.
+/// Removing the deadline would trade that for hanging the MCP handshake, which is worse.
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     let mut child = Command::new("git")
         .args(args)
@@ -716,11 +752,16 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 
 fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
     let lang = primary_lang?; // require a detected language
-    let start = Instant::now();
 
-    // Sort by size (smallest first) and take first 100
+    // Sort by size (smallest first), then by path, and take the first 100.
+    //
+    // The path tie-break matters because same-size files are common — a stable sort on
+    // size alone left them in `code_files` order, i.e. `fs::read_dir` order, and
+    // `truncate(100)` then picked a set that depends on it. `read_dir` order is at least
+    // stable for a fixed tree on one filesystem, so this was the milder of the two
+    // problems here, but it is free to remove and it is not guaranteed by the API.
     let mut files: Vec<&(String, u64)> = walk.code_files.iter().collect();
-    files.sort_by_key(|(_, size)| *size);
+    files.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     files.truncate(100);
 
     // Use resolve_related_files to get real file paths for imports.
@@ -729,10 +770,17 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // Also collect all import source lines for symbol extraction later
     let mut all_import_sources: Vec<String> = Vec::new();
 
+    // No wall-clock cutoff here. There used to be a `start.elapsed() > 100ms` break, which
+    // is a *time* budget deciding which files contribute — so under load, or on a cold
+    // cache, a different prefix of `files` was processed and the reported hot files changed.
+    // That is the one bound shape that cannot be made deterministic, and it was rejected on
+    // the search paths for the same reason.
+    //
+    // Work here is already bounded, and deterministically: `files` is capped at 100 above,
+    // by a total-ordered key. The cost is 100 file reads plus import resolution, measured at
+    // well under the previous 100ms budget even on a large tree — so the cutoff was not
+    // buying anything except instability.
     for (rel_path, _) in &files {
-        if start.elapsed().as_millis() > 100 {
-            break;
-        }
         let full = root.join(rel_path);
         let Ok(content) = fs::read_to_string(&full) else {
             continue;
@@ -837,6 +885,156 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Directories in the tie fixture, and files in each.
+    ///
+    /// **Every directory has the same count**, which is the whole point: the bug was a
+    /// stable `sort_by_key` over `HashMap` iteration order, so it is invisible unless
+    /// counts tie. A fixture whose counts are all distinct passes with the bug present.
+    ///
+    /// More than 10 directories, because `truncate(10)` is what turned an unstable order
+    /// into unstable *membership* — with 10 or fewer, every directory is listed whatever
+    /// the order, and only the ordering half of the bug shows.
+    const TIE_DIRS: usize = 15;
+    const TIE_FILES_PER_DIR: usize = 3;
+
+    /// A tree of `TIE_DIRS` directories, each holding `TIE_FILES_PER_DIR` Rust files, so
+    /// every module has an identical primary-language count.
+    fn write_tie_fixture(root: &Path) {
+        for d in 0..TIE_DIRS {
+            let sub = root.join(format!("m{d:02}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..TIE_FILES_PER_DIR {
+                std::fs::write(sub.join(format!("f{f}.rs")), "pub fn a() {}\n").unwrap();
+            }
+        }
+    }
+
+    /// The MCP `initialize` payload must be the same on every run for an unchanged tree.
+    ///
+    /// It was not: six runs on a large tree produced six distinct fingerprints, differing
+    /// in *which* directory the `dirs:` line named, not merely the order. Cause was a
+    /// stable sort over `HashMap` iteration order followed by `truncate(10)`.
+    #[test]
+    fn fingerprint_is_byte_identical_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tie_fixture(dir.path());
+
+        let runs: Vec<String> = (0..8).map(|_| fingerprint(dir.path())).collect();
+
+        assert!(
+            !runs[0].is_empty(),
+            "fixture produced no fingerprint, so this test proves nothing"
+        );
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "fingerprint varied across 8 identical runs:\n{}",
+            runs.join("\n---\n")
+        );
+    }
+
+    /// Stronger than "stable": with every count tied, the ten listed directories must be
+    /// the alphabetically first ten. A consistently *wrong* selection would satisfy the
+    /// stability test above but not this one.
+    #[test]
+    fn tied_module_counts_are_broken_by_name_not_hash_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tie_fixture(dir.path());
+
+        let out = fingerprint(dir.path());
+        let dirs_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("dirs:"))
+            .unwrap_or_else(|| panic!("no dirs: line in fingerprint:\n{out}"));
+
+        // Sorted by (count desc, name asc) then truncated to 10 → m00..m09.
+        for d in 0..10 {
+            assert!(
+                dirs_line.contains(&format!("m{d:02}/")),
+                "expected m{d:02}/ in the first ten:\n{dirs_line}"
+            );
+        }
+        for d in 10..TIE_DIRS {
+            assert!(
+                !dirs_line.contains(&format!("m{d:02}/")),
+                "m{d:02}/ is past the first ten and must not be listed:\n{dirs_line}"
+            );
+        }
+    }
+
+    /// The `hot` line must be stable, and must be produced without a wall-clock budget.
+    ///
+    /// `hot_files` had two problems. It sorted candidates by size alone and truncated to
+    /// 100, so same-size files — common — were ordered by `fs::read_dir`; and it broke out
+    /// of its loop after 100ms, a *time* budget deciding which files contributed, so under
+    /// load a different prefix was processed. The importer files here are byte-identical in
+    /// length on purpose, so every candidate ties on size and only the path tie-break
+    /// orders them.
+    ///
+    /// The removed time budget is not directly testable — a test cannot reliably make the
+    /// machine slow — so this covers the size tie and the presence of the line. What pins
+    /// the budget's removal is that the loop no longer reads a clock at all.
+    #[test]
+    fn hot_files_line_is_stable_with_tied_file_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"hf\"\n").unwrap();
+        std::fs::write(src.join("shared.rs"), "pub struct Thing;\n").unwrap();
+        // Single-character names keep these four files exactly the same length.
+        for n in ["a", "b", "c", "d"] {
+            std::fs::write(
+                src.join(format!("{n}.rs")),
+                format!("use crate::shared::Thing;\npub fn {n}(_t: Thing) {{}}\n"),
+            )
+            .unwrap();
+        }
+
+        let runs: Vec<String> = (0..8).map(|_| fingerprint(dir.path())).collect();
+
+        assert!(
+            runs[0].contains("hot ("),
+            "fixture produced no hot line, so this test proves nothing:\n{}",
+            runs[0]
+        );
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "hot line varied across 8 identical runs:\n{}",
+            runs.join("\n---\n")
+        );
+    }
+
+    /// A tie on *language* counts must not change the primary language.
+    ///
+    /// `primary_lang` is a `max_by_key` over a `HashMap`, and `max_by_key` returns the last
+    /// maximum, so a tie resolved by hash order. That choice cascades: it sets the displayed
+    /// language and file count, decides which directories count as modules, and gates
+    /// `hot_files` entirely.
+    #[test]
+    fn tied_language_counts_resolve_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Equal numbers of Rust and Python files, so `lang_counts` ties.
+        for f in 0..4 {
+            std::fs::write(sub.join(format!("a{f}.rs")), "pub fn a() {}\n").unwrap();
+            std::fs::write(sub.join(format!("b{f}.py")), "def a():\n    pass\n").unwrap();
+        }
+
+        let runs: Vec<String> = (0..8).map(|_| fingerprint(dir.path())).collect();
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "tied language counts produced a varying fingerprint:\n{}",
+            runs.join("\n---\n")
+        );
+        // And the tie must resolve to the alphabetically-first display name, not whichever
+        // the hash happened to visit last.
+        assert!(
+            runs[0].contains("Python project"),
+            "expected the name tie-break to pick Python over Rust, got:\n{}",
+            runs[0].lines().next().unwrap_or_default()
+        );
+    }
 
     #[test]
     fn test_fingerprint_on_tilth() {
