@@ -132,7 +132,7 @@ pub fn analyze_deps(
 
     // Local deps via callee resolution
     let callee_names = extract_callee_names(&content, lang, None);
-    let resolved = resolve_callees(&callee_names, path, &content, bloom);
+    let resolved = resolve_callees(&callee_names, path, &content, bloom, boundary.as_deref());
 
     // Group resolved callees by file
     let mut local_by_file: HashMap<PathBuf, Vec<String>> = HashMap::new();
@@ -1296,6 +1296,179 @@ mod tests {
             "it must not ALSO be external — that means the two buckets used different \
              boundaries: {:?}",
             result.uses_external
+        );
+    }
+
+    /// The post-read hint and `deps` must agree about the same include, in both directions,
+    /// in a tree that is not a git checkout (#15).
+    ///
+    /// Only `deps` passed a boundary to the include resolver; the hint and callee resolution
+    /// passed `None` and so needed a `.git` ancestor. Outside a repository that split the two
+    /// apart: `deps` listed `Peer.h` as a local dependency while the hint did not mention it,
+    /// and — because callee resolution shares the same resolver — the `uses_local` entry
+    /// carried no symbols, so `deps` named the file without saying what it used from it.
+    ///
+    /// Both directions are asserted, not just "the hint caught up". During #10's review the
+    /// asymmetry ran the *other* way, with `deps` resolving fewer includes than the hint,
+    /// which a one-sided subset check would have passed.
+    ///
+    /// Set equality is the right assertion for *this* fixture specifically: every local
+    /// dependency here arrives through an `#include`, so the callee-resolved half of
+    /// `uses_local` cannot contribute a path the import-based hint lacks. The fixture also
+    /// stays under `MAX_SUGGESTIONS`, or the hint's cap would break equality on its own.
+    ///
+    /// Scope: this asserts the two *resolvers* agree given the same boundary. It calls
+    /// `resolve_related_files` directly, so it would not notice `tools::read` reverting to
+    /// `None` — that half is pinned by
+    /// `tool_read_hint_resolves_include_root_headers_under_a_declared_root`, which drives
+    /// the real `tool_read`.
+    #[test]
+    fn cpp_read_hint_and_deps_agree_about_an_include_root_header_without_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        for d in ["Character", "Camera"] {
+            std::fs::create_dir_all(module.join(d)).unwrap();
+        }
+        // Deliberately no `.git`: with one, both paths resolve via the repository fallback
+        // and agree by luck, so the fixture could not detect the split at all.
+        assert!(
+            !module.join(".git").exists() && !dir.path().join(".git").exists(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+        std::fs::write(
+            module.join("Character/Peer.h"),
+            "#pragma once\nvoid ConnectPeer(int id);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Camera/CameraMode.h"),
+            "#pragma once\nvoid ApplyCameraMode(int mode);\n",
+        )
+        .unwrap();
+        // Written relative to the module root, not to the including file: own-directory
+        // resolution looks for `Character/Character/Peer.h` and finds nothing.
+        let target = module.join("Character/HeroComponent.h");
+        std::fs::write(
+            &target,
+            "#pragma once\n\
+             #include \"Character/Peer.h\"\n\
+             #include \"Camera/CameraMode.h\"\n\
+             void Setup() {\n\
+             \x20   ConnectPeer(1);\n\
+             \x20   ApplyCameraMode(2);\n\
+             }\n",
+        )
+        .unwrap();
+
+        // The hint's boundary is the declared project root; deps' is the declared scope.
+        // Here they are the same directory, which is the case the two must agree on.
+        let boundary = crate::read::imports::canonical_boundary(Some(&module));
+        let hint = crate::read::imports::resolve_related_files(&target, boundary.as_deref());
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&target, &module, &bloom).unwrap();
+
+        // Compare canonical forms: deps canonicalizes its target before resolving, the hint
+        // does not, and on Windows that is the difference between `C:\x` and `\\?\C:\x`.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let hint_set: HashSet<PathBuf> = hint.iter().map(|p| canon(p)).collect();
+        let deps_set: HashSet<PathBuf> = result.uses_local.iter().map(|d| canon(&d.path)).collect();
+
+        assert!(
+            hint_set.iter().any(|p| p.ends_with("Peer.h")),
+            "the include-root-relative header must reach the hint: {hint_set:?}"
+        );
+        assert_eq!(
+            hint_set, deps_set,
+            "the hint and deps must resolve the same includes to the same files"
+        );
+
+        // The half that made `deps` output visibly thinner: callee resolution shares the
+        // hint's resolver, so with no boundary it could not open `Peer.h` and the entry
+        // named the file with an empty symbol list.
+        let peer = result
+            .uses_local
+            .iter()
+            .find(|d| d.path.ends_with("Peer.h"))
+            .expect("Peer.h must be a local dependency");
+        assert!(
+            peer.symbols.iter().any(|s| s == "ConnectPeer"),
+            "the local dep must carry per-symbol detail, got {:?}",
+            peer.symbols
+        );
+    }
+
+    /// Callee resolution must see every import, not the first eight.
+    ///
+    /// `resolve_related_files_with_content` truncates to `MAX_SUGGESTIONS` (8) because it
+    /// feeds a display hint, and its own doc says callers needing completeness must use
+    /// `resolve_local_imports` instead. `resolve_callees` was on the wrong side of that
+    /// line, and the ninth import onwards was never opened — so a symbol defined there was
+    /// reported as external.
+    ///
+    /// #15 turned that latent bug into a live regression. Include-root-relative includes
+    /// used to resolve to nothing in a non-git tree and cost no slots; once the boundary
+    /// made them resolve, they filled the cap and *evicted* the plain sibling include that
+    /// had been resolving all along. `deps` re-merges the uncapped import list, so the file
+    /// still appears in `uses_local` — but with no symbols, which is the exact "names the
+    /// file without saying what it uses" failure #15 set out to remove. `grok` has no such
+    /// merge and calls the symbol `extern` outright.
+    ///
+    /// The sibling is asserted specifically because it is the eviction victim: it resolves
+    /// with or without a boundary, so if it loses its symbols the cap is the only cause.
+    #[test]
+    fn cpp_callee_resolution_sees_imports_past_the_suggestion_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        std::fs::create_dir_all(module.join("A")).unwrap();
+        std::fs::create_dir_all(module.join("Sub")).unwrap();
+        assert!(
+            !module.join(".git").exists() && !dir.path().join(".git").exists(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+
+        // 8 include-root-relative headers — exactly MAX_SUGGESTIONS, so they fill the cap
+        // on their own and anything after them is truncated away.
+        let mut includes = String::new();
+        let mut calls = String::new();
+        for i in 0..8 {
+            std::fs::write(
+                module.join(format!("A/a{i}.h")),
+                format!("#pragma once\nvoid AFunc{i}(int v);\n"),
+            )
+            .unwrap();
+            let _ = writeln!(includes, "#include \"A/a{i}.h\"");
+            let _ = writeln!(calls, "    AFunc{i}(1);");
+        }
+        // The plain sibling: resolves by the direct check, with or without a boundary.
+        std::fs::write(
+            module.join("Sub/Sib.h"),
+            "#pragma once\nvoid SibFunc(int v);\n",
+        )
+        .unwrap();
+        includes.push_str("#include \"Sib.h\"\n");
+        calls.push_str("    SibFunc(2);\n");
+
+        let target = module.join("Sub/Target.h");
+        std::fs::write(
+            &target,
+            format!("#pragma once\n{includes}void Run() {{\n{calls}}}\n"),
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&target, &module, &bloom).unwrap();
+
+        let sib = result
+            .uses_local
+            .iter()
+            .find(|d| d.path.ends_with("Sib.h"))
+            .expect("the sibling include must be a local dependency");
+        assert!(
+            sib.symbols.iter().any(|s| s == "SibFunc"),
+            "the 9th import must still be opened for callee resolution — got {:?}. \
+             A capped import list drops it and the symbol is reported as external.",
+            sib.symbols
         );
     }
 

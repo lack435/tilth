@@ -104,6 +104,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "number",
                         "description": "Max tokens in response."
                     },
+                    "scope": {
+                        "type": "string",
+                        "description": "Project directory the file belongs to. Only affects the 'Related:' hint, where it is the include root for C/C++ headers. Pass the same value as tilth_deps to get the same answer. Default: project root."
+                    },
                     "root": {
                         "type": "string",
                         "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."

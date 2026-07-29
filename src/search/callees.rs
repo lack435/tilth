@@ -175,11 +175,22 @@ fn resolve_from_entries(
 ///
 /// Strategy: check the source file's own outline first (cheapest), then scan
 /// imported files resolved from the source's import statements.
+///
+/// `boundary` is the caller's declared scope, already canonicalized
+/// (`imports::canonical_boundary`). It only affects C/C++, where it is the
+/// containment root for include-root resolution — without it, step 2 below can
+/// only see include-root-relative headers in a tree that has a `.git` ancestor,
+/// so in a non-git tree it attributed no symbols to them and `tilth_deps` listed
+/// the header with an empty symbol list. It is threaded down to the second hop
+/// unchanged: `resolve_c_include` already ignores a scope that does not contain
+/// the file it is resolving for, so a hop into a file outside the scope falls
+/// back to that file's own repository rather than being vetoed.
 pub fn resolve_callees(
     callee_names: &[String],
     source_path: &Path,
     source_content: &str,
     bloom: &crate::index::bloom::BloomFilterCache,
+    boundary: Option<&Path>,
 ) -> Vec<ResolvedCallee> {
     if callee_names.is_empty() {
         return Vec::new();
@@ -202,9 +213,24 @@ pub fn resolve_callees(
         return resolved;
     }
 
-    // 2. Check imported files
+    // 2. Check imported files.
+    //
+    // Uncapped, for the reason `resolve_related_files_with_content`'s own doc gives:
+    // its `MAX_SUGGESTIONS` truncation exists to keep a *display* hint short, and a
+    // caller that needs completeness must not use it. This is such a caller — a symbol
+    // defined in the ninth import is not "less relevant", it is simply reported as
+    // external, and `search::deps` loses the per-symbol half of its `uses_local` entry
+    // for that file while still naming the file via its own uncapped import merge.
+    //
+    // Threading a boundary through made that latent cap live: an include-root-relative
+    // include used to resolve to nothing in a non-git tree and cost no slot, so filling
+    // the cap with newly-resolving includes evicted plain siblings that had been
+    // resolving all along. Pinned by `cpp_callee_resolution_sees_imports_past_the_suggestion_cap`.
+    //
+    // The extra imports are cheap to carry: the loop stops as soon as every name is
+    // resolved, and each candidate is size-gated and bloom-checked before it is read.
     let imported =
-        crate::read::imports::resolve_related_files_with_content(source_path, source_content);
+        crate::read::imports::resolve_local_imports(source_path, source_content, boundary);
 
     for import_path in imported {
         if remaining.is_empty() {
@@ -311,9 +337,10 @@ pub fn resolve_callees_transitive(
     bloom: &crate::index::bloom::BloomFilterCache,
     depth_limit: u32,
     budget: usize,
+    boundary: Option<&Path>,
 ) -> Vec<ResolvedCalleeNode> {
     // 1st hop: resolve direct callees (existing logic)
-    let first_hop = resolve_callees(initial_names, source_path, source_content, bloom);
+    let first_hop = resolve_callees(initial_names, source_path, source_content, bloom, boundary);
 
     if depth_limit < 2 || first_hop.is_empty() {
         return first_hop
@@ -338,7 +365,13 @@ pub fn resolve_callees_transitive(
 
     for parent in first_hop {
         let children = if budget_remaining > 0 {
-            resolve_second_hop(&parent, bloom, &mut visited, &mut budget_remaining)
+            resolve_second_hop(
+                &parent,
+                bloom,
+                &mut visited,
+                &mut budget_remaining,
+                boundary,
+            )
         } else {
             Vec::new()
         };
@@ -357,6 +390,7 @@ fn resolve_second_hop(
     bloom: &crate::index::bloom::BloomFilterCache,
     visited: &mut HashSet<(PathBuf, u32)>,
     budget: &mut usize,
+    boundary: Option<&Path>,
 ) -> Vec<ResolvedCallee> {
     let file_type = crate::lang::detect_file_type(&parent.file);
     let crate::types::FileType::Code(lang) = file_type else {
@@ -374,7 +408,7 @@ fn resolve_second_hop(
         return Vec::new();
     }
 
-    let mut resolved = resolve_callees(&nested_names, &parent.file, &content, bloom);
+    let mut resolved = resolve_callees(&nested_names, &parent.file, &content, bloom, boundary);
 
     // Filter: skip self-recursive calls and already-visited callees
     resolved.retain(|c| {

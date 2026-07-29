@@ -275,7 +275,8 @@ fn run_inner(
         QueryType::FilePath(path) => {
             let mut out = read::read_file(&path, section, full, cache, false)?;
             if section.is_none() && !full && read::would_outline(&path) {
-                let related = read::imports::resolve_related_files(&path);
+                let boundary = read::imports::canonical_boundary(Some(scope));
+                let related = read::imports::resolve_related_files(&path, boundary.as_deref());
                 if !related.is_empty() {
                     let hints: Vec<String> = related
                         .iter()

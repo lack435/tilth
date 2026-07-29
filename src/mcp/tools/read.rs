@@ -10,7 +10,7 @@ use crate::lang::outline::get_outline_entries;
 use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, OutlineEntry, ViewMode};
 
-use super::apply_budget;
+use super::{apply_budget, resolve_scope};
 
 pub(in crate::mcp) fn tool_read(
     args: &Value,
@@ -26,6 +26,16 @@ pub(in crate::mcp) fn tool_read(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
+    // Resolved up here, before any reading, so a `scope` that cannot be resolved is
+    // refused the same way `deps`/`grok`/`search` refuse it rather than being discovered
+    // after the work is done — and so the refusal is uniform across single and batch
+    // reads even though only a single read emits the hint that uses it.
+    //
+    // The soft warning is dropped. `resolve_scope` emits one when the named directory does
+    // not exist and it falls back to `root`; `deps` prepends it because scope decides what
+    // that tool searches, whereas here it only tunes an advisory hint appended to content
+    // the caller did get. The hard-error half is what carries the discipline.
+    let (scope, _scope_warning) = resolve_scope(args, root)?;
     let full_flag = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
@@ -175,7 +185,30 @@ pub(in crate::mcp) fn tool_read(
 
     // Append related-file hint for outlined code files (not section reads, not batch).
     if section.is_none() && crate::read::would_outline(&path) {
-        let related = crate::read::imports::resolve_related_files(&path);
+        // The containment boundary for C/C++ include-root resolution. Without one this
+        // falls back to requiring a `.git` ancestor, so in a non-git tree the hint omitted
+        // headers `tilth_deps` listed as local dependencies of the very file just read
+        // (#15).
+        //
+        // Derived through `resolve_scope`, which is how `deps`, `grok`, `search` and
+        // `files` all get theirs. Matching the *rule* is the point: the bug in #15 is a
+        // hint that resolves by a different rule than `deps`, so `tilth_read` gained the
+        // same `scope` argument the other five tools have and feeds it through the same
+        // helper. Same arguments in, same boundary out, by construction.
+        //
+        // Reading `root` directly instead looked equivalent and was not, in both
+        // directions: `resolve_scope` deliberately ignores `root` when no `scope` is given
+        // (`resolve_scope_no_arg_ignores_root`), so a bare `tilth_deps` boundary is the
+        // server cwd while `root` yielded `None` — still disagreeing in exactly the
+        // non-git tree #15 is about — and conversely an explicit `scope` on `deps` had no
+        // expressible counterpart on a read at all.
+        //
+        // Note this is a declared boundary, not a widening one: when it contains the file
+        // it *replaces* the `.git` root rather than adding to it (see `resolve_c_include`),
+        // so a boundary narrower than the repository resolves fewer includes and one above
+        // it can reach outside. Same as `deps`, which is the agreement being bought.
+        let boundary = crate::read::imports::canonical_boundary(Some(&scope));
+        let related = crate::read::imports::resolve_related_files(&path, boundary.as_deref());
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
             for (i, p) in related.iter().enumerate() {
@@ -373,6 +406,166 @@ mod tests {
             !out.lines().any(|l| l.contains(":") && l.contains("|")),
             "stripped output must not expose hash anchors: {out}"
         );
+    }
+
+    /// Build a C++ header that is large enough to be outlined (`would_outline` needs
+    /// more than `TOKEN_THRESHOLD` ≈ 24 KB, and the "Related:" hint only rides along on
+    /// an outlined read), carrying `includes` verbatim at the top.
+    fn bulky_cpp_header(includes: &[&str]) -> String {
+        let mut src = String::from("#pragma once\n");
+        for inc in includes {
+            let _ = writeln!(src, "#include \"{inc}\"");
+        }
+        for i in 0..200 {
+            let _ = writeln!(src, "inline int pad_{i}() {{");
+            for j in 0..20 {
+                let _ = writeln!(src, "    int v_{i}_{j} = {j} * {i} + 42;");
+            }
+            src.push_str("    return 0;\n}\n");
+        }
+        src
+    }
+
+    /// The post-read "Related:" hint must resolve include-root-relative headers in a tree
+    /// that is not a git checkout, using the caller's declared `scope` as the containment
+    /// boundary — the same argument, resolved by the same helper, that `tilth_deps` uses
+    /// (#15).
+    ///
+    /// The no-`scope` case is the positive control in reverse: the fixture is a temp
+    /// directory, so it is neither inside the server cwd that `resolve_scope` falls back
+    /// to nor inside any `.git`, leaving no boundary and no hint. That is the old
+    /// behaviour, and asserting it is what proves the passing half is the declared scope
+    /// doing the work rather than the direct sibling check.
+    #[test]
+    fn tool_read_hint_resolves_include_root_headers_under_a_declared_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        for d in ["Character", "Camera"] {
+            std::fs::create_dir_all(module.join(d)).unwrap();
+        }
+        // Deliberately no `.git`, or the boundary is not what is being tested.
+        assert!(
+            !module.join(".git").exists() && !dir.path().join(".git").exists(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+        std::fs::write(
+            module.join("Character/Peer.h"),
+            "#pragma once\nclass Peer {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Camera/CameraMode.h"),
+            "#pragma once\nclass CameraMode {};\n",
+        )
+        .unwrap();
+
+        let target = module.join("Character/HeroComponent.h");
+        // `Character/Peer.h` is written relative to the module root, not to the including
+        // file — own-directory resolution would look for `Character/Character/Peer.h`.
+        std::fs::write(
+            &target,
+            bulky_cpp_header(&["Character/Peer.h", "Camera/CameraMode.h"]),
+        )
+        .unwrap();
+        assert!(
+            crate::read::would_outline(&target),
+            "fixture must be large enough to be outlined, or no hint is emitted at all"
+        );
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let args = serde_json::json!({
+            "path": target.to_str().unwrap(),
+            "scope": module.to_str().unwrap(),
+            "root": module.to_str().unwrap(),
+        });
+        let with_scope = tool_read(&args, &cache, &session, false).expect("read with scope");
+        // Assert on the hint line alone: the outline of the file quotes its own `#include`
+        // lines, so a substring search over the whole response passes without the hint.
+        let hint = hint_of(&with_scope);
+        assert!(
+            hint.contains("Peer.h"),
+            "an include-root-relative header must appear in the hint: {hint}"
+        );
+        assert!(
+            hint.contains("CameraMode.h"),
+            "a peer directory reached via the include root must appear too: {hint}"
+        );
+
+        // The agreement #15 is actually about, at the tool boundary: identical arguments to
+        // `tilth_read` and `tilth_deps` must produce the same verdict about the same header.
+        // The resolver-level version of this lives in `search::deps`; this is the one that
+        // would catch either tool wiring its boundary up differently.
+        let bloom = std::sync::Arc::new(crate::index::bloom::BloomFilterCache::new());
+        let deps_out = crate::mcp::tools::deps::tool_deps(&args, &bloom).expect("deps");
+        for header in ["Peer.h", "CameraMode.h"] {
+            assert!(
+                deps_out.contains(header),
+                "deps must agree the hint's {header} is a local dependency:\n{deps_out}"
+            );
+        }
+
+        let without_scope = tool_read(
+            &serde_json::json!({ "path": target.to_str().unwrap() }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect("read without scope");
+        assert!(
+            !without_scope.lines().any(|l| l.starts_with("> Related:")),
+            "control: with no declared scope the boundary falls back to the server cwd, \
+             which does not contain this temp fixture, and there is no .git either — so no \
+             hint is emitted at all"
+        );
+    }
+
+    /// `tilth_read` must apply the shared scope discipline, not a private one.
+    ///
+    /// Reading `root` directly for the boundary looked equivalent to what the other tools
+    /// do and was not: `resolve_scope` deliberately ignores `root` when no `scope` is
+    /// given, so a bare `tilth_deps` bounded itself by the server cwd while the hint got
+    /// nothing at all — still disagreeing in exactly the non-git tree #15 is about, for
+    /// the commonest call shape there is.
+    ///
+    /// A relative `scope` with no absolute `root` is the sharp end of that discipline: it
+    /// is unresolvable, because the server cannot see the caller's shell cwd, and every
+    /// other tool refuses it rather than quietly resolving against the process cwd.
+    /// Refusing it here is what proves the shared helper is really in the path — a private
+    /// `root`-reading boundary would accept this call and silently emit a hint bounded by
+    /// whatever directory the server was launched in.
+    #[test]
+    fn tool_read_refuses_a_relative_scope_with_no_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("any.rs");
+        std::fs::write(&path, "fn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let err = tool_read(
+            &serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "scope": "relative/subdir",
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect_err("a relative scope with no root must be refused");
+        assert!(
+            err.contains("relative scope") && err.contains("root"),
+            "the refusal must name the offending input and the fix: {err}"
+        );
+    }
+
+    /// The "Related:" line of a read response. Panics when absent — every caller here
+    /// asserts about its contents, and "no hint" would silently satisfy a `!contains`.
+    fn hint_of(output: &str) -> &str {
+        output
+            .lines()
+            .find(|l| l.starts_with("> Related:"))
+            .unwrap_or_else(|| panic!("response carries no `> Related:` line:\n{output}"))
     }
 
     #[test]

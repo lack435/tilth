@@ -824,6 +824,16 @@ fn format_single_match(
                             let callee_names =
                                 callees::extract_callee_names(&content, lang, m.def_range);
                             if !callee_names.is_empty() {
+                                // The declared search scope is the containment root for
+                                // C/C++ include-root resolution; without it callee
+                                // resolution can only follow includes in a tree that has
+                                // a `.git` ancestor (#15). Canonicalized here rather than
+                                // hoisted out of `format_single_match`: this block only
+                                // runs for a definition that actually has callees, and it
+                                // is one stat in front of a walk that reads and parses
+                                // every imported file.
+                                let boundary =
+                                    crate::read::imports::canonical_boundary(Some(scope));
                                 let mut nodes = callees::resolve_callees_transitive(
                                     &callee_names,
                                     &m.path,
@@ -831,6 +841,7 @@ fn format_single_match(
                                     bloom,
                                     2,
                                     15,
+                                    boundary.as_deref(),
                                 );
 
                                 if let Some(ref name) = m.def_name {
