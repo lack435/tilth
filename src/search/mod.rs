@@ -15,6 +15,7 @@ pub mod truncate;
 
 mod bloom_walk;
 mod callee_query;
+mod retain;
 pub mod scope;
 
 use std::collections::HashSet;
@@ -1282,11 +1283,28 @@ fn format_search_result(
         .map(|(kind, _, total)| format!("{total} {kind}"))
         .collect();
 
-        if !omitted.is_empty() {
+        // The facet totals above are computed over the *retained* candidate set, which the search
+        // bounds (`search::retain`). `total_found` is the true pre-bound total, so when retention
+        // clipped, the facets cannot sum to it and the difference is real matches that no facet
+        // knows about.
+        //
+        // Naming that remainder is what keeps this header honest. Reporting only the facet numbers
+        // would say "19600 other usages" for a search that found 2.4M, which is worse than a
+        // useless number — it is a confident wrong one, and it is the failure the comment above
+        // exists to prevent. The local/cross split of the clipped portion genuinely cannot be
+        // recovered (`facets::facet_of` needs a primary package derived from the full set), so this
+        // reports the one thing that is knowable: how many there were.
+        let beyond_retention = facets::unattributed_remainder(result.total_found, totals);
+
+        if !omitted.is_empty() || beyond_retention > 0 {
+            let mut parts = omitted;
+            if beyond_retention > 0 {
+                parts.push(format!("{beyond_retention} beyond the retention limit"));
+            }
             let _ = write!(
                 out,
                 "\n\nNot shown: {}. Narrow with scope.",
-                omitted.join(", ")
+                parts.join(", ")
             );
         }
     } else {
@@ -1865,6 +1883,18 @@ mod tests {
         );
     }
 
+    /// When symbol retention clips, the header's arithmetic must still close — and it can only do
+    /// that by naming the clipped remainder.
+    ///
+    /// The facet totals are computed over the *retained* set, so once retention bites they cannot
+    /// sum to `total_found`. Reporting facets alone then produces a confidently wrong number: on a
+    /// 2.4M-match fixture the line read "Not shown: 19600 other usages", understating by two orders
+    /// of magnitude. The local/cross split of the clipped portion is unrecoverable — `facet_of`
+    /// needs a primary package derived from the full set — so the remainder is reported as its own
+    /// term instead of being folded into a facet it cannot be attributed to.
+    ///
+    /// Asserted on the sum rather than the exact string: the property is that every match is
+    /// accounted for somewhere in the line, not that a particular phrase appears.
     /// Matches in the retention fixture below, chosen to exceed `content::MAX_RETAINED` (500)
     /// by a wide margin — the bound is invisible below it.
     const RETENTION_SHALLOW_FILES: usize = 10;

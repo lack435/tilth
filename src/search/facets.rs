@@ -136,6 +136,30 @@ pub fn facet_totals(matches: &[Match], _scope: &Path) -> FacetTotals {
     totals
 }
 
+/// Matches counted in `total_found` that no facet total accounts for.
+///
+/// Facet totals are computed over the set a search **retained**, which `search::retain` bounds,
+/// while `total_found` is the true pre-bound total. Once retention clips, the facets cannot sum to
+/// it and the difference is real matches that no facet knows about.
+///
+/// The renderer names this remainder separately rather than folding it into a facet. It cannot be
+/// attributed: `facet_of` splits usages local/cross using a primary package derived from the whole
+/// match set, so for clipped matches neither the package nor the split is recoverable. Reporting
+/// only the facet numbers instead produced a confidently wrong line — "19600 other usages" for a
+/// search that found 2.4M — which is worse than an obviously useless number.
+///
+/// Saturating: a caller that passes facet totals from a *different* result than `total_found` gets
+/// 0 rather than a wrapped count.
+#[must_use]
+pub(crate) fn unattributed_remainder(total_found: usize, totals: &FacetTotals) -> usize {
+    let facet_sum = totals.definitions
+        + totals.implementations
+        + totals.tests
+        + totals.usages_local
+        + totals.usages_cross;
+    total_found.saturating_sub(facet_sum)
+}
+
 /// Test-ness of a single match, for callers computing facet totals during a walk.
 ///
 /// `content::search` needs this to keep its `tests` count exact while retaining only a
@@ -312,5 +336,53 @@ mod tests {
                 "{label} bucket is empty — assertion would be vacuous"
             );
         }
+    }
+}
+#[cfg(test)]
+mod remainder_tests {
+    use super::*;
+
+    /// Once retention clips, the not-shown counts must still add up to `total_found`.
+    ///
+    /// The renderer prints facet totals plus this remainder, so if the remainder is wrong the header
+    /// contradicts its own body — "2400000 matches" over a line naming 19600. Asserting the sum
+    /// rather than a phrase: the property is that every match is accounted for somewhere.
+    #[test]
+    fn the_remainder_closes_the_gap_between_facets_and_the_true_total() {
+        let totals = FacetTotals {
+            usages_cross: 19_600,
+            ..Default::default()
+        };
+        let remainder = unattributed_remainder(2_400_000, &totals);
+        assert_eq!(remainder, 2_380_400);
+        assert_eq!(
+            19_600 + remainder,
+            2_400_000,
+            "facets plus remainder must equal the header's total"
+        );
+    }
+
+    /// An unclipped search has nothing unattributed, so the renderer's output is unchanged from
+    /// before the bound existed. This is the case that must not regress.
+    #[test]
+    fn an_unclipped_search_has_no_remainder() {
+        let totals = FacetTotals {
+            definitions: 3,
+            implementations: 1,
+            tests: 7,
+            usages_local: 11,
+            usages_cross: 5,
+        };
+        assert_eq!(unattributed_remainder(27, &totals), 0);
+    }
+
+    /// Facet totals from a different result must not wrap the count.
+    #[test]
+    fn a_larger_facet_sum_saturates_to_zero() {
+        let totals = FacetTotals {
+            definitions: 100,
+            ..Default::default()
+        };
+        assert_eq!(unattributed_remainder(1, &totals), 0);
     }
 }

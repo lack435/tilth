@@ -84,7 +84,9 @@ pub(crate) fn apply_destination_permutation<T>(slice: &mut [T], dest: &mut [usiz
 /// n log n moves of a 136-byte element and the stable sort's scratch buffer. `score` costs
 /// ~650ns per call here; the old sort made order-1e8 calls, this one makes 2.4e6.
 ///
-/// The ordering is unchanged — same key, same stability — so output is byte-identical.
+/// The key has since been extended to a total order — see the comment on the comparator. For
+/// every input that already had a unique `(score, path, line)` per match, which is all of them
+/// outside the overload case, the ordering is unchanged and output is byte-identical.
 ///
 /// Sorting an index permutation rather than using `sort_by_cached_key` is deliberate: a
 /// cached key must *own* what it compares, so breaking ties on path means cloning a
@@ -119,15 +121,31 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
         .collect();
 
     // Sort indices, so the comparator reads scores by index and paths by reference.
-    // Stable, and the tie-break chain is the same one the old comparator used — equal
-    // keys therefore keep their original relative order, which is what the "one
-    // contiguous block per file" invariant in `symbol.rs` relies on for determinism.
+    //
+    // `(score, path, line)` alone is **not** a total order: two overload declarations on one
+    // line compare equal, and `dedupe_same_span_definitions` deliberately keeps both. That
+    // used to be covered by arrival order — a stable sort plus the "one contiguous block per
+    // file" invariant in `symbol.rs` meant ties could only ever be within a file, in a fixed
+    // within-file order.
+    //
+    // Relying on arrival order caps how the callers can collect. A bounded retention heap has
+    // to be able to drop a match from the middle, which destroys contiguity, so symbol search
+    // could not be bounded while determinism rested on arrival. Extending the key to a genuine
+    // total order removes that coupling: ties are now broken by data the match carries, so any
+    // collection order gives the same output.
+    //
+    // `def_range` separates the overload case: same path, same line, different span. `text` is
+    // the backstop for anything else reaching here — two matches agreeing on all four are
+    // indistinguishable to a reader, so their relative order is not observable. Both are `Ord`
+    // and neither allocates in the comparator.
     let mut order: Vec<usize> = (0..matches.len()).collect();
     order.sort_by(|&i, &j| {
         scores[j]
             .cmp(&scores[i])
             .then_with(|| matches[i].path.cmp(&matches[j].path))
             .then_with(|| matches[i].line.cmp(&matches[j].line))
+            .then_with(|| matches[i].def_range.cmp(&matches[j].def_range))
+            .then_with(|| matches[i].text.cmp(&matches[j].text))
     });
 
     // `order[k]` is the index of the element that belongs at position `k`; the helper
@@ -654,6 +672,42 @@ mod tests {
             def_weight: if is_definition { 80 } else { 0 },
             impl_target: None,
         }
+    }
+
+    /// `sort`'s key must be a **total order**, so the result cannot depend on the order matches
+    /// arrived in.
+    ///
+    /// This is what lets a caller bound retention. `symbol.rs` used to guarantee determinism by
+    /// appending each file's matches as one contiguous block, so a stable sort's ties were always
+    /// within a file; a bounded retention heap has to drop matches from the middle, which breaks
+    /// contiguity, so the key had to stop relying on arrival order.
+    ///
+    /// The fixture is the case the old comment named as genuinely tied: two overload declarations
+    /// on one line, same path, same line, different `def_range` — which
+    /// `dedupe_same_span_definitions` deliberately keeps both of. Feeding them in both orders must
+    /// give the same output. Without the `def_range` tie-break this fails, because a stable sort
+    /// preserves whichever order it was handed.
+    #[test]
+    fn sort_is_order_independent_for_matches_tied_on_path_and_line() {
+        let mk = |span: (u32, u32)| {
+            let mut m = make_match("src/a.rs", "fn overload(x: i32);", true, Some("overload"));
+            m.def_range = Some(span);
+            m
+        };
+        let (scope, query) = (Path::new("."), "overload");
+
+        let mut forward = vec![mk((1, 4)), mk((1, 9))];
+        let mut reverse = vec![mk((1, 9)), mk((1, 4))];
+        sort(&mut forward, query, scope, None);
+        sort(&mut reverse, query, scope, None);
+
+        let key =
+            |v: &[Match]| -> Vec<Option<(u32, u32)>> { v.iter().map(|m| m.def_range).collect() };
+        assert_eq!(
+            key(&forward),
+            key(&reverse),
+            "sort depends on arrival order, so retention cannot be bounded without changing output"
+        );
     }
 
     /// `sort` scores once per match and applies a hand-rolled index permutation, replacing
