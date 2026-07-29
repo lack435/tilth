@@ -53,8 +53,9 @@ const FULL_MAX_MATCHES: usize = 100;
 // target. It used to: the second hop ran inside the render loop and the existence scan
 // behind the no-callers message ran once per empty target, so five targets could be six
 // or more full traversals. It is at most three now, whatever the target count — see that
-// function. Peak RSS at this scale is dominated by `BloomFilterCache`, which holds one
-// filter per code file walked and is currently unbounded.
+// function. Peak RSS at this scale is dominated by `BloomFilterCache`, which held one
+// filter per code file walked with no bound; #32 capped it at 32 MB and #34 stopped a full
+// cache rebuilding the same filter once per target. #40 tracks what is left.
 //
 // `search::symbol` and `search::content` carried the same count-gated walks and were
 // fixed the same way afterwards — see the notes at the top of those two files for the

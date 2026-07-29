@@ -72,34 +72,21 @@ use crate::types::{FileType, Lang};
 /// so a refused admission made every target rebuild the same filter instead of one building it
 /// and the rest hitting. Unbounded, refusal only happened on a cold entry; with a ceiling it is
 /// the steady state once the budget is full, which turned a non-issue into an N x multiplier on
-/// filter-building work.
+/// filter-building work — as bad as not caching at all, and N x what a single build per file
+/// would cost.
 ///
-/// #34 fixed that by hoisting the build out of the per-target loop — see `contains_any`. Measured
-/// on a ~147k-file C++ tree, `kind: "callers"`, three reps per session and two interleaved
-/// A/B/A/B rounds per row (n=6), against the commit before the fix:
-///
-/// ```text
-///                 before                     after
-/// 5-target        9520-10446ms (mean 10088)  8334-9362ms (mean 8925)
-/// single-target   7122-8086ms  (mean 7748)   7110-8185ms (mean 7782)
-/// ```
-///
-/// -11.5% on the 5-target mean. Within-row spread is ~10-15%, wider than the 158ms gap between
-/// the two 5-target ranges, so the ranges being disjoint is not by itself the argument. What
-/// makes it resolvable is that all six "after" reps beat all six "before" reps — a perfect split
-/// of twelve observations, ~0.1% under the null — *and* that the single-target row, where there
-/// is no fan-out to remove, moves -0.4% with fully overlapping ranges. The effect appears exactly
-/// where the mechanism predicts it and nowhere else.
-///
-/// Peak RSS is unchanged (109-130 MB either side, n=2 per cell, overlapping). It should be: the
-/// fix removes redundant *transient* builds, not retained bytes, so the ceiling still sets peak.
-/// This tree is not the one the table above was measured on, so these numbers size the fix, not
-/// the ceiling — do not read them against the rows above.
+/// #34 fixed that by hoisting the build out of the per-target loop; see `contains_any`, where the
+/// measurement lives. That measurement is a 2x2 over {pre-fix, post-fix} x {this ceiling,
+/// unbounded} on a ~147k-file tree — a different tree from this table, so the absolute numbers do
+/// not transfer, but the *ratio* asked about here does. It reproduced the ceiling's wall-time cost
+/// at +14.0% pre-fix, and measured it at +0.8% (not resolvable) post-fix. So the ~13% above was
+/// almost entirely this bug rather than an intrinsic cost of bounding the cache, and the row
+/// should no longer be read as the price of the ceiling.
 ///
 /// Output is unaffected at every setting — verified byte-identical with the cache unbounded,
-/// bounded and disabled, and again across the #34 fix (same MD5 over the response text on every
-/// rep of every row). It must be: a filter is only ever a pre-filter ahead of a real `memmem`
-/// check and a parse, so a miss costs work and never a wrong answer.
+/// bounded and disabled, and again across the #34 fix. It must be: a filter is only ever a
+/// pre-filter ahead of a real `memmem` check and a parse, so a miss costs work and never a wrong
+/// answer.
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Fixed cost of one cache entry, beyond its bit array.
@@ -239,8 +226,58 @@ impl BloomFilterCache {
     /// every target is DEFINITELY absent. Empty `targets` is vacuously `false`, and costs no
     /// build — matching `any` on an empty iterator.
     ///
-    /// The cached-filter arm holds the `DashMap` shard read lock across the target loop, so
-    /// `targets` must not itself touch this cache; every caller passes a plain collection.
+    /// Measured on a ~147k-file C++ tree, `kind: "callers"` with 5 targets, as a 2x2 over
+    /// {pre-fix, post-fix} x {32 MB ceiling, unbounded}. Six sessions per arm, three reps each,
+    /// arm order shuffled per session; the reported unit is the **session mean**, because reps
+    /// share a process and therefore a warm cache and are not independent. Grand means:
+    ///
+    /// ```text
+    ///                  pre-fix    post-fix
+    /// 32 MB ceiling    10480ms     9292ms     -11.3%   p=0.0011
+    /// unbounded         9190ms     9220ms      -0.3%   p=0.63
+    /// ```
+    ///
+    /// Exact one-sided permutation tests on session means; 0.0011 is 1/924, the floor for 6-vs-6,
+    /// i.e. the six post-fix sessions were all faster than all six pre-fix ones.
+    ///
+    /// The second row is the point. Unbounded, the cache admits, so target 1 built and 2..N hit —
+    /// there was no fan-out to remove, and the fix does nothing (p=0.63). The gain appears only
+    /// in the configuration where the bug existed. That interaction is the evidence; a
+    /// before/after pair on one configuration could not distinguish this from a general speedup.
+    ///
+    /// Read down the columns instead and it answers #34's other question — what the ceiling costs
+    /// now. Pre-fix the ceiling cost +14.0% of wall time, reproducing the ~13% recorded on
+    /// `MAX_CACHE_BYTES` from a different tree. Post-fix it costs +0.8% (p=0.77, not resolvable).
+    /// The ceiling's throughput penalty was almost entirely this bug.
+    ///
+    /// Peak RSS: the ceiling still saves ~46% (241 MB unbounded vs 131 MB bounded, p=0.0011).
+    /// The fix itself *raises* bounded peak by ~12 MB (114-125 MB pre-fix vs 126-137 MB post-fix,
+    /// non-overlapping across six sessions). Cached bytes cannot differ — admission logic is
+    /// untouched and both fill the same 32 MB — so this is transient, and the likeliest cause is
+    /// simply that a walk 11% faster keeps more freshly-built filters in flight at once. That
+    /// mechanism is unconfirmed. It is ~12 MB against the ~110 MB the ceiling saves.
+    ///
+    /// Two earlier runs of this measurement are worth knowing about, because one of them was
+    /// wrong in a way that survived review. A 2-session run gave -11.5%, agreeing with the table
+    /// above; a second gave +4.3% (p=0.27) and a spurious "pre-fix variance is 10x post-fix"
+    /// reading. That run had fixed arm order and visibly unstable timing — pre-fix session means
+    /// spanning 7901-11255ms, CV 14.4%, against 1.0% here. Randomised order and six sessions
+    /// supersede it, and the variance claim does not survive: here the pre-fix arm is the *most*
+    /// stable of the four. Treat -11.3% as carrying more uncertainty than its p-value suggests.
+    ///
+    /// Output is byte-identical across all four arms — two response digests over the whole run,
+    /// one per query shape. It must be: a filter is only ever a pre-filter ahead of a real
+    /// `memmem` check and a parse, so a miss costs work and never a wrong answer.
+    ///
+    /// **`targets` must not touch this cache.** The cached-filter arm holds the `DashMap` shard
+    /// read lock across the whole target loop, so a target iterator that re-entered the cache
+    /// would deadlock — and not only on the write side: the shard guard is a `parking_lot`-style
+    /// `RwLock`, where a re-entrant *read* also deadlocks if a writer is already queued. Under
+    /// `find_callers_batch` a queued writer is the normal state, since every other walk thread is
+    /// calling `admit`. No current caller does this: they pass slices, `HashSet`s, or (in
+    /// `callees`) a lazy `Copied<Iter>` whose `next` only walks its own set. Left as a contract
+    /// rather than enforced by draining into a `Vec`, because the drain would cost an allocation
+    /// per candidate file on the cached-hit path — the path with no build to amortise it.
     #[must_use]
     pub fn contains_any<I, S>(
         &self,
@@ -735,7 +772,13 @@ mod tests {
     }
 
     /// An empty target set is vacuously false and must not pay for a filter, matching `any` on an
-    /// empty iterator. Reachable from `callees`, which passes its shrinking `remaining` set.
+    /// empty iterator.
+    ///
+    /// Not reachable from any caller today — every batch entry point guards an empty set upstream
+    /// (`resolve_callees` returns early, and its import loop breaks on `remaining.is_empty()`
+    /// *before* the prefilter call; `blast_radius`, `diff` and `grok` likewise). So this is purely
+    /// defensive, kept so `contains_any` stays faithful to `any` on an empty iterator, and
+    /// asserted so it stays that way.
     #[test]
     fn no_targets_costs_no_build() {
         let cache = BloomFilterCache::with_ceiling(16 * 1024 * 1024);
@@ -752,11 +795,21 @@ mod tests {
 
     /// `contains_any` must agree with per-target `contains` on the same filter, target for target.
     /// The optimisation is only sound if it changes cost and nothing else.
+    ///
+    /// Both runs share **one** cache, and `contains_any` goes first so it builds and admits. The
+    /// per-target run then queries that same admitted filter, which is what makes the comparison
+    /// about loop logic and nothing else. Two caches would compare two *differently seeded*
+    /// filters: `fastbloom`'s `with_false_pos` derives a fresh SipHash key per filter instance, so
+    /// filters built from identical content have different false-positive sets. Measured on this
+    /// fixture — a 64-bit filter over 3 identifiers — two independent filters disagree on ~6 of
+    /// 20000 absent probes, so the two-absent-target case would flake, and it would look like
+    /// nondeterminism in a Bloom filter, the worst possible false alarm.
     #[test]
     fn contains_any_agrees_with_per_target_contains() {
         let content = "fn alpha() { beta(); }";
         let mtime = SystemTime::UNIX_EPOCH;
         let path = Path::new("/synthetic/agree.rs");
+        let cache = BloomFilterCache::new();
 
         for targets in [
             vec!["alpha"],
@@ -766,15 +819,14 @@ mod tests {
             vec!["alpha", "nope_xyzzy"],
             vec!["nope_xyzzy", "nope_plugh"],
         ] {
-            // Separate caches so neither run sees the other's admissions.
-            let a = BloomFilterCache::new();
-            let b = BloomFilterCache::new();
-            let via_any = a.contains_any(path, mtime, content, targets.iter().copied());
+            let via_any = cache.contains_any(path, mtime, content, targets.iter().copied());
             let via_each = targets
                 .iter()
-                .any(|t| b.contains(path, mtime, content, t.as_ref()));
+                .any(|t| cache.contains(path, mtime, content, t.as_ref()));
             assert_eq!(via_any, via_each, "disagreement on {targets:?}");
         }
+        // One filter served every case: the first probe admitted it and nothing invalidated it.
+        assert_eq!(cache.filters_built(), 1);
     }
 
     /// Two threads missing on the **same** path must charge the budget once, not twice.
