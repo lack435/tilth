@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use std::sync::atomic::Ordering::Relaxed;
+
 use dashmap::DashMap;
 use fastbloom::BloomFilter;
 
@@ -20,10 +22,89 @@ use crate::types::{FileType, Lang};
 // BloomFilterCache
 // ---------------------------------------------------------------------------
 
+/// Approximate memory ceiling for cached filters, in bytes.
+///
+/// The cache held one filter per code file it had ever been asked about, with no bound, and
+/// the MCP server keeps one instance for the process lifetime — so resident memory climbed to
+/// "one filter per code file in the tree" and stayed there. It plateaus rather than leaking,
+/// but a server sitting at a few hundred MB after one query is a real cost on a machine also
+/// running an editor and a compiler.
+///
+/// The constant is calibrated against measured peak RSS, **not** against its own accounting —
+/// which matters, because the accounting undercounts. On a 176k-file C++ tree, one
+/// `kind: "callers"` query, three repetitions in a single MCP session:
+///
+/// ```text
+/// ceiling        peak RSS      wall
+/// unbounded      188-214 MB    2947-3572ms
+/// 64 MB          136-147 MB    3064-3190ms
+/// 8 MB            70-78 MB     3583-3670ms
+/// disabled        44-50 MB     3097-3917ms
+/// ```
+///
+/// Read that carefully, because two things in it are easy to get wrong:
+///
+/// * **The ceiling controls peak memory** — monotonic across four settings, which is what this
+///   bound is for. But a nominal 64 MB produced ~94 MB of actual growth over the
+///   cache-disabled baseline, so `estimated_filter_bytes` undercounts real cost by around 1.5x.
+///   The constant is a calibrated knob, not a byte-accurate budget, and it should be re-measured
+///   rather than reasoned about if it is ever retuned.
+/// * **The time differences are inside the noise.** An earlier two-point reading suggested the
+///   unbounded cache was worth ~15% of wall time; across four settings the ranges overlap and
+///   the cache-disabled run was sometimes the fastest. So this bound is close to free, and any
+///   claim that the cache buys a specific percentage is not supported by these numbers.
+///
+/// 32 MB is what shipped. Measured against `main` on the same tree, three reps each:
+///
+/// ```text
+///                 unbounded                 32 MB ceiling
+/// single-target   189-215 MB / 3001-3546ms  107-122 MB / 2973-3471ms
+/// 5-target        206-241 MB / 10.1-10.8s   117-128 MB / 11.4-12.2s
+/// ```
+///
+/// So roughly 45% off peak RSS, free on the single-walk path and about **12% slower** on the
+/// multi-walk one — that second row is a real cost, outside the noise, and worth stating rather
+/// than rounding away. Multi-target `callers` is where cross-walk reuse pays most, because it
+/// runs one walk per target; that fan-out is itself tracked as a defect, and when it is fixed
+/// this cost shrinks with it.
+///
+/// Output is unaffected at every setting — verified byte-identical with the cache unbounded,
+/// bounded and disabled, and it must be: a filter is only ever a pre-filter ahead of a real
+/// `memmem` check and a parse, so a miss costs work and never a wrong answer.
+const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes a filter of `expected_items` occupies, for budgeting only.
+///
+/// `BloomFilter` exposes no size accessor, so this reproduces its nominal sizing: a 1%
+/// false-positive rate needs about 9.6 bits per item, hence ~1.2 bytes, plus a constant for the
+/// struct. It is known to **undercount** — see `MAX_CACHE_BYTES` for the measurement — because
+/// it counts neither the `PathBuf` key, nor `DashMap`'s per-entry overhead, nor allocator
+/// rounding. That is tolerable for a guard against unbounded growth; it would not be tolerable
+/// if anything depended on the number being right.
+fn estimated_filter_bytes(expected_items: usize) -> usize {
+    expected_items * 12 / 10 + 64
+}
+
 /// Thread-safe cache of per-file Bloom filters, keyed by path and validated
 /// by mtime. Stale entries are automatically rebuilt on access.
+///
+/// Bounded by `MAX_CACHE_BYTES`. Once the budget is reached the cache stops accepting new
+/// entries rather than evicting: eviction would need an access order that `DashMap` does not
+/// keep, and for a cache whose miss penalty is a rebuild the simpler rule is enough. Repeated
+/// walks visit files in a similar order, so what gets in early is also what gets re-probed.
 pub struct BloomFilterCache {
-    filters: DashMap<PathBuf, (BloomFilter, SystemTime)>,
+    filters: DashMap<PathBuf, CachedFilter>,
+    /// Sum of `CachedFilter::bytes` over the map. Only ever compared against the ceiling, so
+    /// a transient overshoot from two threads inserting at once is acceptable and bounded by
+    /// one filter per thread.
+    bytes: std::sync::atomic::AtomicUsize,
+}
+
+struct CachedFilter {
+    filter: BloomFilter,
+    mtime: SystemTime,
+    /// What this entry contributed to `bytes`, so replacing a stale entry can subtract it.
+    bytes: usize,
 }
 
 impl Default for BloomFilterCache {
@@ -38,7 +119,14 @@ impl BloomFilterCache {
     pub fn new() -> Self {
         Self {
             filters: DashMap::new(),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Bytes currently accounted for by cached filters. Test/diagnostic accessor.
+    #[must_use]
+    pub fn cached_bytes(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if `symbol` might appear in the file at `path`.
@@ -52,16 +140,42 @@ impl BloomFilterCache {
     pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
         // Fast path: check existing cached entry
         if let Some(entry) = self.filters.get(path) {
-            let (ref filter, cached_mtime) = *entry;
-            if cached_mtime == mtime {
-                return filter.contains(symbol);
+            if entry.mtime == mtime {
+                return entry.filter.contains(symbol);
             }
         }
 
         // Cache miss or stale: build and cache a new filter
-        let filter = build_filter(content, code_lang(path));
+        let (filter, expected_items) = build_filter(content, code_lang(path));
         let result = filter.contains(symbol);
-        self.filters.insert(path.to_path_buf(), (filter, mtime));
+        let cost = estimated_filter_bytes(expected_items);
+
+        // Replacing a stale entry frees its budget first, so a file edited repeatedly cannot
+        // consume the ceiling one revision at a time.
+        let reclaimed = self
+            .filters
+            .get(path)
+            .filter(|e| e.mtime != mtime)
+            .map_or(0, |e| e.bytes);
+        if reclaimed > 0 {
+            self.bytes.fetch_sub(reclaimed, Relaxed);
+        }
+
+        if self.bytes.load(Relaxed) + cost <= MAX_CACHE_BYTES {
+            self.bytes.fetch_add(cost, Relaxed);
+            self.filters.insert(
+                path.to_path_buf(),
+                CachedFilter {
+                    filter,
+                    mtime,
+                    bytes: cost,
+                },
+            );
+        } else if reclaimed > 0 {
+            // Budget reclaimed but the replacement does not fit: drop the stale entry rather
+            // than leave one whose mtime can never match again.
+            self.filters.remove(path);
+        }
         result
     }
 }
@@ -79,7 +193,10 @@ fn code_lang(path: &Path) -> Option<Lang> {
 }
 
 /// Build a Bloom filter from file content by extracting all identifiers.
-fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
+///
+/// Returns the filter and the `expected_items` it was sized for, so the caller can budget
+/// against it without a size accessor `BloomFilter` does not provide.
+fn build_filter(content: &str, lang: Option<Lang>) -> (BloomFilter, usize) {
     let idents: Vec<&str> = extract_identifiers(content, lang).collect();
     // Sized for total token count, not unique identifiers -- duplicates over-allocate
     // the filter, so the achieved FPR is well below the 0.01 target in practice.
@@ -89,7 +206,7 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
     for ident in idents {
         filter.insert(ident);
     }
-    filter
+    (filter, expected)
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +414,72 @@ fn is_ident_continue(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache must stop growing at `MAX_CACHE_BYTES`, and must keep answering correctly
+    /// once it does — a filter is only ever a pre-filter, so a refused insert costs a rebuild
+    /// and never a wrong answer.
+    ///
+    /// Uses `estimated_filter_bytes` to size the fixture rather than a magic number, so raising
+    /// the ceiling retunes this instead of breaking it.
+    #[test]
+    fn cache_stops_growing_at_the_ceiling_and_stays_correct() {
+        let cache = BloomFilterCache::new();
+        let mtime = SystemTime::UNIX_EPOCH;
+
+        // Each file carries enough distinct identifiers to make its filter non-trivial.
+        let content: String = (0..2000).map(|i| format!("ident_{i} ")).collect();
+        let per_file = estimated_filter_bytes(2001);
+        // Enough files to overrun the ceiling several times over.
+        let files = MAX_CACHE_BYTES / per_file + 50;
+
+        for f in 0..files {
+            let path = PathBuf::from(format!("/synthetic/f{f}.rs"));
+            // Correctness under the bound: a symbol that is present must still be reported
+            // present whether or not this file got cached.
+            // The only guarantee a Bloom filter makes is no false *negatives*, so this is the
+            // only thing that can be asserted per file. Asserting the absent case fails
+            // legitimately — the filters are built for a 1% false-positive rate, and over this
+            // many files a false positive is near-certain (it first fired on file 6).
+            assert!(
+                cache.contains(&path, mtime, &content, "ident_7"),
+                "a present symbol must be found regardless of cache admission (file {f})"
+            );
+        }
+
+        let bytes = cache.cached_bytes();
+        assert!(
+            bytes <= MAX_CACHE_BYTES,
+            "cache exceeded its ceiling: {bytes} > {MAX_CACHE_BYTES}"
+        );
+        // And it must actually have filled up, or the ceiling was never exercised.
+        assert!(
+            bytes > MAX_CACHE_BYTES / 2,
+            "fixture did not reach the ceiling ({bytes} bytes); the bound is untested"
+        );
+    }
+
+    /// Re-caching a modified file must not consume the ceiling one revision at a time.
+    #[test]
+    fn restating_a_stale_entry_reclaims_its_budget() {
+        let cache = BloomFilterCache::new();
+        let path = PathBuf::from("/synthetic/churn.rs");
+        let content: String = (0..2000).map(|i| format!("ident_{i} ")).collect();
+
+        let mut last = 0;
+        for rev in 0..50u64 {
+            let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(rev);
+            assert!(cache.contains(&path, mtime, &content, "ident_7"));
+            let now = cache.cached_bytes();
+            if rev > 0 {
+                assert_eq!(
+                    now, last,
+                    "budget grew on revision {rev} — a stale entry was not reclaimed"
+                );
+            }
+            last = now;
+        }
+        assert!(last > 0, "nothing was cached, so this proves nothing");
+    }
 
     #[test]
     fn test_basic_membership() {
@@ -506,7 +689,7 @@ mod tests {
     #[test]
     fn test_build_filter_integration() {
         let content = "pub fn search(query: &str) -> Vec<Match> { find(query) }";
-        let filter = build_filter(content, Some(Lang::Rust));
+        let (filter, _) = build_filter(content, Some(Lang::Rust));
 
         assert!(filter.contains("search"));
         assert!(filter.contains("query"));
