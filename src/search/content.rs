@@ -18,11 +18,31 @@ const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Candidates kept for ranking. Everything past this is counted and dropped.
 ///
-/// Well above `FULL_MAX_MATCHES` (100) on purpose: the display cap decides what is *shown*,
-/// this decides what is *available to rank*, and the gap is the room recency has to reorder
-/// the page. See `rank::Scorer` for why selection deliberately ignores recency and what the
-/// residual risk is.
-const MAX_RETAINED: usize = 500;
+/// Selection ignores recency (see `rank::Scorer`), so the retained set has to be deep enough
+/// that recency can still promote a match onto the page from *within* it. Recency is worth up
+/// to 100 points, so a match is at risk of being wrongly dropped only when its selection score
+/// is within 100 of the score at the retention cut.
+///
+/// This was 500, and 500 was far too small — set from an assumption that recency was small
+/// against "scores in the thousands". It is not. A content match scores about **230** in total:
+/// `is_definition` and `exact` are both false for every content match, which removes two
+/// 500-point terms and leaves `scope_proximity` (180 at depth 1) plus the 50-point short-file
+/// bonus. So recency is ~43% of the whole score, and 100 points is **five directory levels** of
+/// `scope_proximity`.
+///
+/// The consequence was measured, not theorised: 600 matches at the scope root aged 60 days,
+/// plus 300 in a freshly-edited directory five levels down, and the fresh directory vanished
+/// from the page entirely — 10 of 10 entries before the bound, 0 after, while the header still
+/// reported all 900. "Edit a subdirectory, then search for a common token" is an ordinary
+/// thing to do.
+///
+/// 20k candidates is ~5.6 MB at ~280 bytes each, against the 405-449 MB this bound exists to
+/// remove, so the memory argument tolerates a bound two orders of magnitude above the display
+/// cap. What remains is precise: the page can differ from an unbounded search only when more
+/// than `MAX_RETAINED` matches sit within 100 points above the dropped one. That is a real
+/// residual, not a proof of correctness — it is just now narrow enough to need a pathological
+/// tree rather than an ordinary one.
+const MAX_RETAINED: usize = 20_000;
 
 // This walk used to stop once a shared `AtomicUsize` crossed `EARLY_QUIT_THRESHOLD`
 // (30, or 300 under `--full`), which made content search **non-deterministic** for the
@@ -190,33 +210,43 @@ pub fn search(
                 total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
                 test_matches.fetch_add(tests_here, Ordering::Relaxed);
 
-                // Score outside the lock. `Scorer` omits the recency term, so which matches
-                // are retained cannot depend on the wall clock.
-                let scored: Vec<Candidate> = file_matches
-                    .into_iter()
-                    .map(|m| Candidate {
+                // Reduce this file to its own best `MAX_RETAINED` first, with **no lock held**.
+                // `Scorer` omits the recency term, so what survives cannot depend on when it
+                // ran. A rejected candidate is dropped here, off the lock.
+                //
+                // Two earlier shapes were worse and are worth naming. Collecting everything
+                // and reducing after the walk left peak memory unmoved — the peak is reached
+                // before ranking starts, so a bound applied afterwards bounds nothing.
+                // Reducing straight into the shared heap fixed that but held the mutex across
+                // every comparison for the file, each a `PathBuf` compare, and let the reject
+                // buffer grow to the file's whole match count under that lock. A file with
+                // 250k matches then serialised the entire parallel walk behind it.
+                let mut local: BinaryHeap<Candidate> = BinaryHeap::with_capacity(64);
+                for m in file_matches {
+                    let cand = Candidate {
                         score: scorer.selection_score(&m),
                         m,
-                    })
-                    .collect();
+                    };
+                    if local.len() < MAX_RETAINED {
+                        local.push(cand);
+                    } else if local.peek().is_some_and(|worst| cand < *worst) {
+                        // Peek first so a doomed candidate is never sifted in and back out.
+                        local.pop();
+                        local.push(cand);
+                    }
+                }
 
-                // Reduce *inside* the walk, which is the whole point. A first version of
-                // this collected every scored match and reduced afterwards; output was
-                // correct and it was faster, but peak memory did not move at all — the peak
-                // is reached before ranking ever starts, so a bound applied after the walk
-                // bounds nothing.
+                // Merge under one acquisition, now bounded by `MAX_RETAINED` rather than by
+                // the file's match count.
                 let mut evicted: Vec<Candidate> = Vec::new();
                 {
                     let mut heap = matches
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for cand in scored {
+                    for cand in local.into_vec() {
                         if heap.len() < MAX_RETAINED {
                             heap.push(cand);
                         } else if heap.peek().is_some_and(|worst| cand < *worst) {
-                            // Better than the worst kept: swap it in. Peeking first avoids
-                            // sifting a doomed candidate in and back out, and keeps the
-                            // rejected one out of the heap entirely.
                             if let Some(out) = heap.pop() {
                                 evicted.push(out);
                             }

@@ -157,9 +157,12 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
 /// it. Selecting on a time-independent key keeps membership a function of the tree, and the
 /// full ranking (recency included) still orders the retained set.
 ///
-/// The residual is bounded rather than hoped away: a match can only be wrongly dropped if at
-/// least `retain` others beat it on this key *and* it would have overtaken them on recency
-/// alone, worth at most 100 points against scores in the thousands.
+/// The residual is bounded, and the bound is *not* "recency is small". Recency is worth up to
+/// 100 points, and a content match's entire score is about 230 — `is_definition` and `exact` are
+/// both false for every content match, which removes two 500-point terms. So the retained set
+/// must be deep enough that a match within 100 points of the retention cut is still kept; see
+/// `content::MAX_RETAINED`, which was set an order of magnitude too small on the strength of an
+/// unchecked claim that scores are "in the thousands".
 pub(crate) struct Scorer<'a> {
     query: &'a str,
     scope: &'a Path,

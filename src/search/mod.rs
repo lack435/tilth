@@ -1805,8 +1805,8 @@ mod tests {
     /// `(path, line)` tie-break — which meant inverting the heap's score comparison, so it
     /// kept the *worst* candidates instead of the best, failed no test at all. Verified by
     /// mutation. `scope_proximity` charges 20 points per path component, so burying one tier
-    /// eight levels down separates the tiers by ~160 points and makes the score comparison
-    /// decide something.
+    /// five levels down separates the tiers by 100 points — measured: shallow 230, deep 130 —
+    /// and makes the score comparison decide something.
     ///
     /// The shallow tier alone exceeds `MAX_RETAINED`, so a correct implementation retains only
     /// shallow matches and an inverted one retains only deep ones.
@@ -1815,12 +1815,18 @@ mod tests {
         for f in 0..RETENTION_SHALLOW_FILES {
             std::fs::write(dir.join(format!("shallow{f:03}.rs")), &body).unwrap();
         }
+        // One file whose *name* marks it as a test, so the `tests` bucket is non-zero and the
+        // `tests` counter is actually exercised. Without it `assert_eq!(tests, 0)` was `0 == 0`,
+        // and stubbing the test predicate to `false` failed nothing — verified by mutation.
+        // `_test.` rather than a `tests/` directory, because `is_test_match`'s directory checks
+        // use forward slashes and never fire on Windows paths.
+        std::fs::write(dir.join("marked_test.rs"), &body).unwrap();
         let deep_dir = dir.join("a").join("b").join("c").join("d").join("e");
         std::fs::create_dir_all(&deep_dir).unwrap();
         for f in 0..RETENTION_DEEP_FILES {
             std::fs::write(deep_dir.join(format!("deep{f:03}.rs")), &body).unwrap();
         }
-        (RETENTION_SHALLOW_FILES + RETENTION_DEEP_FILES) * RETENTION_MATCHES_PER_FILE
+        (RETENTION_SHALLOW_FILES + RETENTION_DEEP_FILES + 1) * RETENTION_MATCHES_PER_FILE
     }
 
     /// Bounding retention must not make the reported counts approximate.
@@ -1848,10 +1854,24 @@ mod tests {
         assert_eq!(result.definitions, 0, "content search has no definitions");
         // Content search can only populate `tests` and `usages_cross`; every match here is a
         // plain usage, so the whole total lands in the latter.
-        assert_eq!(result.facet_totals.usages_cross, expected);
-        assert_eq!(result.facet_totals.tests, 0);
         assert_eq!(result.facet_totals.definitions, 0);
         assert_eq!(result.facet_totals.usages_local, 0);
+        assert_eq!(
+            result.facet_totals.tests, RETENTION_MATCHES_PER_FILE,
+            "the marked test file's matches must all land in the tests bucket"
+        );
+        assert!(
+            result.facet_totals.tests > 0,
+            "tests bucket must be exercised, or stubbing the predicate fails nothing"
+        );
+        // The two reachable buckets must partition the total exactly. This is the property
+        // that makes hand-building `FacetTotals` from counters equivalent to faceting the
+        // whole set, and it fails if either counter drifts.
+        assert_eq!(
+            result.facet_totals.tests + result.facet_totals.usages_cross,
+            result.total_found,
+            "tests + usages_cross must partition total_found"
+        );
         // And the retained set must actually have been capped, or none of the above is a test
         // of the bound.
         assert!(
