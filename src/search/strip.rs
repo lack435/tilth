@@ -65,10 +65,11 @@ pub(crate) fn strip_noise(
 
         // BOM-aware, because `str::trim` is not: U+FEFF was removed from Unicode
         // `White_Space` years ago, so on a BOM'd file every `starts_with` test below fails
-        // for line 1 and an opening comment survives stripping (#42). Python is where this
-        // actually bites — a leading `# comment` is strippable there. Not Bash: `is_strippable_comment`
-        // exempts `#!` deliberately, so a BOM'd shebang surviving was already the right
-        // answer, reached by accident.
+        // for line 1 and an opening comment survives stripping (#42). It bites any language
+        // whose line 1 can be a strippable comment — Rust `//`, Python `#`, SQL `--`, all of
+        // them. The one place it does not is a Bash shebang: `is_strippable_comment` exempts
+        // `#!` on purpose, so a BOM'd `#!/bin/bash` surviving was already correct, reached by
+        // accident rather than by this.
         //
         // Only line 1 can be affected — a BOM occurs once, at file start — but this is the
         // single funnel all three rules read from, so one call covers them. Same helper as
@@ -247,7 +248,12 @@ mod tests {
     #[test]
     fn a_bom_does_not_defeat_stripping_on_line_one() {
         let body = "// leading comment\nfn foo() {\n    debug!(\"hi\");\n}\n";
-        let bommed = format!("\u{feff}{body}");
+        // The BOM is built from its bytes, not a `\u{feff}` literal — the convention #35 and
+        // #41 set, because a literal is the thing an editor or a source-formatting pass
+        // silently normalises away, which is how this class of bug kept coming back.
+        let mut bommed_bytes = vec![0xEF, 0xBB, 0xBF];
+        bommed_bytes.extend_from_slice(body.as_bytes());
+        let bommed = String::from_utf8(bommed_bytes).unwrap();
 
         let plain = strip_noise(body, &path("rs"), Some((1, 4)));
         let with_bom = strip_noise(&bommed, &path("rs"), Some((1, 4)));

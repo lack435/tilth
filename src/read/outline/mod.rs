@@ -27,15 +27,20 @@ const OUTLINE_CAP: usize = 100; // max outline lines for huge files
 /// wrong. Stripping `content` fixes the stray glyph, in the CSV header and in a code
 /// outline's first entry. Stripping `buf` fixes nothing for a *single* BOM — tree-sitter-md
 /// skips one by itself, so a BOM'd markdown file already outlined correctly — but a
-/// **doubled** BOM makes it parse the heading as a paragraph and the whole outline comes
-/// back empty. Measured: 0 BOMs and 1 BOM both give `[1-3] # Title`, 2 give `""`. So the
-/// `buf` strip is not a cosmetic fix at all; it stops a total loss of the outline.
+/// **doubled** BOM makes it parse the *first* heading as a paragraph, so that heading drops
+/// out of the outline. Measured on a two-heading file: 0 and 1 BOM outline both headings,
+/// 2 BOMs outline only the second. A single-heading file therefore outlines as `""` under
+/// two BOMs, which is where the loss is total — but the mechanism is "first heading lost",
+/// not "whole outline emptied". Either way the `buf` strip is not cosmetic; it recovers a
+/// heading the parser would otherwise swallow.
 ///
 /// This is an *outline* funnel, so nothing here feeds `tilth_write`'s hash verification —
 /// see the note in `read::full_view` for why the full-content path is deliberately left
 /// carrying the BOM. But it does have to agree with `resolve_heading` and
 /// `suggest_headings`, which parse the same bytes for the section reader: while only this
 /// side stripped, the outline advertised a doubled-BOM heading that the resolver denied.
+/// The search-side markdown parsers (`search::symbol`, `search::mod`) still parse unstripped
+/// and so still disagree about a doubled-BOM file's first heading — tracked in #51.
 pub fn generate(
     path: &Path,
     file_type: FileType,
@@ -119,32 +124,32 @@ mod tests {
     /// its `columns:` header. That one is the cosmetic fix: the BOM rendered as a stray
     /// glyph in front of the first column name.
     ///
-    /// Markdown is here for a different and stronger reason, worth stating because the
-    /// obvious guess is wrong. It is the one backend that parses `buf`, but tree-sitter-md
-    /// already skips a *single* leading BOM, so one BOM never leaked. Two make it parse the
-    /// heading as a paragraph and the outline comes back **empty** — measured: 0 and 1 BOM
-    /// both give `[1-3] # Title`, 2 gives `""`. So the doubled case is not belt-and-braces
-    /// here, it is the only thing the `buf` strip fixes, and removing that strip fails this
-    /// test on the `n == 2` iteration with `got ""` rather than on a leaked glyph.
+    /// Markdown is here for a different and stronger reason. It parses `buf`, and
+    /// tree-sitter-md already skips a *single* leading BOM — so one BOM never leaked. Two
+    /// make it parse the **first** heading as a paragraph, dropping it. The fixture carries
+    /// two headings on purpose: a single-heading file cannot tell "first heading lost" from
+    /// "whole outline emptied", and asserting the wrong one of those is how the claim first
+    /// went in overstated. Removing the `buf` strip fails this on `n == 2` because `Alpha`
+    /// goes missing while `Beta` survives — not because the outline is empty.
     #[test]
     fn a_bom_does_not_reach_the_rendered_outline() {
-        // (path, file type, body, the text that must open the outline)
-        let cases: &[(&str, FileType, &str, &str)] = &[
+        // (path, file type, body, substrings that must appear in the outline)
+        let cases: &[(&str, FileType, &str, &[&str])] = &[
             (
                 "data.csv",
                 FileType::Tabular,
                 "name,age\nalice,30\nbob,25\n",
-                "columns: name,age",
+                &["columns: name,age"],
             ),
             (
                 "readme.md",
                 FileType::Markdown,
-                "# Title\n\nbody text\n",
-                "Title",
+                "# Alpha\n\nbody text\n\n# Beta\n\nmore text\n",
+                &["Alpha", "Beta"],
             ),
         ];
 
-        for (name, file_type, body, needle) in cases {
+        for (name, file_type, body, needles) in cases {
             let path = Path::new(name);
             let plain = generate(path, *file_type, body, body.as_bytes(), false);
 
@@ -157,10 +162,12 @@ mod tests {
                     !out.contains('\u{feff}'),
                     "{name}: {n} BOM(s) reached the outline: {out:?}"
                 );
-                assert!(
-                    out.contains(needle),
-                    "{name}: with {n} BOM(s), expected {needle:?} in the outline, got {out:?}"
-                );
+                for needle in *needles {
+                    assert!(
+                        out.contains(needle),
+                        "{name}: with {n} BOM(s), expected {needle:?} in the outline, got {out:?}"
+                    );
+                }
                 assert_eq!(out, plain, "{name}: {n} BOM(s) changed the outline");
             }
         }

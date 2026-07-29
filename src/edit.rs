@@ -637,6 +637,53 @@ mod tests {
         );
     }
 
+    /// The same hash contract, reached through a *section* read.
+    ///
+    /// `collect_blocks` slices the raw mmap and hashes the slice, so a line-1 section keeps
+    /// the BOM and its anchor agrees with `apply_edits` — today. Nothing pinned that: the
+    /// full-view path has `hash_mode_edits_line_one_of_a_bom_file`, but section reads are a
+    /// separate rendering path (`read_ranges`), and a contributor stripping the section slice
+    /// to tidy the glyph would desync section anchors from verification with no failing test.
+    /// This is that test. Section reads keeping the BOM is the same call the full view makes,
+    /// for the same reason.
+    #[test]
+    fn hash_mode_section_read_of_line_one_of_a_bom_file() {
+        const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.csv");
+        let mut bytes = BOM.to_vec();
+        bytes.extend_from_slice(b"name,age\nalice,30\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // A section read of line 1, in edit mode — the anchor the agent is handed.
+        let cache = crate::cache::OutlineCache::new();
+        let view = crate::read::read_file(&path, Some("1-1"), false, &cache, true).unwrap();
+        let hashline = view
+            .lines()
+            .find(|l| l.starts_with("1:"))
+            .expect("a section read of line 1 in edit mode must emit its hashline");
+        let hash_str = hashline
+            .split_once(':')
+            .and_then(|(_, rest)| rest.split_once('|'))
+            .map(|(h, _)| h)
+            .expect("hashline must be `{line}:{hash}|{text}`");
+        let h1 = u16::from_str_radix(hash_str.trim(), 16).expect("hash must be hex");
+
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: h1,
+            end_line: 1,
+            end_hash: h1,
+            content: "name,years".into(),
+        }];
+        match apply_edits(&path, &edits).unwrap() {
+            EditResult::Applied { .. } => {}
+            EditResult::HashMismatch(msg) => {
+                panic!("a section-read anchor was rejected by verification: {msg}")
+            }
+        }
+    }
+
     #[test]
     fn single_line_replacement() {
         let content = "aaa\nbbb\nccc\n";

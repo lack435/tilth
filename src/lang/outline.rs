@@ -1111,10 +1111,14 @@ pub(crate) fn strip_bom(content: &str) -> &str {
 
 /// `strip_bom` for callers holding raw bytes rather than a `&str`.
 ///
-/// The markdown paths parse the mmap directly — `read::outline::generate`'s markdown arm,
-/// and `resolve_heading` / `suggest_headings` — so they cannot use the `&str` form. They
-/// must all agree: one of them stripping while another does not is how an outline came to
-/// advertise a heading anchor that the section resolver then denied.
+/// Several markdown paths parse the mmap directly and so cannot use the `&str` form. The
+/// three on the read side use this and must agree, because one stripping while another does
+/// not is how an outline came to advertise a heading anchor that the section resolver then
+/// denied: `read::outline::generate`'s markdown arm, `resolve_heading`, and
+/// `suggest_headings`. Two more parse markdown on the *search* side —
+/// `search::symbol`'s definition matcher and `search::mod`'s enclosing-scope lookup — and
+/// still do not strip, so they disagree with the read side about a doubled-BOM file's first
+/// heading; that is tracked in #51, not fixed here.
 ///
 /// A BOM contains no newline, so removing it never shifts a line number — only column 0 of
 /// row 0, which no caller tests.
@@ -1122,8 +1126,8 @@ pub(crate) fn strip_bom(content: &str) -> &str {
 /// Repeats are stripped for the same reason `strip_bom` strips them: a tool that prepends a
 /// BOM without checking for an existing one leaves two. That is not hypothetical here —
 /// tree-sitter-md skips a *single* leading BOM by itself, so one BOM parses correctly with
-/// or without this, but two make it parse the heading as a paragraph and the entire outline
-/// comes back empty.
+/// or without this, but two make it parse the first heading as a paragraph, dropping that
+/// heading from the outline (the rest survive).
 pub(crate) fn strip_bom_bytes(buf: &[u8]) -> &[u8] {
     const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
     let mut rest = buf;
