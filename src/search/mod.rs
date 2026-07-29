@@ -1804,18 +1804,16 @@ mod tests {
     const GLOB_FIXTURE_DIRS: usize = 10;
     const GLOB_FIXTURE_FILES_PER_DIR: usize = 40;
 
-    /// `glob::MAX_FILES`, duplicated because it is private to that module. If it changes,
-    /// the tests below fail on a length mismatch — this comment is the hint as to why.
-    /// Above `GLOB_FIXTURE_FILES_PER_DIR` the expectation would have to span `d1` too, so
-    /// `write_glob_fixture` would need widening rather than just retuning.
-    const GLOB_EXPECTED_SHOWN: usize = 20;
-
     /// Write the glob fixture and return the relative paths a correct implementation must
     /// return, in the order it must return them.
+    ///
+    /// Derived from `glob::MAX_FILES` rather than a copied literal, so raising the cap
+    /// retunes these tests instead of breaking them — up to the point where the displayed
+    /// page no longer fits in `d0`, which the assertion below catches explicitly.
     fn write_glob_fixture(dir: &Path) -> Vec<String> {
         assert!(
-            GLOB_EXPECTED_SHOWN <= GLOB_FIXTURE_FILES_PER_DIR,
-            "expectation assumes the whole displayed page fits in d0"
+            glob::MAX_FILES <= GLOB_FIXTURE_FILES_PER_DIR,
+            "expectation assumes the whole displayed page fits in d0; widen the fixture"
         );
         for d in 0..GLOB_FIXTURE_DIRS {
             let sub = dir.join(format!("d{d}"));
@@ -1826,7 +1824,7 @@ mod tests {
             }
         }
         // Sorted by path, the whole displayed page is inside `d0`.
-        (0..GLOB_EXPECTED_SHOWN)
+        (0..glob::MAX_FILES)
             .map(|f| format!("d0/f{f:03}.txt"))
             .collect()
     }
@@ -1880,6 +1878,40 @@ mod tests {
             GLOB_FIXTURE_DIRS * GLOB_FIXTURE_FILES_PER_DIR,
             "total_found must be the true match count, not the display cap"
         );
+    }
+
+    /// Under the cap, every match is rendered and no "more files" tail appears.
+    ///
+    /// The eviction branch never fires here, so this is the only coverage of the heap's
+    /// fill-up path — every other glob test runs well past capacity.
+    ///
+    /// Its unique contribution is the *absence* of the truncation tail: relaxing
+    /// `format_glob_result`'s `total_found > files.len()` to `>=` appends
+    /// "... and 0 more files. Narrow with scope." to every complete listing, and this is the
+    /// only test that fails on it — verified by mutation. It does **not** catch a boundary
+    /// off-by-one in the eviction check; that shows up in
+    /// `glob_returns_the_alphabetically_first_files_in_order`, which runs past the cap.
+    #[test]
+    fn glob_under_the_cap_renders_every_match_with_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        // One under the cap, so nothing is ever evicted.
+        let n = glob::MAX_FILES - 1;
+        for f in 0..n {
+            std::fs::write(dir.path().join(format!("f{f:03}.txt")), "x\n").unwrap();
+        }
+
+        let out = search_glob("*.txt", dir.path()).unwrap();
+        let shown = out.lines().filter(|l| l.starts_with("  ")).count();
+
+        assert_eq!(shown, n, "every match under the cap must render:\n{out}");
+        assert!(
+            !out.contains("more files"),
+            "no truncation tail when nothing was truncated:\n{out}"
+        );
+
+        let result = glob::search("*.txt", dir.path()).unwrap();
+        assert_eq!(result.total_found, n);
+        assert_eq!(result.files.len(), n);
     }
 
     /// The header must state how many files matched, not how many were rendered.
