@@ -142,6 +142,59 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
     apply_destination_permutation(matches, &mut dest);
 }
 
+/// Scores a match against one query, for use *during* a walk.
+///
+/// Exists so a search can decide what to retain while it walks, instead of retaining
+/// everything and deciding afterwards. Owns the per-query context that `sort` otherwise
+/// recomputes, so a worker thread can construct one and score its own matches.
+///
+/// `selection_score` deliberately **omits the recency term**, and that is the whole reason
+/// this is a separate entry point rather than a call to `score`. `recency` buckets by age
+/// at 1h/1d/1w/1mo, so a file crossing a boundary between two runs changes its score. That
+/// is harmless when every match is retained — `now` only reorders the displayed page — but a
+/// score-gated *retention* bound would let the wall clock decide which matches exist at all,
+/// which is the defect removed from `overview::hot_files` and from the search walks before
+/// it. Selecting on a time-independent key keeps membership a function of the tree, and the
+/// full ranking (recency included) still orders the retained set.
+///
+/// The residual is bounded rather than hoped away: a match can only be wrongly dropped if at
+/// least `retain` others beat it on this key *and* it would have overtaken them on recency
+/// alone, worth at most 100 points against scores in the thousands.
+pub(crate) struct Scorer<'a> {
+    query: &'a str,
+    scope: &'a Path,
+    ctx_parent: Option<&'a Path>,
+    ctx_pkg_root: Option<PathBuf>,
+    pkg_cache: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl<'a> Scorer<'a> {
+    pub(crate) fn new(query: &'a str, scope: &'a Path, context: Option<&'a Path>) -> Self {
+        Scorer {
+            query,
+            scope,
+            ctx_parent: context.and_then(Path::parent),
+            ctx_pkg_root: context
+                .and_then(crate::lang::package_root)
+                .map(std::path::Path::to_path_buf),
+            pkg_cache: HashMap::new(),
+        }
+    }
+
+    /// Time-independent ranking score. See the struct docs for why recency is excluded.
+    pub(crate) fn selection_score(&mut self, m: &Match) -> i32 {
+        score_inner(
+            m,
+            self.query,
+            self.scope,
+            self.ctx_parent,
+            self.ctx_pkg_root.as_ref(),
+            &mut self.pkg_cache,
+            None,
+        )
+    }
+}
+
 /// Ranking function. Each match gets a score — no floating point, no randomness.
 /// All boosts are positive (added), all penalties are positive (subtracted).
 fn score(
@@ -152,6 +205,28 @@ fn score(
     ctx_pkg_root: Option<&PathBuf>,
     pkg_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
     now: SystemTime,
+) -> i32 {
+    score_inner(
+        m,
+        query,
+        scope,
+        ctx_parent,
+        ctx_pkg_root,
+        pkg_cache,
+        Some(now),
+    )
+}
+
+/// `now = None` omits the recency term, yielding a score that does not depend on the clock.
+/// Every other term is identical, so the two callers cannot drift apart.
+fn score_inner(
+    m: &Match,
+    query: &str,
+    scope: &Path,
+    ctx_parent: Option<&Path>,
+    ctx_pkg_root: Option<&PathBuf>,
+    pkg_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+    now: Option<SystemTime>,
 ) -> i32 {
     let mut s = 0i32;
 
@@ -166,7 +241,9 @@ fn score(
     s += query_intent_boost(m, query);
     s += multi_word_boost(m, query);
     s += scope_proximity(&m.path, scope) as i32;
-    s += recency(m.mtime, now) as i32;
+    if let Some(now) = now {
+        s += recency(m.mtime, now) as i32;
+    }
 
     if m.file_lines > 0 && m.file_lines < 200 {
         s += 50;
@@ -555,7 +632,7 @@ fn recency(mtime: SystemTime, now: SystemTime) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::sort;
+    use super::{score, sort, Scorer};
     use crate::types::Match;
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
@@ -713,6 +790,50 @@ mod tests {
             actual.len(),
             33,
             "fixture size changed — retune the assertion"
+        );
+    }
+
+    /// `Scorer::selection_score` must not include recency. This is the pin for the whole
+    /// bounded-retention design.
+    ///
+    /// A retention bound gated on the ranking score would let the wall clock decide which
+    /// matches exist: `recency` buckets by age at 1h/1d/1w/1mo, so a file crossing a boundary
+    /// between two runs changes its score by 20-100 points and can enter or leave the
+    /// retained set. That is the defect removed from `overview::hot_files`. Selection
+    /// therefore uses a time-independent key, and this asserts it stays that way.
+    #[test]
+    fn selection_score_ignores_recency_while_the_full_score_does_not() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let scope = PathBuf::from("/repo/src");
+        let query = "handleAuth";
+
+        let fresh_mtime = SystemTime::now();
+        // Two months old: a different `recency` bucket from "within the last hour".
+        let stale_mtime = fresh_mtime - Duration::from_secs(60 * 24 * 3600);
+
+        let mut fresh = make_match("/repo/src/a.rs", "handleAuth(user)", false, None);
+        fresh.mtime = fresh_mtime;
+        let mut stale = make_match("/repo/src/a.rs", "handleAuth(user)", false, None);
+        stale.mtime = stale_mtime;
+
+        let mut scorer = Scorer::new(query, &scope, None);
+        assert_eq!(
+            scorer.selection_score(&fresh),
+            scorer.selection_score(&stale),
+            "selection must not depend on mtime, or a bound on it would depend on the clock"
+        );
+
+        // And the full score *must* still differ, or the fixture is not exercising recency
+        // and the assertion above is vacuous.
+        let mut cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+        let now = SystemTime::now();
+        let full_fresh = score(&fresh, query, &scope, None, None, &mut cache, now);
+        let full_stale = score(&stale, query, &scope, None, None, &mut cache, now);
+        assert!(
+            full_fresh > full_stale,
+            "fixture must straddle a recency bucket ({full_fresh} vs {full_stale})"
         );
     }
 

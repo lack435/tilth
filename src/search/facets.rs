@@ -136,6 +136,15 @@ pub fn facet_totals(matches: &[Match], _scope: &Path) -> FacetTotals {
     totals
 }
 
+/// Test-ness of a single match, for callers computing facet totals during a walk.
+///
+/// `content::search` needs this to keep its `tests` count exact while retaining only a
+/// bounded number of matches. Exposed rather than duplicated so the count cannot drift from
+/// the bucket the renderer puts the match in.
+pub(crate) fn is_test_match_for_totals(m: &Match) -> bool {
+    is_test_match(m)
+}
+
 /// Check if a match is in a test file or contains test markers.
 fn is_test_match(m: &Match) -> bool {
     // Path-based detection

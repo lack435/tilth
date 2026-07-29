@@ -1792,6 +1792,113 @@ mod tests {
         );
     }
 
+    /// Matches in the retention fixture below, chosen to exceed `content::MAX_RETAINED` (500)
+    /// by a wide margin — the bound is invisible below it.
+    const RETENTION_SHALLOW_FILES: usize = 10;
+    const RETENTION_DEEP_FILES: usize = 40;
+    const RETENTION_MATCHES_PER_FILE: usize = 60;
+
+    /// Write files containing `needle` on every line, in two tiers that **score differently**.
+    ///
+    /// The score spread is load-bearing. A first version put every file at the same depth, so
+    /// all matches scored equally and the selection key was decided entirely by its
+    /// `(path, line)` tie-break — which meant inverting the heap's score comparison, so it
+    /// kept the *worst* candidates instead of the best, failed no test at all. Verified by
+    /// mutation. `scope_proximity` charges 20 points per path component, so burying one tier
+    /// eight levels down separates the tiers by ~160 points and makes the score comparison
+    /// decide something.
+    ///
+    /// The shallow tier alone exceeds `MAX_RETAINED`, so a correct implementation retains only
+    /// shallow matches and an inverted one retains only deep ones.
+    fn write_retention_fixture(dir: &Path) -> usize {
+        let body = "let v = needle();\n".repeat(RETENTION_MATCHES_PER_FILE);
+        for f in 0..RETENTION_SHALLOW_FILES {
+            std::fs::write(dir.join(format!("shallow{f:03}.rs")), &body).unwrap();
+        }
+        let deep_dir = dir.join("a").join("b").join("c").join("d").join("e");
+        std::fs::create_dir_all(&deep_dir).unwrap();
+        for f in 0..RETENTION_DEEP_FILES {
+            std::fs::write(deep_dir.join(format!("deep{f:03}.rs")), &body).unwrap();
+        }
+        (RETENTION_SHALLOW_FILES + RETENTION_DEEP_FILES) * RETENTION_MATCHES_PER_FILE
+    }
+
+    /// Bounding retention must not make the reported counts approximate.
+    ///
+    /// This is the half of the bound that is easy to get wrong: capping what is kept is
+    /// trivial, keeping `total_found` and the per-facet totals *exact* while doing it is the
+    /// requirement (#19). The counters are incremented per match during the walk and only
+    /// ever read after the threads join, so they are independent of what the heap retained.
+    #[test]
+    fn content_counts_stay_exact_totals_past_the_retention_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = write_retention_fixture(dir.path());
+        assert!(
+            expected > 500,
+            "fixture must exceed MAX_RETAINED or the bound is untested ({expected})"
+        );
+
+        let result = search_content_raw("needle", dir.path(), None).unwrap();
+
+        assert_eq!(
+            result.total_found, expected,
+            "total_found must be the true count, not the retained count"
+        );
+        assert_eq!(result.usages, expected, "usages must be the true count");
+        assert_eq!(result.definitions, 0, "content search has no definitions");
+        // Content search can only populate `tests` and `usages_cross`; every match here is a
+        // plain usage, so the whole total lands in the latter.
+        assert_eq!(result.facet_totals.usages_cross, expected);
+        assert_eq!(result.facet_totals.tests, 0);
+        assert_eq!(result.facet_totals.definitions, 0);
+        assert_eq!(result.facet_totals.usages_local, 0);
+        // And the retained set must actually have been capped, or none of the above is a test
+        // of the bound.
+        assert!(
+            result.matches.len() <= 10,
+            "display cap should still apply: {}",
+            result.matches.len()
+        );
+
+        // The bound must keep the *best* candidates, not merely some bounded set. The shallow
+        // tier alone exceeds MAX_RETAINED and outscores the deep tier on `scope_proximity`, so
+        // nothing from the deep tier can reach the page. Inverting the heap's ordering fails
+        // here and nowhere else.
+        assert!(
+            result.matches.len() >= 5,
+            "expected a full page to judge selection on"
+        );
+        for m in &result.matches {
+            let p = m.path.to_string_lossy().replace('\\', "/");
+            assert!(
+                !p.contains("/a/b/c/"),
+                "a deep, lower-scoring match reached the page — the bound is keeping the \
+                 wrong candidates: {p}"
+            );
+        }
+    }
+
+    /// Bounding retention must not reintroduce the nondeterminism four PRs removed.
+    ///
+    /// The heap holds the best `MAX_RETAINED` by a total-ordered, time-independent key, so
+    /// neither thread arrival order nor the wall clock can change which matches survive.
+    #[test]
+    fn content_output_is_byte_identical_across_runs_past_the_retention_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        write_retention_fixture(dir.path());
+        let cache = OutlineCache::new();
+
+        let runs: Vec<String> = (0..6)
+            .map(|_| search_content("needle", dir.path(), &cache, None).unwrap())
+            .collect();
+
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "content search rendered {} distinct outputs in 6 runs over a fixture past the              retention bound",
+            runs.iter().collect::<HashSet<_>>().len()
+        );
+    }
+
     /// Files in the glob fixture below: 10 directories of 40 files, all matching.
     ///
     /// `MAX_FILES` is 20, so a fixture of 25 files would be "past the cap" — and would
