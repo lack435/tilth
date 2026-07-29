@@ -738,6 +738,56 @@ mod tests {
         );
     }
 
+    /// Both halves of #17, driven through the function that actually produces the buckets.
+    ///
+    /// The unit tests in `read::imports` stop at resolution; the acceptance criteria are
+    /// phrased in terms of `uses_local` / `uses_external`, and reaching those also runs
+    /// `is_valid_module_path` and `is_stdlib`, which no other #17 test exercises.
+    ///
+    /// Two independent bugs, one fixture, because they compound: `Main.cpp` sits at the
+    /// scope root — so the include-root walk had no ancestor inside the root to find
+    /// `include/` from — *and* spells its includes with a space after the `#`, which meant
+    /// no consumer saw them as includes at all. Before the fix this file reported
+    /// `0 local, 0 external`: both dependencies gone, in neither bucket, with no warning.
+    #[test]
+    fn cpp_spaced_includes_at_the_scope_root_reach_the_right_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("include/lib")).unwrap();
+        std::fs::write(root.join("include/lib/db.h"), "struct DB { int V; };\n").unwrap();
+        std::fs::write(
+            root.join("Main.cpp"),
+            "#  include \"lib/db.h\"\n# include <vector>\nint main() { return 0; }\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("Main.cpp"), root, &bloom).unwrap();
+
+        assert!(
+            result.uses_local.iter().any(|d| d.path.ends_with("db.h")),
+            "a file at the scope root must reach its own include/ sibling, got {:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result.uses_external,
+            vec!["vector".to_string()],
+            "the spaced angle include must still bucket as external"
+        );
+        // The header must not be double-counted: resolving locally excludes it from the
+        // external bucket, and a regression that broke only the walk would show up here as
+        // `lib/db.h` appearing alongside `vector`.
+        assert!(
+            !result.uses_external.iter().any(|e| e.contains("db.h")),
+            "a resolved include must not also appear as external: {:?}",
+            result.uses_external
+        );
+    }
+
     /// A quoted include that does not resolve on disk used to vanish from both lists:
     /// not a system header, so not "external", and unresolvable, so not "local". Any
     /// project whose headers sit behind a build-system include path — most non-trivial

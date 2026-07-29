@@ -1071,7 +1071,7 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
     }
 
     // C/C++: #include "file.h" or #include <header>
-    if let Some(rest) = trimmed.strip_prefix("#include") {
+    if let Some(rest) = c_include_directive_rest(trimmed) {
         return c_include_header_name(rest);
     }
 
@@ -1082,6 +1082,29 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .last()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// The text following a C/C++ `#include` directive, or `None` when the line is not one.
+///
+/// Whitespace is legal between the `#` and the directive name — `# include "X.h"`, and
+/// equally `#\tinclude` — and is not rare in older codebases. Requiring `#include` as a
+/// single token meant such a line was not treated as an import by *any* consumer: it
+/// contributed to neither `uses_local` nor `uses_external` and vanished from `tilth_deps`
+/// with no warning.
+///
+/// Detection (`read::imports::is_import_line`) and extraction (`extract_import_source`)
+/// both route through here so they cannot disagree about which lines are includes. That
+/// they were separate judgements is exactly how the trailing-comment bug managed to drop
+/// includes silently: one function said "import", the other produced a name that resolved
+/// to nothing, and the line fell between the two buckets.
+///
+/// `#include_next` is left for `c_include_header_name` to strip, so the returned text is
+/// everything after `include` either way.
+pub(crate) fn c_include_directive_rest(line: &str) -> Option<&str> {
+    line.trim_start()
+        .strip_prefix('#')?
+        .trim_start()
+        .strip_prefix("include")
 }
 
 /// The delimited header name in the text following `#include`, delimiters kept.
@@ -1106,16 +1129,18 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
 /// and the include took the pass-through path below and was dropped exactly as a trailing
 /// comment used to be.
 ///
-/// `#include_next` — real in glibc and gcc system headers — is accepted too. `is_import_line`
-/// matches on `#include` alone, so it arrives here regardless; recognising it costs one
-/// `strip_prefix` and the alternative is silently discarding it.
+/// `#include_next` — real in glibc and gcc system headers — is accepted too.
+/// `c_include_directive_rest` matches on `include` alone, so it arrives here regardless;
+/// recognising it costs one `strip_prefix` and the alternative is silently discarding it.
 ///
 /// Text that still does not begin with a delimiter is returned trimmed and unchanged. An
 /// `#include SOME_MACRO` has no header name to find and inventing one would be worse. Note
 /// what happens to such a value downstream, because it is not obvious: `is_external` sees no
-/// leading quote and routes it to the external bucket, where `is_valid_module_path` then
-/// rejects it — so it is dropped, not surfaced. Passing it through is honest about having
-/// no answer, but it is not the same as reporting it.
+/// leading quote and routes it to the external bucket, where `is_valid_module_path` accepts
+/// it — no space, alphanumeric first character — so `tilth_deps` reports the macro *name* as
+/// an external dependency. Passing the text through is honest about having no answer, but
+/// the result is a bogus-looking entry rather than a dropped one. Verified, not assumed:
+/// `#include SOME_MACRO` renders as `SOME_MACRO` under `## Uses (external)`.
 fn c_include_header_name(after_include: &str) -> String {
     // `#include_next "x.h"` arrives as `_next "x.h"`.
     let rest = after_include.strip_prefix("_next").unwrap_or(after_include);
@@ -1272,6 +1297,42 @@ mod c_include_tests {
             extract_import_source("#include_next <stdio.h>", Some(Lang::Cpp)),
             "<stdio.h>"
         );
+    }
+
+    /// Whitespace between the `#` and the directive name is legal C and habitual in some
+    /// older codebases. Requiring `#include` as a single token meant such a line was not an
+    /// include to *any* consumer — it reached neither `uses_local` nor `uses_external` and
+    /// disappeared from `tilth_deps` with no warning.
+    #[test]
+    fn whitespace_after_the_hash_is_allowed() {
+        for line in [
+            "# include \"Widget.h\"",
+            "#  include \"Widget.h\"",
+            "#\tinclude \"Widget.h\"",
+            "  # include \"Widget.h\" // note",
+        ] {
+            assert_eq!(
+                extract_import_source(line, Some(Lang::Cpp)),
+                "\"Widget.h\"",
+                "line: {line}"
+            );
+        }
+        assert_eq!(
+            extract_import_source("# include_next <stdio.h>", Some(Lang::Cpp)),
+            "<stdio.h>"
+        );
+    }
+
+    /// The `#` alone is not enough — other directives must not be mistaken for includes and
+    /// routed to `c_include_header_name`, which would hand back a bogus header name.
+    #[test]
+    fn other_preprocessor_directives_are_not_includes() {
+        for line in ["#pragma once", "# define INCLUDE_GUARD 1", "#ifndef X_H"] {
+            assert!(
+                super::c_include_directive_rest(line).is_none(),
+                "must not be read as an include: {line}"
+            );
+        }
     }
 
     /// A non-ASCII header name must not panic the byte slicing in `c_include_header_name`.

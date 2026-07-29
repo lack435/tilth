@@ -97,7 +97,9 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
         }
         Lang::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
         Lang::Go | Lang::Java | Lang::Scala | Lang::Kotlin => trimmed.starts_with("import "),
-        Lang::C | Lang::Cpp => trimmed.starts_with("#include"),
+        // Shares its judgement with `extract_import_source` so the two cannot disagree
+        // about which lines are includes — see `c_include_directive_rest`.
+        Lang::C | Lang::Cpp => crate::lang::outline::c_include_directive_rest(trimmed).is_some(),
         Lang::Elixir => {
             trimmed.starts_with("alias ")
                 || trimmed.starts_with("import ")
@@ -292,11 +294,14 @@ fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
 /// fixture, 310 resolve at one hop and 7 at two, none beyond. `Source/<Module>/A/B/C.h`
 /// including `A/Other.h` — the deepest layout worth supporting — is three. Every hop
 /// past that buys nothing measurable and only widens the surface for a wrong match.
+///
+/// Counts *ancestors*. The walk also tests the including directory itself, at hop 0, which
+/// is what lets a file reach an `include/` sitting beside it rather than above it.
 const MAX_INCLUDE_ROOT_HOPS: usize = 4;
 
-/// Conventional include-root directory names, tried as *siblings* at each ancestor.
+/// Conventional include-root directory names, tried as *siblings* at each level of the walk.
 ///
-/// The ancestor walk alone only finds roots that are ancestors of the including file.
+/// The upward walk alone only finds roots that are ancestors of the including file.
 /// The canonical C++ layout puts the root beside the sources instead — `include/leveldb/db.h`
 /// included from `db/db_impl.cc` — which is `-Iinclude` to a compiler and invisible to a
 /// pure upward walk. These two names cover that layout; anything more exotic needs real
@@ -362,10 +367,17 @@ fn resolve_c_include(dir: &Path, source: &str, boundary: Option<&Path>) -> Optio
         None => enclosing_repo_root(dir)?,
     };
 
+    // Hop 0 is the including directory itself, so that a file gets its *own* `include/`
+    // sibling tried. Testing only ancestors meant a translation unit sitting directly at
+    // the containment root could never reach `<root>/include/…` — there is no ancestor
+    // left to hang the sibling off. That is an ordinary case since the declared scope
+    // became a containment root, not an edge one.
+    //
+    // The cost is that hop 0 re-tests `dir.join(clean)`, which the direct check above
+    // already covered: one extra stat on a path known not to be a file.
     let mut base = dir;
-    for _ in 0..MAX_INCLUDE_ROOT_HOPS {
-        let Some(parent) = base.parent() else { break };
-        for candidate in candidates_at(parent, clean) {
+    for _ in 0..=MAX_INCLUDE_ROOT_HOPS {
+        for candidate in candidates_at(base, clean) {
             let normalized = normalize_path(&candidate);
             if normalized.is_file() && is_within(&normalized, &root) {
                 return Some(normalized);
@@ -374,6 +386,7 @@ fn resolve_c_include(dir: &Path, source: &str, boundary: Option<&Path>) -> Optio
         if base == root {
             break;
         }
+        let Some(parent) = base.parent() else { break };
         base = parent;
     }
     None
@@ -394,13 +407,13 @@ fn is_within(candidate: &Path, root: &Path) -> bool {
     }
 }
 
-/// The include-root candidates to try at `parent`: the root itself, then the
-/// conventional sibling roots (see `CONVENTIONAL_INCLUDE_ROOTS`).
-fn candidates_at(parent: &Path, clean: &str) -> Vec<PathBuf> {
+/// The include-root candidates to try at `base`: `base` itself, then the conventional
+/// sibling roots beneath it (see `CONVENTIONAL_INCLUDE_ROOTS`).
+fn candidates_at(base: &Path, clean: &str) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(1 + CONVENTIONAL_INCLUDE_ROOTS.len());
-    out.push(parent.join(clean));
+    out.push(base.join(clean));
     for root in CONVENTIONAL_INCLUDE_ROOTS {
-        out.push(parent.join(root).join(clean));
+        out.push(base.join(root).join(clean));
     }
     out
 }
@@ -797,6 +810,128 @@ mod tests {
         let got = resolve_c_include(&root.join("wt/src"), "\"lib/db.h\"", None)
             .expect("a .git file must still establish the root");
         assert_eq!(got, root.join("wt/include/lib/db.h"));
+    }
+
+    /// A file sitting directly at the containment root must still get its *own* `include/`
+    /// sibling tried. Candidates were only ever tested at ancestors, so `<root>/main.cpp`
+    /// including `"lib/db.h"` never reached `<root>/include/lib/db.h` — there is no ancestor
+    /// left inside the root to hang the sibling off, and the include bucketed as external.
+    ///
+    /// The tell was that moving the same file down one level made it resolve, which
+    /// `c_include_resolves_against_a_sibling_include_directory` covers. Both spellings of
+    /// the same layout are asserted here so the asymmetry cannot come back.
+    ///
+    /// Reachable as an ordinary case since the declared scope became a containment root: a
+    /// translation unit at the scope root is now normal, not exotic.
+    #[test]
+    fn c_include_resolves_its_own_include_sibling_at_the_scope_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("include/lib")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("include/lib/db.h"), "struct DB {};\n").unwrap();
+        // Deliberately no `.git`: the declared scope is what bounds the walk.
+        assert!(
+            enclosing_repo_root(root).is_none(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+        let scope = root.canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_c_include(root, "\"lib/db.h\"", Some(&scope)),
+            Some(root.join("include/lib/db.h")),
+            "a file at the scope root must try the include/ beside it"
+        );
+        assert_eq!(
+            resolve_c_include(&root.join("src"), "\"lib/db.h\"", Some(&scope)),
+            Some(root.join("include/lib/db.h")),
+            "the ancestor spelling of the same layout must still resolve"
+        );
+    }
+
+    /// `# include "X.h"` — legal C, and not rare in older codebases — was not treated as an
+    /// import by any consumer, because detection required `#include` as a single token. It
+    /// contributed to neither `uses_local` nor `uses_external`: a silently dropped
+    /// dependency, the same failure mode as the trailing-comment bug.
+    #[test]
+    fn spaced_include_is_detected_and_lands_in_the_right_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Widget.h"), "struct W {};\n").unwrap();
+        let main = root.join("main.cpp");
+        let content = "#  include \"Widget.h\"\n\
+                       # include <vector>\n\
+                       int main() { return 0; }\n";
+        fs::write(&main, content).unwrap();
+
+        assert_eq!(
+            resolve_local_imports(&main, content, None),
+            vec![root.join("Widget.h")],
+            "the spaced quoted include must resolve as a local dependency"
+        );
+        // The system header is detected too, and its delimiter survives extraction — which
+        // is the only thing that keeps it out of the local bucket. Asserted on the fixture's
+        // own line rather than on a literal, so reverting the fix fails this half as well.
+        let vector_line = content.lines().nth(1).expect("fixture has a second line");
+        assert!(is_import_line(vector_line, Lang::Cpp), "{vector_line}");
+        let source = crate::lang::outline::extract_import_source(vector_line, Some(Lang::Cpp));
+        assert_eq!(source, "<vector>");
+        assert!(is_external(&source, Lang::Cpp));
+    }
+
+    /// `is_import_line` and `extract_import_source` are separate judgements, and a mismatch
+    /// between them is precisely how an include gets dropped with no warning: one says
+    /// "import", the other yields a name that resolves to nothing and carries no delimiter,
+    /// so the line lands in neither the local nor the external bucket. #10's trailing-comment
+    /// bug worked exactly that way. Pin that they agree on every form either accepts.
+    #[test]
+    fn c_include_detection_and_extraction_agree() {
+        use crate::lang::outline::extract_import_source;
+
+        // `None` means "not an include line at all".
+        let cases: &[(&str, Option<&str>)] = &[
+            ("#include \"X.h\"", Some("\"X.h\"")),
+            ("# include \"X.h\"", Some("\"X.h\"")),
+            ("#  include \"X.h\"", Some("\"X.h\"")),
+            ("#\tinclude \"X.h\"", Some("\"X.h\"")),
+            ("   # include \"X.h\"", Some("\"X.h\"")),
+            ("#include\"X.h\"", Some("\"X.h\"")),
+            ("#include \"X.h\" // note", Some("\"X.h\"")),
+            ("#include /* why */ \"X.h\"", Some("\"X.h\"")),
+            ("  #include <vector>", Some("<vector>")),
+            ("# include <vector> // std", Some("<vector>")),
+            ("#include_next <stdio.h>", Some("<stdio.h>")),
+            ("# include_next \"limits.h\"", Some("\"limits.h\"")),
+            ("#pragma once", None),
+            ("# define INCLUDE_GUARD 1", None),
+            ("#ifndef X_H", None),
+            ("// #include \"X.h\"", None),
+            ("int x = 0;", None),
+        ];
+
+        for (line, want) in cases {
+            assert_eq!(
+                is_import_line(line, Lang::Cpp),
+                want.is_some(),
+                "detection is wrong for: {line}"
+            );
+            let Some(header) = want else {
+                // Extraction is only ever reached *through* detection, so its output for a
+                // non-include line is unconstrained — the generic fallback would hand back
+                // `"X.h"` for the commented-out row above. Detection saying no is the whole
+                // guard, and that is what is asserted.
+                continue;
+            };
+            let source = extract_import_source(line, Some(Lang::Cpp));
+            assert_eq!(&source, header, "extraction is wrong for: {line}");
+            // The delimiter has to survive extraction, because it is the only thing
+            // `is_external` uses to tell a system header from a project-relative one.
+            assert_eq!(
+                is_external(&source, Lang::Cpp),
+                header.starts_with('<'),
+                "bucketed wrongly: {line}"
+            );
+        }
     }
 
     #[test]
