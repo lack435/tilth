@@ -121,6 +121,15 @@ pub fn analyze_deps(
 
     // ── Phase 2: Forward dependencies ────────────────────────────────────────
 
+    // The C/C++ include-root boundary, computed exactly once.
+    //
+    // Both halves of Phase 2 ask "does this include resolve?" — the local bucket below via
+    // `resolve_local_imports`, the external bucket via `resolve_import_to_file` — and they
+    // must get the same answer. Computing it separately in each place left the invariant
+    // resting on a comment: desynchronising them puts an include in both buckets or, worse,
+    // in neither, which is the silent-loss bug this whole path exists to avoid.
+    let boundary = crate::read::imports::canonical_boundary(Some(scope));
+
     // Local deps via callee resolution
     let callee_names = extract_callee_names(&content, lang, None);
     let resolved = resolve_callees(&callee_names, path, &content, bloom);
@@ -142,7 +151,7 @@ pub fn analyze_deps(
     // hint, and truncating here loses dependencies outright — an import that resolves is
     // excluded from the external bucket below, so one dropped by a cap would appear in
     // neither list. A C++ translation unit with more than 8 project includes is ordinary.
-    let import_files = resolve_local_imports(path, &content);
+    let import_files = resolve_local_imports(path, &content, boundary.as_deref());
     for import_path in import_files {
         local_by_file.entry(import_path).or_default();
     }
@@ -186,7 +195,13 @@ pub fn analyze_deps(
         let unresolved_local = !external
             && matches!(lang, crate::types::Lang::C | crate::types::Lang::Cpp)
             && path.parent().is_none_or(|dir| {
-                crate::read::imports::resolve_import_to_file(dir, &source, lang).is_none()
+                crate::read::imports::resolve_import_to_file(
+                    dir,
+                    &source,
+                    lang,
+                    boundary.as_deref(),
+                )
+                .is_none()
             });
 
         if (!external && !unresolved_local) || is_stdlib(&source, lang) {
@@ -883,6 +898,234 @@ mod tests {
                 .iter()
                 .map(|d| (&d.path, &d.symbols))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A trailing comment on an `#include` must not delete the dependency.
+    ///
+    /// The header name used to be the whole rest of the line, so `#include "X.h" // note`
+    /// asked the filesystem for `X.h" // note`, which does not exist — and `is_external`
+    /// still saw the leading quote, so the include was neither local nor external. It
+    /// vanished, with nothing in the output to say a line had been skipped. Per-line, so a
+    /// file mixing commented and clean includes under-reported by exactly the commented
+    /// ones.
+    #[test]
+    fn cpp_include_with_a_trailing_comment_still_counts_as_a_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Sibling.h"), "#pragma once\nclass Sibling {};\n").unwrap();
+        std::fs::create_dir_all(root.join("Sub")).unwrap();
+        std::fs::write(
+            root.join("Sub/Nested.h"),
+            "#pragma once\nclass Nested {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Target.h"),
+            "#pragma once\n\
+             #include \"Sibling.h\" // line comment\n\
+             #include \"Sub/Nested.h\" /* block comment */\n\
+             #include <vector> // still a system header\n\
+             class Target {};\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("Target.h"), root, &bloom).unwrap();
+
+        let local: Vec<String> = result
+            .uses_local
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            local.contains(&"Sibling.h".to_string()) && local.contains(&"Nested.h".to_string()),
+            "both commented includes must resolve, got {local:?}"
+        );
+        assert!(
+            result.uses_external.iter().any(|e| e == "vector"),
+            "the commented system header must still be external, got {:?}",
+            result.uses_external
+        );
+    }
+
+    /// The include-root layout, end to end, in a tree that is not a git checkout.
+    ///
+    /// This is the shape that motivated include-root resolution: a module source root is an
+    /// include root, so a header in `<Module>/Character/` writes `"Character/Peer.h"` to
+    /// reach a sibling. Own-directory resolution turns that into
+    /// `Character/Character/Peer.h`, which does not exist, and the dependency bucketed as
+    /// external. Resolution was gated on finding `.git`, so it also did nothing at all
+    /// outside a repository even though the caller had named a scope.
+    #[test]
+    fn cpp_include_root_relative_deps_resolve_under_a_declared_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("Source").join("TheGame");
+        for d in ["Character", "Camera"] {
+            std::fs::create_dir_all(module.join(d)).unwrap();
+        }
+        // Deliberately no `.git`.
+        std::fs::write(
+            module.join("Character/PawnComponent.h"),
+            "#pragma once\nclass UPawnComponent {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Camera/CameraMode.h"),
+            "#pragma once\nclass UCameraMode {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Character/HeroComponent.h"),
+            "#pragma once\n\
+             #include \"Character/PawnComponent.h\"\n\
+             #include \"Camera/CameraMode.h\"\n\
+             #include \"OutOfTree/TagContainer.h\"\n\
+             class UHeroComponent {};\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result =
+            analyze_deps(&module.join("Character/HeroComponent.h"), &module, &bloom).unwrap();
+
+        let local: Vec<String> = result
+            .uses_local
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            local.contains(&"PawnComponent.h".to_string()),
+            "a sibling reached via the include root must be local, got {local:?}"
+        );
+        assert!(
+            local.contains(&"CameraMode.h".to_string()),
+            "a peer directory reached via the include root must be local, got {local:?}"
+        );
+        assert!(
+            result
+                .uses_external
+                .iter()
+                .any(|e| e == "OutOfTree/TagContainer.h"),
+            "an include with no file in scope stays external, got {:?}",
+            result.uses_external
+        );
+    }
+
+    /// Every include lands in exactly one bucket, whatever the scope is.
+    ///
+    /// Phase 2 asks "does this include resolve?" twice — once to build `uses_local`, once to
+    /// decide `uses_external` — and the two must agree. While each computed its own
+    /// boundary, desynchronising them was a one-line edit that no test noticed: the include
+    /// then appeared in both lists, or in neither. "Neither" is the silent loss this whole
+    /// path exists to prevent, so the invariant is asserted directly rather than left to a
+    /// comment, and asserted across scopes that exercise both the declared-scope root and
+    /// the repository fallback.
+    #[test]
+    fn cpp_every_include_lands_in_exactly_one_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("proj/.git")).unwrap();
+        std::fs::create_dir_all(root.join("proj/Alpha")).unwrap();
+        std::fs::create_dir_all(root.join("proj/Gamma")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(
+            root.join("proj/Alpha/Beta.h"),
+            "#pragma once\nclass Beta {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("proj/Gamma/Delta.h"),
+            "#pragma once\n\
+             #include \"Alpha/Beta.h\"\n\
+             #include <vector>\n\
+             #include \"NotInTree/Absent.h\"\n\
+             class Delta {};\n",
+        )
+        .unwrap();
+
+        let target = root.join("proj/Gamma/Delta.h");
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        for scope in [
+            root.join("proj"),
+            root.join("elsewhere"),
+            root.to_path_buf(),
+        ] {
+            let result = analyze_deps(&target, &scope, &bloom).unwrap();
+
+            // `Alpha/Beta.h` resolves, so it belongs in local and must not also be external.
+            let in_local = result.uses_local.iter().any(|d| d.path.ends_with("Beta.h"));
+            let in_external = result.uses_external.iter().any(|e| e.contains("Beta.h"));
+            assert!(
+                in_local && !in_external,
+                "scope {}: expected exactly local, got local={in_local} external={in_external} \
+                 ({:?} / {:?})",
+                scope.display(),
+                result
+                    .uses_local
+                    .iter()
+                    .map(|d| &d.path)
+                    .collect::<Vec<_>>(),
+                result.uses_external
+            );
+
+            // The unresolvable one must still be reported, as external.
+            assert!(
+                result
+                    .uses_external
+                    .iter()
+                    .any(|e| e == "NotInTree/Absent.h"),
+                "scope {}: an include with no file anywhere must stay external, got {:?}",
+                scope.display(),
+                result.uses_external
+            );
+        }
+    }
+
+    /// The same invariant in a tree with no `.git`, which is where the two buckets can
+    /// actually diverge.
+    ///
+    /// With a repository present, a bucket that forgot the boundary still resolves via the
+    /// `.git` fallback and agrees by luck — so the git fixture above cannot detect the
+    /// desync at all (verified: it does not). Remove `.git` and the boundary becomes the
+    /// only thing that resolves an include-root-relative path, so a bucket computed without
+    /// it disagrees: the include lands in `uses_local` *and* `uses_external` at once.
+    #[test]
+    fn cpp_bucket_invariant_holds_in_a_tree_without_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        std::fs::create_dir_all(module.join("Alpha")).unwrap();
+        std::fs::create_dir_all(module.join("Gamma")).unwrap();
+        std::fs::write(
+            module.join("Alpha/Beta.h"),
+            "#pragma once\nclass Beta {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Gamma/Delta.h"),
+            "#pragma once\n#include \"Alpha/Beta.h\"\nclass Delta {};\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&module.join("Gamma/Delta.h"), &module, &bloom).unwrap();
+
+        let in_local = result.uses_local.iter().any(|d| d.path.ends_with("Beta.h"));
+        let in_external = result.uses_external.iter().any(|e| e.contains("Beta.h"));
+        assert!(
+            in_local,
+            "the include resolves under the declared scope, so it must be local: {:?}",
+            result
+                .uses_local
+                .iter()
+                .map(|d| &d.path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !in_external,
+            "it must not ALSO be external — that means the two buckets used different \
+             boundaries: {:?}",
+            result.uses_external
         );
     }
 

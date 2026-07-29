@@ -1072,7 +1072,7 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
 
     // C/C++: #include "file.h" or #include <header>
     if let Some(rest) = trimmed.strip_prefix("#include") {
-        return rest.trim().to_string(); // preserves quotes/angles for external detection
+        return c_include_header_name(rest);
     }
 
     // Go: `import "source"` — already handled above via "import"
@@ -1082,6 +1082,72 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .last()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// The delimited header name in the text following `#include`, delimiters kept.
+///
+/// Everything after the closing delimiter is discarded. That matters because it is
+/// legal — and in some codebases habitual — to comment an include:
+///
+/// ```text
+/// #include "Widget.h" // forward decls only
+/// ```
+///
+/// Returning the whole remainder made the header name `"Widget.h" // forward decls only`,
+/// which resolves to nothing on disk. `is_external` still saw a leading quote, so the
+/// include was neither local nor external and vanished from `tilth_deps` with no warning:
+/// a file whose every include carried a trailing comment reported no dependencies at all.
+///
+/// The `"…"` / `<…>` delimiters are preserved because `is_external` distinguishes a system
+/// header from a project-relative one by the opening delimiter.
+///
+/// A comment *before* the header name (`#include /* why */ "Widget.h"`) is skipped for the
+/// same reason: left in place it made the text start with `/`, which is neither delimiter,
+/// and the include took the pass-through path below and was dropped exactly as a trailing
+/// comment used to be.
+///
+/// `#include_next` — real in glibc and gcc system headers — is accepted too. `is_import_line`
+/// matches on `#include` alone, so it arrives here regardless; recognising it costs one
+/// `strip_prefix` and the alternative is silently discarding it.
+///
+/// Text that still does not begin with a delimiter is returned trimmed and unchanged. An
+/// `#include SOME_MACRO` has no header name to find and inventing one would be worse. Note
+/// what happens to such a value downstream, because it is not obvious: `is_external` sees no
+/// leading quote and routes it to the external bucket, where `is_valid_module_path` then
+/// rejects it — so it is dropped, not surfaced. Passing it through is honest about having
+/// no answer, but it is not the same as reporting it.
+fn c_include_header_name(after_include: &str) -> String {
+    // `#include_next "x.h"` arrives as `_next "x.h"`.
+    let rest = after_include.strip_prefix("_next").unwrap_or(after_include);
+    let rest = skip_leading_comments(rest.trim());
+    let close = match rest.chars().next() {
+        Some('"') => '"',
+        Some('<') => '>',
+        _ => return rest.to_string(),
+    };
+    match rest[1..].find(close) {
+        // +2: one for the opening delimiter, one to include the closing one. Both
+        // delimiters are single-byte ASCII and `find` searches within `rest[1..]`, so this
+        // always lands on a char boundary even for a non-ASCII header name.
+        Some(end) => rest[..end + 2].to_string(),
+        // Unterminated. Pass it through rather than inventing a boundary.
+        None => rest.to_string(),
+    }
+}
+
+/// Strip any `/* … */` comments at the start of `s`, plus the whitespace around them.
+///
+/// A `//` comment cannot precede the header name — everything after it is comment — so only
+/// the block form is worth handling. An unterminated block comment consumes the rest.
+fn skip_leading_comments(s: &str) -> &str {
+    let mut cur = s.trim_start();
+    while let Some(after_open) = cur.strip_prefix("/*") {
+        cur = match after_open.find("*/") {
+            Some(end) => after_open[end + 2..].trim_start(),
+            None => return "",
+        };
+    }
+    cur
 }
 
 /// Get structured outline entries for file content.
@@ -1101,6 +1167,124 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 
     let lines: Vec<&str> = content.lines().collect();
     walk_top_level(tree.root_node(), &lines, lang)
+}
+
+#[cfg(test)]
+mod c_include_tests {
+    use super::{c_include_header_name, extract_import_source};
+    use crate::types::Lang;
+
+    /// Everything after the closing delimiter must be discarded. Returning the whole
+    /// remainder of the line made a commented include's "path" include the comment, which
+    /// resolved to nothing on disk while `is_external` still saw a leading quote — so the
+    /// include landed in neither the local nor the external bucket and disappeared from
+    /// `tilth_deps` silently. A file whose every include carried a trailing comment
+    /// reported no dependencies at all.
+    #[test]
+    fn trailing_comment_is_not_part_of_the_header_name() {
+        for line in [
+            "#include \"Widget.h\" // forward decls only",
+            "#include \"Widget.h\" /* forward decls only */",
+            "#include \"Widget.h\"\t// tab-separated",
+            "#include \"Widget.h\"   ",
+            "#include\"Widget.h\"// no spaces anywhere",
+        ] {
+            assert_eq!(
+                extract_import_source(line, Some(Lang::Cpp)),
+                "\"Widget.h\"",
+                "line: {line}"
+            );
+        }
+    }
+
+    /// The delimiters are load-bearing: `is_external` tells a system header from a
+    /// project-relative one by the opening one.
+    #[test]
+    fn delimiters_are_preserved_for_both_forms() {
+        assert_eq!(
+            extract_import_source("#include <vector> // std", Some(Lang::Cpp)),
+            "<vector>"
+        );
+        assert_eq!(
+            extract_import_source("#include \"a/b.h\"", Some(Lang::Cpp)),
+            "\"a/b.h\""
+        );
+    }
+
+    /// A comment character inside the header name is part of the path, not a comment.
+    #[test]
+    fn slashes_inside_the_delimiters_survive() {
+        assert_eq!(
+            extract_import_source("#include \"a/b/c.h\" // note", Some(Lang::Cpp)),
+            "\"a/b/c.h\""
+        );
+    }
+
+    /// No delimiter and no close: pass through rather than invent a boundary. An
+    /// `#include SOME_MACRO` has no header name, and an unterminated one is a broken file.
+    #[test]
+    fn undelimited_and_unterminated_forms_pass_through() {
+        assert_eq!(c_include_header_name(" SOME_MACRO"), "SOME_MACRO");
+        assert_eq!(
+            c_include_header_name(" \"unterminated.h"),
+            "\"unterminated.h"
+        );
+        assert_eq!(c_include_header_name(" <unterminated.h"), "<unterminated.h");
+        assert_eq!(c_include_header_name(""), "");
+    }
+
+    /// A comment before the header name took the pass-through path — the text started with
+    /// `/`, not a delimiter — and was dropped exactly as a trailing comment used to be.
+    #[test]
+    fn comment_before_the_header_name_is_skipped() {
+        for line in [
+            "#include /* why */ \"Widget.h\"",
+            "#include /*a*/ /*b*/ \"Widget.h\" // and after",
+            "#include/*tight*/\"Widget.h\"",
+        ] {
+            assert_eq!(
+                extract_import_source(line, Some(Lang::Cpp)),
+                "\"Widget.h\"",
+                "line: {line}"
+            );
+        }
+        assert_eq!(
+            extract_import_source("#include /* why */ <vector>", Some(Lang::Cpp)),
+            "<vector>"
+        );
+        // An unterminated block comment swallows the line rather than yielding a bogus name.
+        assert_eq!(
+            extract_import_source("#include /* never closed", Some(Lang::Cpp)),
+            ""
+        );
+    }
+
+    /// `#include_next` reaches this code because `is_import_line` matches on `#include`
+    /// alone. It is a real directive in glibc and gcc headers; recognising it beats
+    /// silently discarding it.
+    #[test]
+    fn include_next_is_recognised() {
+        assert_eq!(
+            extract_import_source("#include_next \"limits.h\" // chain", Some(Lang::Cpp)),
+            "\"limits.h\""
+        );
+        assert_eq!(
+            extract_import_source("#include_next <stdio.h>", Some(Lang::Cpp)),
+            "<stdio.h>"
+        );
+    }
+
+    /// A non-ASCII header name must not panic the byte slicing in `c_include_header_name`.
+    #[test]
+    fn non_ascii_header_names_do_not_panic() {
+        for (line, want) in [
+            ("#include \"café.h\" // note", "\"café.h\""),
+            ("#include <café世界.h>", "<café世界.h>"),
+            ("#include \"😀/😀.h\"", "\"😀/😀.h\""),
+        ] {
+            assert_eq!(extract_import_source(line, Some(Lang::Cpp)), want);
+        }
+    }
 }
 
 #[cfg(test)]

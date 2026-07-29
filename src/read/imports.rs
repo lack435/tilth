@@ -24,8 +24,15 @@ pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
 /// a short list is the point. Callers that need the *complete* set (dependency analysis)
 /// must use `resolve_local_imports`; truncating there loses dependencies entirely, since
 /// an import that resolved is also excluded from the external bucket.
+///
+/// Passes no boundary, so C/C++ include-root resolution here still depends on finding a
+/// `.git` ancestor. A read has no declared scope to use instead. The consequence is
+/// narrow and known: in a non-git tree the post-read "Related:" hint, and the callee
+/// resolution in `search::callees`, miss include-root-relative headers that `tilth_deps`
+/// now finds. deps still lists the file — the import-based merge registers it — just
+/// without per-symbol detail. Fixing it means threading a scope through both call paths.
 pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf> {
-    let mut resolved = resolve_local_imports(file_path, content);
+    let mut resolved = resolve_local_imports(file_path, content, None);
     resolved.truncate(MAX_SUGGESTIONS);
     resolved
 }
@@ -36,7 +43,18 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 /// analysis needs all of them: it classifies an import as external only when it does
 /// *not* resolve, so an import dropped by a cap here would appear in neither the local
 /// nor the external list and vanish from the report.
-pub(crate) fn resolve_local_imports(file_path: &Path, content: &str) -> Vec<PathBuf> {
+///
+/// `boundary` is the caller's declared search scope, used to confine C/C++ include-root
+/// resolution. It must already be canonical — build it with `canonical_boundary` — because
+/// a caller that also classifies non-resolving imports has to ask the *same* question here
+/// and there. `search::deps` does exactly that, and an include that resolves under one
+/// boundary but not the other lands in both of its buckets or in neither. Pass `None` when
+/// there is no scope; see `resolve_c_include`.
+pub(crate) fn resolve_local_imports(
+    file_path: &Path,
+    content: &str,
+    boundary: Option<&Path>,
+) -> Vec<PathBuf> {
     let FileType::Code(lang) = detect_file_type(file_path) else {
         return Vec::new();
     };
@@ -54,13 +72,20 @@ pub(crate) fn resolve_local_imports(file_path: &Path, content: &str) -> Vec<Path
         if source.is_empty() || is_external(&source, lang) {
             continue;
         }
-        if let Some(path) = resolve_import_to_file(dir, &source, lang) {
+        if let Some(path) = resolve_import_to_file(dir, &source, lang, boundary) {
             if !results.contains(&path) {
                 results.push(path);
             }
         }
     }
     results
+}
+
+/// Canonicalize a declared scope so it can be compared against canonicalized candidate
+/// paths. A scope that does not exist yields `None`, which falls resolution back to the
+/// enclosing repository.
+pub(crate) fn canonical_boundary(boundary: Option<&Path>) -> Option<PathBuf> {
+    boundary.and_then(|b| b.canonicalize().ok())
 }
 
 pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
@@ -108,12 +133,17 @@ pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
 /// Resolve an import source to an existing file on disk, or `None` when it does not
 /// name one. Shared with `search::deps`, which needs to distinguish "resolved to a
 /// local file" from "names something we cannot see" rather than only collecting hits.
-pub(crate) fn resolve_import_to_file(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
+pub(crate) fn resolve_import_to_file(
+    dir: &Path,
+    source: &str,
+    lang: Lang,
+    boundary: Option<&Path>,
+) -> Option<PathBuf> {
     let raw = match lang {
         Lang::Rust => resolve_rust(dir, source),
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => resolve_js(dir, source),
         Lang::Python => resolve_python(dir, source),
-        Lang::C | Lang::Cpp => resolve_c_include(dir, source),
+        Lang::C | Lang::Cpp => resolve_c_include(dir, source, boundary),
         Lang::Bash => resolve_bash(dir, source),
         // Elixir, Go, Java, etc. — module-to-file mapping requires build system conventions.
         _ => None,
@@ -292,11 +322,27 @@ const CONVENTIONAL_INCLUDE_ROOTS: &[&str] = &["include", "inc"];
 /// project, and walking up for it is how you match an unrelated same-named file several
 /// directories away. Requiring a separator keeps the guess specific.
 ///
-/// The walk is confined to the enclosing repository: it only runs when a `.git` ancestor
-/// is found, and every candidate must normalise to a path inside that repository. Without
-/// those two conditions a `..` in the include, or a tree with no `.git` at all, would let
-/// resolution reach files outside the project entirely.
-fn resolve_c_include(dir: &Path, source: &str) -> Option<PathBuf> {
+/// The walk is confined to a containment root, and every candidate must normalise to a
+/// path inside it. Without that, a `..` in the include could let resolution reach files
+/// outside the project entirely.
+///
+/// Two things can supply that root, and it matters that they *compose* rather than one
+/// replacing the other:
+///
+///   * `boundary` — the caller's declared search scope. Requiring `.git` was once the only
+///     rule, and it meant include-root resolution did nothing whatsoever in a tree that is
+///     not a git checkout: every project-relative include silently bucketed as external.
+///     A caller that named a scope has already stated the boundary.
+///   * the enclosing `.git` repository, derived from the *including file*.
+///
+/// The scope wins only when it actually contains the file. A declared scope is not
+/// guaranteed to be related to the file being analysed — `tilth_deps` with an absolute
+/// `path` and no `scope` resolves the scope to the server's process cwd, which may be a
+/// different checkout entirely — and letting an unrelated root win rejected every
+/// candidate and silently reclassified real local includes as external. That was a
+/// regression against the `.git`-only rule, which at least always derived its root from
+/// the file. So: the scope when it contains the file, the repository otherwise.
+fn resolve_c_include(dir: &Path, source: &str, boundary: Option<&Path>) -> Option<PathBuf> {
     let clean = source.trim_matches('"');
 
     // The standard `""` search: relative to the including file. This is also the only
@@ -311,26 +357,41 @@ fn resolve_c_include(dir: &Path, source: &str) -> Option<PathBuf> {
         return None;
     }
 
-    // Confine the search to the enclosing repository. This replaces an earlier
-    // "stop when you see `.git`" break, which still tested one directory beyond the
-    // root and did nothing at all in a tree without `.git`.
-    let repo_root = enclosing_repo_root(dir)?;
+    let root = match boundary.filter(|b| is_within(dir, b)) {
+        Some(b) => b.to_path_buf(),
+        None => enclosing_repo_root(dir)?,
+    };
 
     let mut base = dir;
     for _ in 0..MAX_INCLUDE_ROOT_HOPS {
         let Some(parent) = base.parent() else { break };
         for candidate in candidates_at(parent, clean) {
             let normalized = normalize_path(&candidate);
-            if normalized.starts_with(&repo_root) && normalized.is_file() {
+            if normalized.is_file() && is_within(&normalized, &root) {
                 return Some(normalized);
             }
         }
-        if base == repo_root {
+        if base == root {
             break;
         }
         base = parent;
     }
     None
+}
+
+/// Is `candidate` inside `root`?
+///
+/// Compared in canonical form. A lexical `starts_with` is only correct when both paths are
+/// spelled the same way, and they need not be: `boundary` is canonicalized so it can be
+/// compared at all, while `candidate` inherits the caller's spelling of the including
+/// file's path. On Windows that is the difference between `C:\x` and `\\?\C:\x`, which
+/// compares as "outside" and silently refuses every resolution. Falls back to the lexical
+/// test if either path cannot be canonicalized.
+fn is_within(candidate: &Path, root: &Path) -> bool {
+    match (candidate.canonicalize(), root.canonicalize()) {
+        (Ok(c), Ok(r)) => c.starts_with(&r),
+        _ => candidate.starts_with(root),
+    }
 }
 
 /// The include-root candidates to try at `parent`: the root itself, then the
@@ -445,10 +506,11 @@ mod tests {
         fs::create_dir_all(root.join("a/c")).unwrap();
         fs::write(root.join("a/b/target.ts"), "").unwrap();
 
-        let from_sibling = resolve_import_to_file(&root.join("a/b"), "./target", Lang::TypeScript)
-            .expect("sibling");
+        let from_sibling =
+            resolve_import_to_file(&root.join("a/b"), "./target", Lang::TypeScript, None)
+                .expect("sibling");
         let from_cousin =
-            resolve_import_to_file(&root.join("a/c"), "../b/target", Lang::TypeScript)
+            resolve_import_to_file(&root.join("a/c"), "../b/target", Lang::TypeScript, None)
                 .expect("cousin");
 
         assert_eq!(
@@ -474,7 +536,7 @@ mod tests {
 
         // Included from include/lib/env.h as "lib/status.h" — one hop up.
         let from = root.join("include/lib");
-        let got = resolve_c_include(&from, "\"lib/status.h\"").expect("should resolve");
+        let got = resolve_c_include(&from, "\"lib/status.h\"", None).expect("should resolve");
         assert_eq!(got, root.join("include/lib/status.h"));
     }
 
@@ -488,7 +550,7 @@ mod tests {
         fs::write(root.join("a/b/a/x.h"), "// near\n").unwrap();
         fs::write(root.join("a/x.h"), "// far\n").unwrap();
 
-        let got = resolve_c_include(&root.join("a/b"), "\"a/x.h\"").expect("resolves");
+        let got = resolve_c_include(&root.join("a/b"), "\"a/x.h\"", None).expect("resolves");
         assert_eq!(got, root.join("a/b/a/x.h"), "nearest match must win");
     }
 
@@ -503,7 +565,7 @@ mod tests {
         fs::write(root.join("config.h"), "// unrelated\n").unwrap();
 
         assert!(
-            resolve_c_include(&root.join("deep/nested"), "\"config.h\"").is_none(),
+            resolve_c_include(&root.join("deep/nested"), "\"config.h\"", None).is_none(),
             "a bare filename must not resolve to a same-named file up the tree"
         );
     }
@@ -521,7 +583,7 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("include/lib/db.h"), "struct DB {};\n").unwrap();
 
-        let got = resolve_c_include(&root.join("src"), "\"lib/db.h\"").expect("resolves");
+        let got = resolve_c_include(&root.join("src"), "\"lib/db.h\"", None).expect("resolves");
         assert_eq!(got, root.join("include/lib/db.h"));
     }
 
@@ -544,13 +606,13 @@ mod tests {
         fs::write(root.join("shared.h"), "// wrong target\n").unwrap();
 
         assert!(
-            resolve_c_include(&root.join("a/b"), "\"../shared.h\"").is_none(),
+            resolve_c_include(&root.join("a/b"), "\"../shared.h\"", None).is_none(),
             "a `..` include must not be re-anchored onto an ancestor"
         );
 
         // With the file where the include actually points, the direct check finds it.
         fs::write(root.join("a/shared.h"), "// right target\n").unwrap();
-        let got = resolve_c_include(&root.join("a/b"), "\"../shared.h\"").expect("resolves");
+        let got = resolve_c_include(&root.join("a/b"), "\"../shared.h\"", None).expect("resolves");
         assert_eq!(normalize_path(&got), root.join("a/shared.h"));
     }
 
@@ -565,7 +627,7 @@ mod tests {
         fs::write(root.join("cfg.h"), "// unrelated\n").unwrap();
 
         assert!(
-            resolve_c_include(&root.join("a/b"), "\"./cfg.h\"").is_none(),
+            resolve_c_include(&root.join("a/b"), "\"./cfg.h\"", None).is_none(),
             "./name is a bare filename and must not trigger the walk"
         );
     }
@@ -583,8 +645,108 @@ mod tests {
         fs::write(root.join("x/leak.h"), "// outside proj\n").unwrap();
 
         assert!(
-            resolve_c_include(&root.join("proj/a/b"), "\"x/leak.h\"").is_none(),
+            resolve_c_include(&root.join("proj/a/b"), "\"x/leak.h\"", None).is_none(),
             "without a .git bound the walk must not run"
+        );
+    }
+
+    /// A declared scope is the containment boundary, and it does not need to be a git
+    /// checkout. Requiring `.git` meant include-root resolution did nothing at all in a
+    /// tree that is not a repository: every project-relative include silently bucketed as
+    /// external, even when the target sat directly under the scope the caller named.
+    ///
+    /// The three forms in one tree, which is how the bug was reported:
+    ///   `B/BThing.h` includes `"BThing2.h"`   — same directory
+    ///   `B/BThing.h` includes `"C/CThing.h"`  — subpath below its own directory
+    ///   `B/BThing.h` includes `"A/AThing.h"`  — relative to the include root
+    /// Only the third needs the walk, and only the third was broken.
+    #[test]
+    fn c_include_resolves_against_a_declared_scope_without_a_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("ModuleRoot");
+        for d in ["A", "B", "B/C"] {
+            fs::create_dir_all(module.join(d)).unwrap();
+        }
+        fs::write(module.join("A/AThing.h"), "// include-root relative\n").unwrap();
+        fs::write(module.join("B/BThing2.h"), "// sibling\n").unwrap();
+        fs::write(module.join("B/C/CThing.h"), "// below own dir\n").unwrap();
+        // Deliberately no `.git` anywhere.
+        assert!(
+            enclosing_repo_root(&module.join("B")).is_none(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+
+        let from = module.join("B");
+        // Canonicalized, as a real caller's scope is — and deliberately a *different
+        // spelling* from `from`, which is not. Containment has to survive that.
+        let scope = module.canonicalize().unwrap();
+        for (include, expected) in [
+            ("\"BThing2.h\"", "B/BThing2.h"),
+            ("\"C/CThing.h\"", "B/C/CThing.h"),
+            ("\"A/AThing.h\"", "A/AThing.h"),
+        ] {
+            let got = resolve_c_include(&from, include, Some(&scope))
+                .unwrap_or_else(|| panic!("{include} must resolve under a declared scope"));
+            assert_eq!(got, module.join(expected), "for {include}");
+        }
+    }
+
+    /// The declared scope bounds the walk as strictly as `.git` did.
+    ///
+    /// The positive control is not optional. Without it this test passes for the wrong
+    /// reason: reintroduce the `.git`-only rule and, since the fixture has no `.git`,
+    /// resolution is disabled outright — so "nothing resolved" is satisfied by nothing
+    /// being *attempted*. The in-scope header proves the walk was live and still refused
+    /// the out-of-scope one.
+    #[test]
+    fn c_include_walk_stops_at_the_declared_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("proj/src")).unwrap();
+        fs::create_dir_all(root.join("proj/inside")).unwrap();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(root.join("proj/inside/ok.h"), "// in scope\n").unwrap();
+        fs::write(root.join("outside/leak.h"), "// outside\n").unwrap();
+
+        let from = root.join("proj/src");
+        let scope = root.join("proj").canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_c_include(&from, "\"inside/ok.h\"", Some(&scope)),
+            Some(root.join("proj/inside/ok.h")),
+            "positive control: the walk must be live inside the scope"
+        );
+        assert!(
+            resolve_c_include(&from, "\"outside/leak.h\"", Some(&scope)).is_none(),
+            "the walk must not resolve outside the declared scope"
+        );
+    }
+
+    /// A declared scope that has nothing to do with the file must not disable resolution.
+    ///
+    /// `tilth_deps` given an absolute `path` and no `scope` resolves the scope to the
+    /// server's process cwd, which can be an unrelated checkout. Letting that win as the
+    /// containment root rejected every candidate and silently reclassified real local
+    /// includes as external — a regression against the `.git`-only rule it replaced, which
+    /// at least always derived its root from the file. The scope wins only when it contains
+    /// the file; otherwise the enclosing repository does.
+    #[test]
+    fn c_include_falls_back_to_the_repo_when_the_scope_excludes_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("proj/.git")).unwrap();
+        fs::create_dir_all(root.join("proj/Alpha")).unwrap();
+        fs::create_dir_all(root.join("proj/Gamma")).unwrap();
+        fs::create_dir_all(root.join("elsewhere")).unwrap();
+        fs::write(root.join("proj/Alpha/Beta.h"), "// target\n").unwrap();
+
+        let from = root.join("proj/Gamma");
+        let unrelated = root.join("elsewhere").canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_c_include(&from, "\"Alpha/Beta.h\"", Some(&unrelated)),
+            Some(root.join("proj/Alpha/Beta.h")),
+            "an unrelated scope must fall back to the file's repository, not veto resolution"
         );
     }
 
@@ -598,7 +760,8 @@ mod tests {
         fs::create_dir_all(root.join("src/a")).unwrap();
         fs::write(root.join("src/shared.h"), "// at src/\n").unwrap();
 
-        let got = resolve_c_include(&root.join("src/a"), "\"src/shared.h\"").expect("resolves");
+        let got =
+            resolve_c_include(&root.join("src/a"), "\"src/shared.h\"", None).expect("resolves");
         assert_eq!(got, root.join("src/shared.h"));
     }
 
@@ -614,7 +777,7 @@ mod tests {
         fs::write(root.join("outside/leak.h"), "// outside\n").unwrap();
 
         assert!(
-            resolve_c_include(&root.join("proj/src"), "\"outside/leak.h\"").is_none(),
+            resolve_c_include(&root.join("proj/src"), "\"outside/leak.h\"", None).is_none(),
             "the walk must not resolve outside the repository"
         );
     }
@@ -631,7 +794,7 @@ mod tests {
         fs::write(root.join("wt/.git"), "gitdir: ../real/.git/worktrees/wt\n").unwrap();
         fs::write(root.join("wt/include/lib/db.h"), "struct DB {};\n").unwrap();
 
-        let got = resolve_c_include(&root.join("wt/src"), "\"lib/db.h\"")
+        let got = resolve_c_include(&root.join("wt/src"), "\"lib/db.h\"", None)
             .expect("a .git file must still establish the root");
         assert_eq!(got, root.join("wt/include/lib/db.h"));
     }
