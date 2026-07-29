@@ -70,11 +70,16 @@ const FULL_MAX_MATCHES: usize = 100;
 //   **each file's matches are appended as one contiguous block, in a deterministic
 //   within-file order, under a single lock acquisition.**
 //
-// That holds at every `all.extend(...)` below and in `content.rs`, so threads can only
+// That holds at every `all.extend(...)` below, so threads can only
 // interleave whole files, and ties can only ever be between matches from the same file —
 // whose relative order is fixed. `merged.sort_by_key(stratum_for_display)` inherits it.
 // Locking per match, or parallelising within a file, would reintroduce the bug without
 // touching a line of the walk logic.
+//
+// `content.rs` no longer appends contiguous per-file blocks — it feeds a bounded heap —
+// and does not need to. Every content match has `is_definition: false` and a unique
+// `(path, line)`, so `rank::sort`'s key is already a total order on that input and there
+// are no ties for arrival order to resolve.
 //
 // Two costs this shifts onto neighbouring code, both measured:
 //
