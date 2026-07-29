@@ -646,6 +646,43 @@ public:
         }
     }
 
+    /// A reference return is how a C++ singleton accessor, `at()`, `front()` and
+    /// `operator[]` are all spelled, and `reference_declarator` hides its inner
+    /// declarator from the field probe both declarator walks used.
+    ///
+    /// The name resolved to nothing, and the declaration arms bail on an unresolved
+    /// name before classifying, so these members were absent from the outline
+    /// altogether — not mislabelled. The `prop` count below is what pins the second
+    /// half of the fix: with only the name walk repaired they come back as data.
+    #[test]
+    fn cpp_outline_names_reference_returning_members() {
+        let rendered = outline(
+            "class Holder\n{\npublic:\n    static Holder& Get();\n    const Holder& Peek() const;\n    Holder&& Take();\n    Holder* Ptr();\n    Holder*& RefToPtr();\n    int Value;\n};\n",
+            Lang::Cpp,
+            1000,
+        );
+        for want in [
+            "fn Get",
+            "fn Peek",
+            "fn Take",
+            "fn Ptr",
+            "fn RefToPtr",
+            "prop Value",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+        assert!(
+            !rendered.contains("<anonymous>"),
+            "no member should be anonymous:\n{rendered}"
+        );
+        // The classification half: a reference return is a function, not a field.
+        assert_eq!(
+            rendered.matches("prop ").count(),
+            1,
+            "only `Value` is data:\n{rendered}"
+        );
+    }
+
     /// Parity alone would be satisfied by both sides being equally wrong, so pin the
     /// things #49 got wrong as absolute facts: the class's range covers the whole
     /// class, and every member is a *child* of it rather than a top-level sibling.
