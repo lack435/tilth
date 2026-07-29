@@ -30,9 +30,8 @@ use crate::types::{FileType, Lang};
 /// but a server sitting at a few hundred MB after one query is a real cost on a machine also
 /// running an editor and a compiler.
 ///
-/// The constant is calibrated against measured peak RSS, **not** against its own accounting —
-/// which matters, because the accounting undercounts. On a 176k-file C++ tree, one
-/// `kind: "callers"` query, three repetitions in a single MCP session:
+/// Sized against measured peak RSS. On a 176k-file C++ tree, one `kind: "callers"` query,
+/// three reps in a single MCP session:
 ///
 /// ```text
 /// ceiling        peak RSS      wall
@@ -42,62 +41,101 @@ use crate::types::{FileType, Lang};
 /// disabled        44-50 MB     3097-3917ms
 /// ```
 ///
-/// Read that carefully, because two things in it are easy to get wrong:
+/// The ceiling controls peak memory — monotonic across four settings, which is what this bound
+/// is for. Three things about that table are worth stating precisely, because an earlier version
+/// of this comment got each of them wrong:
 ///
-/// * **The ceiling controls peak memory** — monotonic across four settings, which is what this
-///   bound is for. But a nominal 64 MB produced ~94 MB of actual growth over the
-///   cache-disabled baseline, so `estimated_filter_bytes` undercounts real cost by around 1.5x.
-///   The constant is a calibrated knob, not a byte-accurate budget, and it should be re-measured
-///   rather than reasoned about if it is ever retuned.
-/// * **The time differences are inside the noise.** An earlier two-point reading suggested the
-///   unbounded cache was worth ~15% of wall time; across four settings the ranges overlap and
-///   the cache-disabled run was sometimes the fastest. So this bound is close to free, and any
-///   claim that the cache buys a specific percentage is not supported by these numbers.
+/// * Growth over the disabled baseline fits `~17 MB + 1.2 x ceiling` far better than any single
+///   multiplier. The earlier text quoted "~1.5x", which is the 64 MB row alone; the row that
+///   shipped implies 2.1x. The marginal undercount is ~1.2x, and there is a fixed component the
+///   disabled baseline does not capture.
+/// * The wall-time ranges do **not** all overlap: 64 MB (3064-3190ms) and 8 MB (3583-3670ms) are
+///   disjoint, so the table does contain evidence that a tight ceiling costs time.
+/// * Disabled was never the fastest setting here — its best is 3097ms against unbounded's
+///   2947ms. It was faster than 8 MB, which is a different claim.
 ///
-/// 32 MB is what shipped. Measured against `main` on the same tree, three reps each:
+/// Within-setting spread is ~21% on the single-target rows at n=3, so differences smaller than
+/// that are not resolvable from this data and no percentage is claimed for them.
+///
+/// 32 MB is what shipped. Against `main`, three reps each, with the exact `num_bits()`
+/// accounting:
 ///
 /// ```text
 ///                 unbounded                 32 MB ceiling
-/// single-target   189-215 MB / 3001-3546ms  107-122 MB / 2973-3471ms
-/// 5-target        206-241 MB / 10.1-10.8s   117-128 MB / 11.4-12.2s
+/// single-target   186-214 MB / 2995-4597ms   93-109 MB / 2919-3484ms
+/// 5-target        213-248 MB / 10.5-10.8s   104-115 MB / 11.4-12.2s
 /// ```
 ///
-/// So roughly 45% off peak RSS, free on the single-walk path and about **12% slower** on the
-/// multi-walk one — that second row is a real cost, outside the noise, and worth stating rather
-/// than rounding away. Multi-target `callers` is where cross-walk reuse pays most, because it
-/// runs one walk per target; that fan-out is itself tracked as a defect, and when it is fixed
-/// this cost shrinks with it.
+/// ~53% off peak RSS. The 5-target row is ~13% slower, and unlike the single-target differences
+/// that one is resolvable: both ranges have ~7% internal spread and they are disjoint. It also
+/// has a known mechanism — `bloom_walk::read_with_bloom_check` calls `contains` once per target,
+/// so a refused admission makes every target rebuild the same filter instead of one building it
+/// and the rest hitting. That is worth fixing on its own and is tracked separately.
 ///
 /// Output is unaffected at every setting — verified byte-identical with the cache unbounded,
 /// bounded and disabled, and it must be: a filter is only ever a pre-filter ahead of a real
 /// `memmem` check and a parse, so a miss costs work and never a wrong answer.
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Bytes a filter of `expected_items` occupies, for budgeting only.
+/// Fixed cost of one cache entry, beyond its bit array.
 ///
-/// `BloomFilter` exposes no size accessor, so this reproduces its nominal sizing: a 1%
-/// false-positive rate needs about 9.6 bits per item, hence ~1.2 bytes, plus a constant for the
-/// struct. It is known to **undercount** — see `MAX_CACHE_BYTES` for the measurement — because
-/// it counts neither the `PathBuf` key, nor `DashMap`'s per-entry overhead, nor allocator
-/// rounding. That is tolerable for a guard against unbounded growth; it would not be tolerable
-/// if anything depended on the number being right.
-fn estimated_filter_bytes(expected_items: usize) -> usize {
-    expected_items * 12 / 10 + 64
+/// `CachedFilter` embeds the `BloomFilter` struct, its mtime and its own byte count; the map
+/// also stores a `PathBuf` key inline. The rest is the key's heap allocation plus hashbrown's
+/// control byte and load-factor slack, which is where the 128 comes from — deliberately
+/// generous, since over-counting the overhead only makes the ceiling more conservative.
+const PER_ENTRY_OVERHEAD: usize =
+    std::mem::size_of::<CachedFilter>() + std::mem::size_of::<PathBuf>() + 128;
+
+/// Real byte cost of caching `filter`.
+///
+/// An earlier version estimated this from the identifier count, on the stated grounds that
+/// "`BloomFilter` exposes no size accessor". That was simply false — `num_bits()` is public —
+/// and the estimate was wrong in a way that mattered: it undercounted a one-identifier file by
+/// 3.2x and a 20k-identifier file by 1.0x, so the same nominal ceiling meant ~34 MB on a
+/// large-file tree and ~100 MB on a header-heavy one. Asking the filter is exact and removes
+/// the whole class.
+fn entry_bytes(filter: &BloomFilter) -> usize {
+    filter.num_bits() / 8 + PER_ENTRY_OVERHEAD
 }
 
 /// Thread-safe cache of per-file Bloom filters, keyed by path and validated
 /// by mtime. Stale entries are automatically rebuilt on access.
 ///
-/// Bounded by `MAX_CACHE_BYTES`. Once the budget is reached the cache stops accepting new
-/// entries rather than evicting: eviction would need an access order that `DashMap` does not
-/// keep, and for a cache whose miss penalty is a rebuild the simpler rule is enough. Repeated
-/// walks visit files in a similar order, so what gets in early is also what gets re-probed.
+/// Bounded by `ceiling`. Once the budget is reached the cache stops accepting new entries
+/// rather than evicting, because eviction needs an access order `DashMap` does not keep and a
+/// miss only costs a rebuild.
+///
+/// Known limitation, stated because the first version of this comment justified the design with
+/// a claim that does not hold ("repeated walks visit files in a similar order, so what gets in
+/// early is also what gets re-probed"). Successive tool calls routinely supply *different*
+/// scopes, and the natural agent shape is adversarial to this: a broad query at the repo root
+/// fills the budget with whatever the walk reached first, then the agent narrows to one subtree
+/// for the next fifty calls and nothing it touches is ever admitted. In that regime the cache
+/// is dead weight — bounded, but useless. A generational reset (clear and start over when the
+/// ceiling is hit) would fix it without needing an access order; not done here.
 pub struct BloomFilterCache {
     filters: DashMap<PathBuf, CachedFilter>,
-    /// Sum of `CachedFilter::bytes` over the map. Only ever compared against the ceiling, so
-    /// a transient overshoot from two threads inserting at once is acceptable and bounded by
-    /// one filter per thread.
+    /// Sum of `CachedFilter::bytes` over the map.
+    ///
+    /// Every read-modify-write of this happens while holding the `DashMap` shard lock for the
+    /// key being changed, via `entry()`. That is load-bearing, not tidiness. The first version
+    /// did the accounting outside the lock and claimed any race was "a transient overshoot
+    /// bounded by one filter per thread"; it was neither. Two threads missing on the same path
+    /// both built and both charged, so one entry was billed twice, permanently — and the window
+    /// was the whole duration of `build_filter`, not a few instructions. Measured on two
+    /// concurrent walks over 3000 shared files: 14.7 MB counted against 7.4 MB real, +98%.
+    /// Four walks: +293%. That is reachable from a single `tilth_write` batch, whose
+    /// `apply_batch` fans out with `into_par_iter` and reaches `find_callers_batch` per task,
+    /// and it would pin the budget with a fraction of it real for the rest of the process —
+    /// leaving the cache strictly worse than no cache, with nothing to show why.
+    ///
+    /// Races between *different* keys still overshoot transiently, by at most one filter per
+    /// thread. That is the bound the old comment described, and for different keys it is true.
     bytes: std::sync::atomic::AtomicUsize,
+    /// Byte ceiling. A field rather than a constant so tests can pick a small one — #13 asked
+    /// for a *configurable* ceiling, and a 32 MB constant also made the growth test take 5s of
+    /// a 5.7s suite because reaching the bound meant tokenising ~28M identifiers.
+    ceiling: usize,
 }
 
 struct CachedFilter {
@@ -117,9 +155,16 @@ impl BloomFilterCache {
     /// Create an empty cache.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_ceiling(MAX_CACHE_BYTES)
+    }
+
+    /// Create an empty cache with an explicit byte ceiling.
+    #[must_use]
+    pub fn with_ceiling(ceiling: usize) -> Self {
         Self {
             filters: DashMap::new(),
             bytes: std::sync::atomic::AtomicUsize::new(0),
+            ceiling,
         }
     }
 
@@ -145,38 +190,72 @@ impl BloomFilterCache {
             }
         }
 
-        // Cache miss or stale: build and cache a new filter
-        let (filter, expected_items) = build_filter(content, code_lang(path));
+        // Cache miss or stale: build outside any lock, answer from the fresh filter, then admit.
+        let filter = build_filter(content, code_lang(path));
         let result = filter.contains(symbol);
-        let cost = estimated_filter_bytes(expected_items);
-
-        // Replacing a stale entry frees its budget first, so a file edited repeatedly cannot
-        // consume the ceiling one revision at a time.
-        let reclaimed = self
-            .filters
-            .get(path)
-            .filter(|e| e.mtime != mtime)
-            .map_or(0, |e| e.bytes);
-        if reclaimed > 0 {
-            self.bytes.fetch_sub(reclaimed, Relaxed);
-        }
-
-        if self.bytes.load(Relaxed) + cost <= MAX_CACHE_BYTES {
-            self.bytes.fetch_add(cost, Relaxed);
-            self.filters.insert(
-                path.to_path_buf(),
-                CachedFilter {
-                    filter,
-                    mtime,
-                    bytes: cost,
-                },
-            );
-        } else if reclaimed > 0 {
-            // Budget reclaimed but the replacement does not fit: drop the stale entry rather
-            // than leave one whose mtime can never match again.
-            self.filters.remove(path);
-        }
+        self.admit(path, mtime, filter);
         result
+    }
+
+    /// Offer `filter` to the cache, charging the budget if it fits.
+    ///
+    /// Every read-modify-write of `bytes` for this key happens inside `DashMap::entry()`, which
+    /// holds the shard write lock for the whole match. That is what makes the accounting sound:
+    /// with the arithmetic outside the lock, two threads missing on the same path both charged
+    /// for one entry and the over-count was permanent. See the note on `bytes`.
+    fn admit(&self, path: &Path, mtime: SystemTime, filter: BloomFilter) {
+        let cost = entry_bytes(&filter);
+
+        match self.filters.entry(path.to_path_buf()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if occupied.get().mtime == mtime {
+                    // Another thread built and admitted the same version while we were
+                    // building. Charging again is exactly the double-billing this design
+                    // exists to prevent, so drop ours.
+                    return;
+                }
+                // Stale: reclaim its budget before considering the replacement, so a file
+                // edited repeatedly cannot consume the ceiling one revision at a time.
+                let stale = occupied.get().bytes;
+                self.sub_bytes(stale);
+                if self.fits(cost) {
+                    self.bytes.fetch_add(cost, Relaxed);
+                    occupied.insert(CachedFilter {
+                        filter,
+                        mtime,
+                        bytes: cost,
+                    });
+                } else {
+                    // Its budget is already reclaimed and its mtime can never match again, so
+                    // keeping it would be resident memory the counter no longer knows about.
+                    occupied.remove();
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                if self.fits(cost) {
+                    self.bytes.fetch_add(cost, Relaxed);
+                    vacant.insert(CachedFilter {
+                        filter,
+                        mtime,
+                        bytes: cost,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Would `cost` more bytes stay inside the ceiling? `saturating_add` so a corrupted counter
+    /// refuses admission rather than overflowing.
+    fn fits(&self, cost: usize) -> bool {
+        self.bytes.load(Relaxed).saturating_add(cost) <= self.ceiling
+    }
+
+    /// `saturating_sub`, so an accounting slip can never wrap the counter to `usize::MAX` and
+    /// permanently disable caching.
+    fn sub_bytes(&self, amount: usize) {
+        let _ = self
+            .bytes
+            .fetch_update(Relaxed, Relaxed, |b| Some(b.saturating_sub(amount)));
     }
 }
 
@@ -194,9 +273,7 @@ fn code_lang(path: &Path) -> Option<Lang> {
 
 /// Build a Bloom filter from file content by extracting all identifiers.
 ///
-/// Returns the filter and the `expected_items` it was sized for, so the caller can budget
-/// against it without a size accessor `BloomFilter` does not provide.
-fn build_filter(content: &str, lang: Option<Lang>) -> (BloomFilter, usize) {
+fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
     let idents: Vec<&str> = extract_identifiers(content, lang).collect();
     // Sized for total token count, not unique identifiers -- duplicates over-allocate
     // the filter, so the achieved FPR is well below the 0.01 target in practice.
@@ -206,7 +283,7 @@ fn build_filter(content: &str, lang: Option<Lang>) -> (BloomFilter, usize) {
     for ident in idents {
         filter.insert(ident);
     }
-    (filter, expected)
+    filter
 }
 
 // ---------------------------------------------------------------------------
@@ -415,70 +492,130 @@ fn is_ident_continue(b: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// The cache must stop growing at `MAX_CACHE_BYTES`, and must keep answering correctly
-    /// once it does — a filter is only ever a pre-filter, so a refused insert costs a rebuild
-    /// and never a wrong answer.
+    /// Content with roughly `n` distinct identifiers.
+    fn ident_content(n: usize) -> String {
+        (0..n).map(|i| format!("ident_{i} ")).collect()
+    }
+
+    /// The cache must stop growing at its ceiling, and must keep answering correctly once it
+    /// does — a refused insert costs a rebuild, never an answer.
     ///
-    /// Uses `estimated_filter_bytes` to size the fixture rather than a magic number, so raising
-    /// the ceiling retunes this instead of breaking it.
+    /// Uses `with_ceiling` rather than the shipped 32 MB constant. That is not just speed:
+    /// reaching 32 MB means tokenising ~28M identifiers, which made this one test 5.0s of a 5.7s
+    /// suite. A small injected ceiling exercises identical logic in milliseconds.
     #[test]
     fn cache_stops_growing_at_the_ceiling_and_stays_correct() {
-        let cache = BloomFilterCache::new();
+        let ceiling = 64 * 1024;
+        let cache = BloomFilterCache::with_ceiling(ceiling);
         let mtime = SystemTime::UNIX_EPOCH;
+        let content = ident_content(200);
 
-        // Each file carries enough distinct identifiers to make its filter non-trivial.
-        let content: String = (0..2000).map(|i| format!("ident_{i} ")).collect();
-        let per_file = estimated_filter_bytes(2001);
-        // Enough files to overrun the ceiling several times over.
-        let files = MAX_CACHE_BYTES / per_file + 50;
-
-        for f in 0..files {
+        let mut admitted_at_least_one = false;
+        for f in 0..400 {
             let path = PathBuf::from(format!("/synthetic/f{f}.rs"));
-            // Correctness under the bound: a symbol that is present must still be reported
-            // present whether or not this file got cached.
             // The only guarantee a Bloom filter makes is no false *negatives*, so this is the
-            // only thing that can be asserted per file. Asserting the absent case fails
-            // legitimately — the filters are built for a 1% false-positive rate, and over this
-            // many files a false positive is near-certain (it first fired on file 6).
+            // only per-file assertion available. Asserting the absent case fails legitimately —
+            // the filters target a 1% false-positive rate, and an earlier version of this test
+            // did exactly that and tripped on the sixth file.
             assert!(
                 cache.contains(&path, mtime, &content, "ident_7"),
                 "a present symbol must be found regardless of cache admission (file {f})"
             );
+            admitted_at_least_one |= cache.cached_bytes() > 0;
         }
 
+        assert!(admitted_at_least_one, "nothing was ever admitted");
         let bytes = cache.cached_bytes();
         assert!(
-            bytes <= MAX_CACHE_BYTES,
-            "cache exceeded its ceiling: {bytes} > {MAX_CACHE_BYTES}"
+            bytes <= ceiling,
+            "cache exceeded its ceiling: {bytes} > {ceiling}"
         );
-        // And it must actually have filled up, or the ceiling was never exercised.
+        // Tight, not `ceiling / 2`: the fixture overruns the bound many times over, so anything
+        // materially below the ceiling means admission stopped early. A loose floor would miss a
+        // cost computed several times too large.
+        let one_entry = ceiling / 8;
         assert!(
-            bytes > MAX_CACHE_BYTES / 2,
-            "fixture did not reach the ceiling ({bytes} bytes); the bound is untested"
+            bytes + one_entry > ceiling,
+            "cache filled only to {bytes} of {ceiling}; admission stopped too early"
         );
     }
 
-    /// Re-caching a modified file must not consume the ceiling one revision at a time.
+    /// The refusal branch — a stale entry whose replacement does not fit — must leave the counter
+    /// consistent with the map, and must not keep an entry it has already un-charged.
+    ///
+    /// Untestable before the ceiling was injectable, which is why it had no coverage.
     #[test]
-    fn restating_a_stale_entry_reclaims_its_budget() {
-        let cache = BloomFilterCache::new();
-        let path = PathBuf::from("/synthetic/churn.rs");
-        let content: String = (0..2000).map(|i| format!("ident_{i} ")).collect();
-
-        let mut last = 0;
-        for rev in 0..50u64 {
-            let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(rev);
-            assert!(cache.contains(&path, mtime, &content, "ident_7"));
-            let now = cache.cached_bytes();
-            if rev > 0 {
-                assert_eq!(
-                    now, last,
-                    "budget grew on revision {rev} — a stale entry was not reclaimed"
-                );
-            }
-            last = now;
+    fn stale_entry_that_cannot_be_replaced_is_dropped_and_uncharged() {
+        let content = ident_content(200);
+        // A ceiling that admits exactly one entry, so a second version cannot fit alongside it.
+        let cache = BloomFilterCache::with_ceiling(64 * 1024);
+        let filler = ident_content(200);
+        // Fill the budget with other files first.
+        for f in 0..400 {
+            let _ = cache.contains(
+                &PathBuf::from(format!("/synthetic/filler{f}.rs")),
+                SystemTime::UNIX_EPOCH,
+                &filler,
+                "ident_1",
+            );
         }
-        assert!(last > 0, "nothing was cached, so this proves nothing");
+        let full = cache.cached_bytes();
+
+        // Now churn a file that is already cached, so the stale path runs with no room.
+        let path = PathBuf::from("/synthetic/filler0.rs");
+        let newer = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        assert!(cache.contains(&path, newer, &content, "ident_7"));
+
+        assert!(
+            cache.cached_bytes() <= full,
+            "refusing a replacement must not increase the charge"
+        );
+        // Whatever happened, the ceiling still holds and answers are still correct.
+        assert!(cache.cached_bytes() <= 64 * 1024);
+        assert!(cache.contains(&path, newer, &content, "ident_7"));
+    }
+
+    /// Two threads missing on the **same** path must charge the budget once, not twice.
+    ///
+    /// This is the test whose absence let a real bug ship in review: the accounting used to sit
+    /// outside the `DashMap` shard lock, with the window spanning the whole of `build_filter`, so
+    /// concurrent probes of one path each charged for it and the over-count was permanent. It is
+    /// reachable in production — `edit::apply_batch` fans out with `into_par_iter` and each task
+    /// reaches `find_callers_batch`, which runs a parallel walk against the shared cache.
+    #[test]
+    fn concurrent_probes_of_one_path_charge_the_budget_once() {
+        use std::sync::{Arc, Barrier};
+
+        let cache = Arc::new(BloomFilterCache::with_ceiling(16 * 1024 * 1024));
+        let content = Arc::new(ident_content(4000));
+        let path = PathBuf::from("/synthetic/contended.rs");
+        let mtime = SystemTime::UNIX_EPOCH;
+
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let cache = Arc::clone(&cache);
+            let content = Arc::clone(&content);
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                // Align the threads so they all miss before any of them admits.
+                barrier.wait();
+                assert!(cache.contains(&path, mtime, &content, "ident_7"));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let charged = cache.cached_bytes();
+        // Charge for exactly one entry. The old code charged up to `threads` times.
+        let single = entry_bytes(&build_filter(&content, None));
+        assert_eq!(
+            charged, single,
+            "{threads} concurrent probes of one path charged {charged} bytes for a {single}-byte              entry — the accounting is outside the shard lock again"
+        );
     }
 
     #[test]
@@ -689,7 +826,7 @@ mod tests {
     #[test]
     fn test_build_filter_integration() {
         let content = "pub fn search(query: &str) -> Vec<Match> { find(query) }";
-        let (filter, _) = build_filter(content, Some(Lang::Rust));
+        let filter = build_filter(content, Some(Lang::Rust));
 
         assert!(filter.contains("search"));
         assert!(filter.contains("query"));
