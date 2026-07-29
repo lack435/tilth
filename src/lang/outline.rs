@@ -159,7 +159,14 @@ fn node_to_entry(
         // See `cpp_misparsed_class_name`.
         "function_definition" | "declaration" if misparsed_class.is_some() => {
             let name = misparsed_class.unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::Class, name, None)
+            // The specifier still says which keyword was written, even though it is
+            // named for the macro — without this a `struct` behind an export macro
+            // outlined as a `class`, a parity failure of its own.
+            let kind = match node.child_by_field_name("type").map(|t| t.kind()) {
+                Some("struct_specifier" | "union_specifier") => OutlineKind::Struct,
+                _ => OutlineKind::Class,
+            };
+            (kind, name, None)
         }
 
         // A C/C++ type specifier with no `body` is an elaborated type specifier — a
@@ -568,6 +575,21 @@ fn collect_member(
         return;
     }
     if let Some(class) = misparsed_class {
+        // A brace body loose in a class body belongs to the member just recovered:
+        // recovery splits an inline-bodied constructor into a head it cannot read and
+        // a `compound_statement` sibling. Without this the entry's range is the head
+        // alone, and `blast_radius`' signature window — `start_line ..= start_line+3`,
+        // clamped to `end_line` — collapses to a single line, so edits inside the
+        // constructor find no callers where the same class unmisparsed does.
+        if child.kind() == "compound_statement" {
+            if let Some(last) = out.last_mut() {
+                let body_end = child.end_position().row as u32 + 1;
+                if last.kind == OutlineKind::Function && last.end_line < body_end {
+                    last.end_line = body_end;
+                }
+            }
+            return;
+        }
         if push_misparsed_members(child, lines, class, out) {
             return;
         }
@@ -575,7 +597,18 @@ fn collect_member(
     if let Some(entry) = node_to_entry(child, lines, lang, depth) {
         out.push(entry);
     }
+    // A nested type definition consumes its whole `declaration`, so a member declared
+    // right after it (`class Inner { … }; Outer();`) is never reached. Emitted after
+    // the type rather than before it, so the outline keeps source order.
+    if let Some(class) = misparsed_class {
+        push_members_after_nested_type(child, lines, class, out);
+    }
 }
+
+/// Recursion cap for the misparsed-body walk, matching `MAX_DECLARATOR_DEPTH`'s
+/// reasoning: `outline::generate` is a fuzz target, and while the deepest `ERROR`
+/// nesting observed in practice is two, nothing in error recovery promises a bound.
+const MAX_MISPARSE_DEPTH: usize = 16;
 
 /// Push any constructors and destructors hidden inside a recovery artifact.
 ///
@@ -593,18 +626,37 @@ fn push_misparsed_members(
     class: &str,
     out: &mut Vec<OutlineEntry>,
 ) -> bool {
+    push_misparsed_members_at(node, lines, class, out, 0)
+}
+
+fn push_misparsed_members_at(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    class: &str,
+    out: &mut Vec<OutlineEntry>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_MISPARSE_DEPTH {
+        return false;
+    }
     match node.kind() {
         // `Widget();` — the statement, not the call inside it, so the entry's range
         // covers the trailing `;` the same way the unmisparsed `declaration` does.
         "expression_statement" => {
-            let mut cursor = node.walk();
-            let name = node
-                .children(&mut cursor)
-                .find_map(|c| misparsed_member_name(c, lines, class));
-            if let Some(name) = name {
+            if let Some(name) = statement_member_name(node, lines, class) {
                 out.push(misparsed_entry(node, name, lines));
             }
             true
+        }
+        // `constexpr Widget();` — a qualifier keeps recovery from reading a call and
+        // leaves a `declaration` whose `type` is the class name and whose declarator
+        // is zero-width, which the ordinary declaration arm cannot name.
+        "declaration" => {
+            if let Some(name) = qualified_ctor_name(node, lines, class) {
+                out.push(misparsed_entry(node, name, lines));
+                return true;
+            }
+            false
         }
         "ERROR" => {
             let mut cursor = node.walk();
@@ -613,13 +665,89 @@ fn push_misparsed_members(
                 match misparsed_member_name(child, lines, class) {
                     Some(name) => out.push(misparsed_entry(child, name, lines)),
                     None => {
-                        push_misparsed_members(child, lines, class, out);
+                        push_misparsed_members_at(child, lines, class, out, depth + 1);
                     }
                 }
             }
             true
         }
         _ => false,
+    }
+}
+
+/// The member an `expression_statement` in a misparsed class body declares.
+///
+/// `Widget() = default;` and `Widget(const Widget&) = delete;` — the two most common
+/// ways a modern C++ class spells a constructor — wrap the call in an
+/// `assignment_expression`, so the call is a *grandchild*. Recovery only produces
+/// that when the member is the first after an access specifier; anywhere else the
+/// same source parses as a `function_definition` and never reaches here, which is why
+/// the gap was position-dependent.
+fn statement_member_name(node: tree_sitter::Node, lines: &[&str], class: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+    for child in children {
+        if let Some(name) = misparsed_member_name(child, lines, class) {
+            return Some(name);
+        }
+        if child.kind() == "assignment_expression" {
+            let mut inner = child.walk();
+            let nested: Vec<tree_sitter::Node> = child.children(&mut inner).collect();
+            for grandchild in nested {
+                if let Some(name) = misparsed_member_name(grandchild, lines, class) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Name of the constructor a qualifier-prefixed `declaration` declares, if any.
+///
+/// `constexpr Widget();` leaves the class name in the `type` field and a zero-width
+/// identifier as the declarator, so `c_declarator_name` yields nothing. Requiring
+/// that emptiness is what keeps an ordinary member of the class's own type
+/// (`Widget Other;`) — same `type`, real declarator — from being read as one.
+fn qualified_ctor_name(node: tree_sitter::Node, lines: &[&str], class: &str) -> Option<String> {
+    let type_node = node.child_by_field_name("type")?;
+    if type_node.kind() != "type_identifier" || node_text_simple(type_node, lines) != class {
+        return None;
+    }
+    let named = node
+        .child_by_field_name("declarator")
+        .and_then(|d| c_declarator_name(d, lines));
+    named.is_none().then(|| class.to_string())
+}
+
+/// Push a member declared immediately after a nested type inside a misparsed body.
+///
+/// `class Inner { … }; Outer();` repairs into a *single* `declaration` holding the
+/// nested type and the constructor's declarator, and the declaration arm returns the
+/// nested type early — so the constructor is never looked at. Gated on the nested
+/// type to make double-emission impossible: a declaration that arm handles any other
+/// way never reaches here.
+fn push_members_after_nested_type(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    class: &str,
+    out: &mut Vec<OutlineEntry>,
+) {
+    if node.kind() != "declaration" {
+        return;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    if !is_named_bodied_specifier(type_node) {
+        return;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+    for child in children {
+        if let Some(name) = misparsed_member_name(child, lines, class) {
+            out.push(misparsed_entry(child, name, lines));
+        }
     }
 }
 
@@ -633,8 +761,32 @@ fn misparsed_entry(node: tree_sitter::Node, name: String, lines: &[&str]) -> Out
         end_line: node.end_position().row as u32 + 1,
         signature: Some(extract_signature(node, lines)),
         children: Vec::new(),
-        doc: extract_doc(node, lines),
+        doc: misparsed_doc(node, lines),
     }
+}
+
+/// Doc comment for a recovered member, looking through the `ERROR`s wrapping it.
+///
+/// `extract_doc` reads the previous *sibling*, but a destructor is matched at the
+/// `function_declarator` inside an `ERROR` while its comment is a sibling of that
+/// `ERROR` — one level further out. Only `ERROR` is stepped through, so this cannot
+/// reach past the artifact and attach an unrelated comment.
+fn misparsed_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let mut cur = node;
+    for _ in 0..MAX_MISPARSE_DEPTH {
+        if let Some(doc) = extract_doc(cur, lines) {
+            return Some(doc);
+        }
+        if cur.prev_sibling().is_some() {
+            return None;
+        }
+        let parent = cur.parent()?;
+        if parent.kind() != "ERROR" {
+            return None;
+        }
+        cur = parent;
+    }
+    None
 }
 
 /// Extract the first line as a function signature (name + params + return type).

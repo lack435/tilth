@@ -521,45 +521,110 @@ public:
         );
     }
 
-    /// Recovery does not repair every member into the same shape: a specifier keyword
-    /// (`explicit`) or an inline body moves a constructor into a different artifact,
-    /// and one `ERROR` can swallow two members at once.
+    /// Parity across every repair shape observed, not just the declared-members one.
+    ///
+    /// Recovery does not reshape members uniformly: a specifier keyword (`explicit`,
+    /// `constexpr`), an inline body, `= default`, or a preceding nested type each move
+    /// a constructor into a different artifact, and one `ERROR` can swallow two
+    /// members at once. Asserting equality against the same class without its macro is
+    /// what makes this a *parity* test — a `contains` check passes while a second
+    /// constructor, a range, or a doc comment is quietly missing.
     #[test]
-    fn cpp_outline_export_macro_members_across_recovery_shapes() {
-        let cases: &[(&str, &[&str])] = &[
-            // `explicit` keeps recovery from reading a call; this `ERROR` holds both
-            // the constructor and the destructor.
+    fn cpp_outline_export_macro_parity_across_recovery_shapes() {
+        let cases: &[(&str, &str)] = &[
             (
+                "explicit — one ERROR holds both constructors and the destructor",
                 "class API Widget\n{\npublic:\n    Widget(int A, float B);\n    explicit Widget(int A);\n    ~Widget();\nprivate:\n    int Value;\n    static int Count;\n};\n",
-                &["fn Widget", "fn ~Widget", "prop Value", "prop Count"],
             ),
-            // Inline bodies: the destructor and method parse as real definitions, the
-            // constructor still does not.
             (
+                "inline bodies",
                 "class API Widget\n{\npublic:\n    Widget() {}\n    ~Widget() {}\n    void Work() { Value = 1; }\n    int Value;\n};\n",
-                &["fn Widget", "fn ~Widget", "fn Work", "prop Value"],
             ),
-            // No base class, no access specifier — the members sit directly in the body.
             (
+                "struct, no base class, no access specifier",
                 "struct API Point\n{\n    Point();\n    ~Point();\n    int X;\n};\n",
-                &["fn Point", "fn ~Point", "prop X"],
             ),
-            // A longer base-class name tips the head into the other repair (see
-            // `macro_class_head_recovery_shapes_are_genuinely_different`).
             (
+                // See `macro_class_head_recovery_shapes_are_genuinely_different`.
+                "long base-class name tips the head into the other repair",
                 "class API Widget : public VeryLongBaseClassNameHere\n{\npublic:\n    Widget();\n    virtual ~Widget();\n    int Value;\n};\n",
-                &["fn Widget", "fn ~Widget", "prop Value"],
+            ),
+            (
+                // Only in the first slot after an access specifier does this repair
+                // into an assignment_expression; lower down it is a function_definition.
+                "= default / = delete in the first slot after an access specifier",
+                "class API Widget : public Base\n{\npublic:\n    Widget() = default;\n    Widget(const Widget&) = delete;\n    ~Widget() = default;\n    int Value;\n};\n",
+            ),
+            (
+                "constexpr / inline qualifiers",
+                "class API Widget : public Base\n{\npublic:\n    constexpr Widget();\n    inline ~Widget();\n};\n",
+            ),
+            (
+                "a nested type immediately before a constructor",
+                "class API Outer : public Base\n{\npublic:\n    class Inner { public: int X; };\n    Outer();\n    int Value;\n};\n",
+            ),
+            (
+                "constructor with an initialiser list and an inline body",
+                "class API Widget : public Base\n{\npublic:\n    Widget()\n        : Value(0)\n    {\n        Setup();\n    }\n    int Value;\n};\n",
+            ),
+            (
+                "doc comments on both a constructor and a destructor",
+                "class API Widget : public Base\n{\npublic:\n    // Builds it.\n    Widget();\n    // Tears it down.\n    ~Widget();\n};\n",
             ),
         ];
-        for (src, expected) in cases {
-            let rendered = outline(src, Lang::Cpp, 1000);
-            for want in *expected {
-                assert!(
-                    rendered.contains(want),
-                    "missing {want:?} for {src:?}:\n{rendered}"
-                );
-            }
+        for (name, src) in cases {
+            let plain = src
+                .replace("class API ", "class ")
+                .replace("struct API ", "struct ");
+            let with_macro = outline(src, Lang::Cpp, 1000);
+            let without = outline(&plain, Lang::Cpp, 1000);
+            assert_eq!(
+                with_macro, without,
+                "export macro changed the outline for {name}\nwith macro:\n{with_macro}\nplain:\n{without}"
+            );
         }
+    }
+
+    /// One `ERROR` can hold two constructors, and a `contains` check cannot tell one
+    /// from two — so count. This is the specific claim the recursion in
+    /// `push_misparsed_members` exists to satisfy.
+    #[test]
+    fn cpp_outline_recovers_every_constructor_from_one_error() {
+        let rendered = outline(
+            "class API Widget\n{\npublic:\n    Widget(int A, float B);\n    explicit Widget(int A);\n    ~Widget();\n};\n",
+            Lang::Cpp,
+            1000,
+        );
+        assert_eq!(
+            rendered.matches("fn Widget").count(),
+            2,
+            "both constructors must survive:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("fn ~Widget").count(),
+            1,
+            "exactly one destructor:\n{rendered}"
+        );
+    }
+
+    /// An inline-bodied constructor is split across a head recovery could not read and
+    /// a `compound_statement` sibling. Taking the entry's range from the head alone
+    /// left `blast_radius`' signature window — `start_line ..= start_line+3`, clamped
+    /// to `end_line` — one line wide, so edits inside the constructor found no callers
+    /// where the same class unmisparsed does. Pinned as a range, not via parity, so it
+    /// cannot be satisfied by both sides being wrong.
+    #[test]
+    fn cpp_outline_inline_constructor_range_covers_its_body() {
+        let entries = crate::lang::outline::get_outline_entries(
+            "class API Widget : public Base\n{\npublic:\n    Widget()\n        : Value(0)\n    {\n        Setup();\n    }\n    int Value;\n};\n",
+            Lang::Cpp,
+        );
+        let ctor = entries
+            .iter()
+            .flat_map(|e| &e.children)
+            .find(|c| c.name == "Widget")
+            .expect("the constructor must be outlined");
+        assert_eq!((ctor.start_line, ctor.end_line), (4, 8), "actual: {ctor:?}");
     }
 
     #[test]

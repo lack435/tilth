@@ -423,6 +423,13 @@ pub(crate) fn enclosing_misparsed_class_name(
 /// (`GENERATED_BODY()`), which recovery reshapes into the identical call — the same
 /// rule `is_cpp_macro_invocation` applies to bodies that parsed cleanly, which cannot
 /// see this shape.
+///
+/// Known residual: when a misparsed class has an inline-bodied *method*, recovery
+/// reads that body's opening brace as an initialiser and the statements after the
+/// first escape upward into the class body, where they are indistinguishable from
+/// members. A leaked `Widget();` then reads as a constructor. The escaped statements
+/// corrupt that outline wholesale — the class's own range is wrong too — so the fix
+/// belongs with the escape, not here.
 pub(crate) fn misparsed_member_name(
     node: tree_sitter::Node,
     lines: &[&str],
@@ -1619,63 +1626,117 @@ mod tests {
     /// Tripwire. Recovering a misparsed class's constructors and destructors means
     /// pattern-matching tree-sitter-cpp's error recovery, which is not a stable
     /// contract — the head repair already differs with the length of the base-class
-    /// name. This pins the body shapes `misparsed_member_kind` relies on so a grammar
+    /// name. This pins the body shapes `misparsed_member_name` relies on so a grammar
     /// bump fails here, loudly, instead of silently dropping members again.
     ///
-    /// If this fires: re-dump the tree for these sources, and update
-    /// `misparsed_member_kind` (and this test) to the new shapes. The outline parity
-    /// test `cpp_outline_export_macro_costs_no_members` is the behaviour to restore.
+    /// Full *paths* from the class body down to each matched node, not a set of
+    /// `parent>child` kind pairs: the walk in `push_misparsed_members` descends only
+    /// `ERROR`, and `enclosing_misparsed_class_name` climbs at most
+    /// `MISPARSED_BODY_DEPTH`. A repair that kept every node kind but nested them one
+    /// level deeper, or introduced a wrapper kind between them, would break the fix
+    /// while leaving a kind-pair assertion green.
+    ///
+    /// If this fires: re-dump the trees for these sources and update
+    /// `misparsed_member_name` (and this test) to the new shapes. The behaviour to
+    /// restore is `cpp_outline_export_macro_parity_across_recovery_shapes`.
     #[test]
     fn misparsed_class_body_repair_shapes_are_unchanged() {
-        /// Every `parent > child` kind edge in the tree, as `"parent>child"`.
-        fn edges(src: &str) -> Vec<String> {
-            let tree = parse(src, Lang::Cpp);
-            let mut out = Vec::new();
-            let mut stack = vec![tree.root_node()];
-            while let Some(node) = stack.pop() {
+        /// Root-to-leaf kind paths for every node in the tree, as `"a>b>c"`.
+        fn paths(src: &str) -> Vec<String> {
+            fn walk(node: tree_sitter::Node, prefix: &str, out: &mut Vec<String>) {
+                let here = if prefix.is_empty() {
+                    node.kind().to_string()
+                } else {
+                    format!("{prefix}>{}", node.kind())
+                };
+                out.push(here.clone());
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    out.push(format!("{}>{}", node.kind(), child.kind()));
-                    stack.push(child);
+                    walk(child, &here, out);
                 }
             }
+            let tree = parse(src, Lang::Cpp);
+            let mut out = Vec::new();
+            walk(tree.root_node(), "", &mut out);
             out
         }
 
-        let declared = edges(
-            "class API Widget : public Base\n{\npublic:\n\tWidget();\n\t~Widget();\n\tint Value;\n};\n",
-        );
+        /// Asserts exactly one path ends with `suffix`, so a shape cannot be satisfied
+        /// by two unrelated nodes elsewhere in the tree.
+        fn pin(paths: &[String], suffix: &str, what: &str) {
+            let hits: Vec<&String> = paths.iter().filter(|p| p.ends_with(suffix)).collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{what}: expected exactly one path ending {suffix:?}, found {hits:?}"
+            );
+        }
+
         // The head misparses into a `function_definition` whose body is a statement
         // block rather than a `field_declaration_list`. Everything below follows from
         // that: statements, not member declarations.
-        assert!(
-            declared.contains(&"function_definition>compound_statement".to_string()),
-            "misparsed class body is no longer a compound_statement: {declared:?}"
+        let declared = paths(
+            "class API Widget : public Base\n{\npublic:\n\tWidget();\n\t~Widget();\n\tint Value;\n};\n",
         );
-        // A constructor has no return type, so recovery reads it as a call.
-        assert!(
-            declared.contains(&"expression_statement>call_expression".to_string()),
-            "a declared constructor is no longer a call expression: {declared:?}"
+        // A constructor has no return type, so recovery reads it as a call — under the
+        // access specifier's `labeled_statement`, which `collect_member` flattens.
+        pin(
+            &declared,
+            "function_definition>compound_statement>labeled_statement>expression_statement>call_expression",
+            "declared constructor",
         );
-        // A destructor is left as a bare declarator inside an ERROR.
-        assert!(
-            declared.contains(&"ERROR>function_declarator".to_string())
-                && declared.contains(&"function_declarator>destructor_name".to_string()),
-            "a declared destructor is no longer a stranded function_declarator: {declared:?}"
+        // A destructor is left as a bare declarator inside an ERROR, a *direct* child
+        // of the body — one level, which is what the ERROR recursion assumes.
+        pin(
+            &declared,
+            "function_definition>compound_statement>ERROR>function_declarator>destructor_name",
+            "declared destructor",
         );
-        // A data member stays a `declaration`, which is why it needs reclassifying
-        // from local variable to property rather than recovering.
-        assert!(
-            declared.contains(&"compound_statement>declaration".to_string()),
-            "a data member is no longer a declaration: {declared:?}"
+        // A data member stays a `declaration`, which is why it needs reclassifying from
+        // local variable to property rather than recovering. Two `parent()` steps from
+        // here to the class head is what `enclosing_misparsed_class_name` walks.
+        pin(
+            &declared,
+            "function_definition>compound_statement>declaration",
+            "data member",
         );
 
         // A specifier keyword blocks the call reading and leaves the constructor as a
-        // declarator instead — the second shape `misparsed_member_kind` handles.
-        let specified = edges("class API Widget\n{\n\texplicit Widget(int A);\n};\n");
-        assert!(
-            specified.contains(&"ERROR>function_declarator".to_string()),
-            "an `explicit` constructor is no longer a stranded declarator: {specified:?}"
+        // declarator instead — the second shape `misparsed_member_name` handles.
+        let specified = paths("class API Widget\n{\n\texplicit Widget(int A);\n};\n");
+        pin(
+            &specified,
+            "compound_statement>ERROR>function_declarator>identifier",
+            "`explicit` constructor",
+        );
+
+        // `= default` wraps the call one level deeper, in an assignment_expression —
+        // the reason `statement_member_name` looks past the statement's own children.
+        let defaulted =
+            paths("class API Widget\n{\npublic:\n\tWidget() = default;\n\tint Value;\n};\n");
+        pin(
+            &defaulted,
+            "labeled_statement>expression_statement>assignment_expression>call_expression",
+            "`= default` constructor",
+        );
+
+        // `constexpr` leaves the class name in the `type` field with a zero-width
+        // declarator — no call and no usable declarator name, hence `qualified_ctor_name`.
+        let qualified = paths("class API Widget\n{\npublic:\n\tconstexpr Widget();\n};\n");
+        pin(
+            &qualified,
+            "labeled_statement>declaration>parenthesized_declarator>identifier",
+            "`constexpr` constructor",
+        );
+
+        // A nested type and the constructor after it share one `declaration`, which is
+        // why the constructor has to be emitted separately, after the type.
+        let nested =
+            paths("class API Outer\n{\npublic:\n\tclass Inner { int X; };\n\tOuter();\n};\n");
+        pin(
+            &nested,
+            "labeled_statement>declaration>function_declarator>identifier",
+            "constructor after a nested type",
         );
     }
 
