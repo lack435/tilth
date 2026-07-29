@@ -717,9 +717,23 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
         styles.push("test_*.py".to_string());
     }
 
-    // Rust in-source test detection
+    // Rust in-source test detection.
+    //
+    // This sampled `take(5)` over `code_files`, which is in `fs::read_dir` order — so it
+    // decided *content*, not merely ordering: whether the `tests:` line mentions in-source
+    // tests at all. Adding five unrelated source files that happened to be visited first
+    // silently deleted a true fact from the fingerprint. Verified on two trees differing
+    // only in which file held the test module.
+    //
+    // Sorting alone fixes the determinism but not the wrongness — with a five-file sample,
+    // five earlier-sorting files still hide a real test module, just reproducibly. So the
+    // candidates are ordered smallest-first (with a path tie-break for a total order, since
+    // same-size files are common) and the sample is widened to `MAX_TEST_STYLE_PROBES`.
+    // `any` short-circuits, so a crate that does use in-source tests almost always stops
+    // after one read; the budget only binds on crates that do not, where it caps the work at
+    // a fixed number of the smallest files rather than the whole tree.
     if primary_lang == Some(Lang::Rust) {
-        let has_cfg_test = walk
+        let mut rs_files: Vec<&(String, u64)> = walk
             .code_files
             .iter()
             .filter(|(path, _)| {
@@ -727,7 +741,12 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
             })
-            .take(5)
+            .collect();
+        rs_files.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let has_cfg_test = rs_files
+            .iter()
+            .take(MAX_TEST_STYLE_PROBES)
             .any(|(path, _)| {
                 let full = root.join(path);
                 fs::read_to_string(&full)
@@ -750,6 +769,18 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // Hot files — most imported local files
 // ---------------------------------------------------------------------------
 
+/// How many Rust files `test_style` reads looking for an in-source `#[cfg(test)]`.
+///
+/// Bounds the work when a crate has none — `any` short-circuits on the first hit, so a crate
+/// that does use them stops almost immediately. Candidates are taken smallest-first, so this
+/// is a bounded number of cheap reads rather than a bounded number of arbitrary ones.
+const MAX_TEST_STYLE_PROBES: usize = 50;
+
+/// Work budget for the `hot_files` import scan, counted in import lines. See the note at
+/// the loop below for why the budget is in import lines rather than files or bytes, and for
+/// the measurement that set it.
+const MAX_IMPORT_LINES: usize = 500;
+
 fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
     let lang = primary_lang?; // require a detected language
 
@@ -770,21 +801,53 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // Also collect all import source lines for symbol extraction later
     let mut all_import_sources: Vec<String> = Vec::new();
 
-    // No wall-clock cutoff here. There used to be a `start.elapsed() > 100ms` break, which
-    // is a *time* budget deciding which files contribute — so under load, or on a cold
-    // cache, a different prefix of `files` was processed and the reported hot files changed.
-    // That is the one bound shape that cannot be made deterministic, and it was rejected on
-    // the search paths for the same reason.
+    // Budget the scan by *work*, not by wall clock.
     //
-    // Work here is already bounded, and deterministically: `files` is capped at 100 above,
-    // by a total-ordered key. The cost is 100 file reads plus import resolution, measured at
-    // well under the previous 100ms budget even on a large tree — so the cutoff was not
-    // buying anything except instability.
+    // There used to be a `start.elapsed() > 100ms` break here. A time budget decides which
+    // files contribute, so under load or on a cold cache a different prefix was processed
+    // and the reported hot files changed — the one bound shape that cannot be made
+    // deterministic. `files` above is now a total-ordered prefix, which is what makes a
+    // count-based budget over it deterministic: the same tree always yields the same
+    // candidates in the same order, so stopping after a fixed amount of work always stops
+    // in the same place.
+    //
+    // The budget is in import *lines*, because that is the actual cost driver.
+    // `resolve_related_files_with_content` is uncached and, for an unresolvable C/C++
+    // include, probes up to 13 candidate paths — so cost scales with imports per file, not
+    // with file count or with file size. Measured on a 100-file C++ tree of 40 unresolvable
+    // includes each, whole-`fingerprint` wall time:
+    //
+    //   no budget at all   338-377ms warm, 705ms cold — `>250ms budget` warning every run
+    //   MAX_IMPORT_LINES   112-180ms, no warning
+    //
+    // 100 files of 41 lines is a *small* tree, and unbudgeted it breaks the 250ms soft
+    // budget `fingerprint` sets for itself by well over a factor of two.
+    //
+    // No claim here that the removed wall-clock cutoff "cost nothing". An earlier version of
+    // this comment asserted the scan measured well under 100ms even on a large tree; that
+    // was never measured, and it was wrong. The tree that motivated #25 is C#, where
+    // `is_import_line` returns false for every line, so it never exercised this path at all.
+    let mut import_budget = MAX_IMPORT_LINES;
+
     for (rel_path, _) in &files {
+        if import_budget == 0 {
+            break;
+        }
         let full = root.join(rel_path);
         let Ok(content) = fs::read_to_string(&full) else {
             continue;
         };
+
+        // Charge this file to the budget before resolving, so the expensive step is what the
+        // budget actually governs. `max(1)` makes an import-free file cost something, which
+        // bounds the reads as well as the resolutions. A file straddling the limit is
+        // processed in full and the next iteration stops, so the real ceiling is
+        // `MAX_IMPORT_LINES` plus one file's worth — bounded, and a function of the tree.
+        let import_lines = content
+            .lines()
+            .filter(|line| is_import_line(line, lang))
+            .count();
+        import_budget = import_budget.saturating_sub(import_lines.max(1));
 
         // Resolve imports to actual file paths using the proven import resolver
         let resolved = crate::read::imports::resolve_related_files_with_content(&full, &content);
@@ -962,18 +1025,20 @@ mod tests {
         }
     }
 
-    /// The `hot` line must be stable, and must be produced without a wall-clock budget.
+    /// The `hot` line must be present and stable.
     ///
-    /// `hot_files` had two problems. It sorted candidates by size alone and truncated to
-    /// 100, so same-size files — common — were ordered by `fs::read_dir`; and it broke out
-    /// of its loop after 100ms, a *time* budget deciding which files contributed, so under
-    /// load a different prefix was processed. The importer files here are byte-identical in
-    /// length on purpose, so every candidate ties on size and only the path tie-break
-    /// orders them.
+    /// Scoped honestly, because the first version of this docstring claimed more than the
+    /// fixture delivers. With only five candidates against `truncate(100)` no truncation
+    /// occurs, so the candidate sort is **unobservable** here — the rendered order comes
+    /// from the later total-ordered sort of `path_counts`. Mutation testing confirms it:
+    /// reversing the candidate sort entirely still passes. Covering the candidate tie-break
+    /// would need a fixture of >100 same-size importers.
     ///
-    /// The removed time budget is not directly testable — a test cannot reliably make the
-    /// machine slow — so this covers the size tie and the presence of the line. What pins
-    /// the budget's removal is that the loop no longer reads a clock at all.
+    /// What this does cover, verified by mutation: the line is produced at all, and is
+    /// stable across runs. Reinstating a wall-clock break with a zero budget removes the
+    /// line and fails here. A *partial* prefix cutoff is not testable — a test cannot
+    /// reliably make the machine slow — and what pins that is the loop no longer reading a
+    /// clock, plus `MAX_IMPORT_LINES` bounding the work by a count instead.
     #[test]
     fn hot_files_line_is_stable_with_tied_file_sizes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1002,6 +1067,93 @@ mod tests {
             "hot line varied across 8 identical runs:\n{}",
             runs.join("\n---\n")
         );
+    }
+
+    /// Adding unrelated source files must not delete the in-source-tests fact.
+    ///
+    /// `test_style` sampled the first five `.rs` files in `fs::read_dir` order, so this was
+    /// a truncation over an unpinned order that decided *content*: five unrelated files
+    /// visited first, and the `tests:` line lost its `#[cfg(test)]` entry. The two trees here
+    /// differ only by five files that contain no tests and sort before the one that does.
+    #[test]
+    fn unrelated_files_do_not_hide_in_source_tests() {
+        let render = |with_filler: bool| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"ts\"\n").unwrap();
+            // Sorts last by name, and is the largest, so it loses on either ordering.
+            std::fs::write(
+                src.join("zz_late.rs"),
+                "pub fn a() {}\n#[cfg(test)]\nmod tests { #[test] fn t() {} }\n",
+            )
+            .unwrap();
+            if with_filler {
+                for n in 0..5 {
+                    std::fs::write(src.join(format!("aa{n}.rs")), "pub fn b() {}\n").unwrap();
+                }
+            }
+            fingerprint(dir.path())
+        };
+
+        let without = render(false);
+        let with = render(true);
+
+        assert!(
+            without.contains("#[cfg(test)]"),
+            "baseline tree must report in-source tests, or this proves nothing:\n{without}"
+        );
+        assert!(
+            with.contains("#[cfg(test)]"),
+            "five unrelated files must not hide a real test module:\n{with}"
+        );
+    }
+
+    /// `primary_lang`'s tie-break assumes display names are unique — lock that in.
+    ///
+    /// The key is `(count, Reverse(lang_display_name(lang)))`. It is a total order *only*
+    /// because no two `Lang` variants share a display string, which is what makes
+    /// `max_by_key`'s return-the-last-maximum behaviour unreachable. Add
+    /// `Lang::Hpp => "C++"` or `Lang::Mjs => "JavaScript"` and the key silently stops being
+    /// total, restoring hash-order dependence with nothing else failing. This is that
+    /// nothing-else.
+    #[test]
+    fn lang_display_names_are_unique() {
+        use std::collections::HashSet;
+
+        // Every variant `detect_file_type` can produce. Kept explicit rather than derived so
+        // adding a `Lang` forces a decision here.
+        let all = [
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::JavaScript,
+            Lang::Python,
+            Lang::Go,
+            Lang::Java,
+            Lang::Scala,
+            Lang::C,
+            Lang::Cpp,
+            Lang::Ruby,
+            Lang::Php,
+            Lang::CSharp,
+            Lang::Swift,
+            Lang::Kotlin,
+            Lang::Elixir,
+            Lang::Bash,
+            Lang::Dockerfile,
+            Lang::Make,
+        ];
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for lang in all {
+            let name = lang_display_name(lang);
+            assert!(
+                seen.insert(name),
+                "two Lang variants share the display name {name:?}; \
+                 primary_lang's tie-break is no longer a total order"
+            );
+        }
     }
 
     /// A tie on *language* counts must not change the primary language.
