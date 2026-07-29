@@ -11,11 +11,13 @@ const MAX_SUGGESTIONS: usize = 8;
 
 /// Extract import sources from a code file and resolve them to existing local file paths.
 /// Returns empty Vec for non-code files, files with no imports, or when all imports are external.
-pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
+///
+/// `boundary` is the caller's declared scope; see `resolve_related_files_with_content`.
+pub fn resolve_related_files(file_path: &Path, boundary: Option<&Path>) -> Vec<PathBuf> {
     let Ok(content) = fs::read_to_string(file_path) else {
         return Vec::new();
     };
-    resolve_related_files_with_content(file_path, &content)
+    resolve_related_files_with_content(file_path, &content, boundary)
 }
 
 /// Same as `resolve_related_files` but takes pre-read content to avoid a redundant file read.
@@ -25,14 +27,19 @@ pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
 /// must use `resolve_local_imports`; truncating there loses dependencies entirely, since
 /// an import that resolved is also excluded from the external bucket.
 ///
-/// Passes no boundary, so C/C++ include-root resolution here still depends on finding a
-/// `.git` ancestor. A read has no declared scope to use instead. The consequence is
-/// narrow and known: in a non-git tree the post-read "Related:" hint, and the callee
-/// resolution in `search::callees`, miss include-root-relative headers that `tilth_deps`
-/// now finds. deps still lists the file — the import-based merge registers it — just
-/// without per-symbol detail. Fixing it means threading a scope through both call paths.
-pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf> {
-    let mut resolved = resolve_local_imports(file_path, content, None);
+/// `boundary` is the caller's declared scope, and it must be canonical — build it with
+/// `canonical_boundary`. Every caller that has one is expected to pass it, because
+/// `resolve_c_include` uses it as a containment root and, without one, falls back to
+/// requiring a `.git` ancestor. When these callers passed `None` they resolved *fewer*
+/// includes in a non-git tree than `search::deps` did against the same file, so the
+/// post-read hint and `deps` disagreed about whether a header was a local dependency —
+/// the asymmetry #15 is about. Pass `None` only when there genuinely is no scope.
+pub fn resolve_related_files_with_content(
+    file_path: &Path,
+    content: &str,
+    boundary: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut resolved = resolve_local_imports(file_path, content, boundary);
     resolved.truncate(MAX_SUGGESTIONS);
     resolved
 }

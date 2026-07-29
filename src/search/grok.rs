@@ -388,7 +388,14 @@ pub fn grok(
     // --- Callees -----------------------------------------------------------
     let callee_names =
         extract_callee_names(&content, lang, Some((target.start_line, target.end_line)));
-    let resolved = resolve_callees(&callee_names, &target.path, &content, bloom);
+    let boundary = crate::read::imports::canonical_boundary(Some(scope));
+    let resolved = resolve_callees(
+        &callee_names,
+        &target.path,
+        &content,
+        bloom,
+        boundary.as_deref(),
+    );
 
     let resolved_names: HashSet<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
     let externals: Vec<String> = callee_names

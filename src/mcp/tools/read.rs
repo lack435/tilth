@@ -175,7 +175,15 @@ pub(in crate::mcp) fn tool_read(
 
     // Append related-file hint for outlined code files (not section reads, not batch).
     if section.is_none() && crate::read::would_outline(&path) {
-        let related = crate::read::imports::resolve_related_files(&path);
+        // `root` is the caller's declared project root — the same kind of containment
+        // boundary `tilth_deps` gets from `scope`, and the only one a read has. Without
+        // it, C/C++ include-root resolution here falls back to requiring a `.git`
+        // ancestor, so in a non-git tree the hint omitted headers `tilth_deps` listed as
+        // local dependencies of the very file just read (#15). `resolve_c_include`
+        // ignores a root that does not contain the file, so passing it can only add
+        // resolutions, never veto the repository fallback.
+        let boundary = crate::read::imports::canonical_boundary(root);
+        let related = crate::read::imports::resolve_related_files(&path, boundary.as_deref());
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
             for (i, p) in related.iter().enumerate() {
@@ -373,6 +381,116 @@ mod tests {
             !out.lines().any(|l| l.contains(":") && l.contains("|")),
             "stripped output must not expose hash anchors: {out}"
         );
+    }
+
+    /// Build a C++ header that is large enough to be outlined (`would_outline` needs
+    /// more than `TOKEN_THRESHOLD` ≈ 24 KB, and the "Related:" hint only rides along on
+    /// an outlined read), carrying `includes` verbatim at the top.
+    fn bulky_cpp_header(includes: &[&str]) -> String {
+        let mut src = String::from("#pragma once\n");
+        for inc in includes {
+            let _ = writeln!(src, "#include \"{inc}\"");
+        }
+        for i in 0..200 {
+            let _ = writeln!(src, "inline int pad_{i}() {{");
+            for j in 0..20 {
+                let _ = writeln!(src, "    int v_{i}_{j} = {j} * {i} + 42;");
+            }
+            src.push_str("    return 0;\n}\n");
+        }
+        src
+    }
+
+    /// The post-read "Related:" hint must resolve include-root-relative headers in a tree
+    /// that is not a git checkout, using the caller's declared `root` as the containment
+    /// boundary — the same role `scope` plays for `tilth_deps` (#15).
+    ///
+    /// The no-`root` case is the positive control in reverse: without a declared boundary
+    /// there is nothing but the `.git` fallback, the fixture has no `.git`, and the header
+    /// goes unmentioned. That is the old behaviour, and asserting it here is what proves
+    /// the passing half is `root` doing the work rather than the direct sibling check.
+    #[test]
+    fn tool_read_hint_resolves_include_root_headers_under_a_declared_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        for d in ["Character", "Camera"] {
+            std::fs::create_dir_all(module.join(d)).unwrap();
+        }
+        // Deliberately no `.git`, or the boundary is not what is being tested.
+        assert!(
+            !module.join(".git").exists() && !dir.path().join(".git").exists(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+        std::fs::write(
+            module.join("Character/Peer.h"),
+            "#pragma once\nclass Peer {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Camera/CameraMode.h"),
+            "#pragma once\nclass CameraMode {};\n",
+        )
+        .unwrap();
+
+        let target = module.join("Character/HeroComponent.h");
+        // `Character/Peer.h` is written relative to the module root, not to the including
+        // file — own-directory resolution would look for `Character/Character/Peer.h`.
+        std::fs::write(
+            &target,
+            bulky_cpp_header(&["Character/Peer.h", "Camera/CameraMode.h"]),
+        )
+        .unwrap();
+        assert!(
+            crate::read::would_outline(&target),
+            "fixture must be large enough to be outlined, or no hint is emitted at all"
+        );
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let with_root = tool_read(
+            &serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "root": module.to_str().unwrap(),
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect("read with root");
+        // Assert on the hint line alone: the outline of the file quotes its own `#include`
+        // lines, so a substring search over the whole response passes without the hint.
+        let hint = hint_of(&with_root);
+        assert!(
+            hint.contains("Peer.h"),
+            "an include-root-relative header must appear in the hint: {hint}"
+        );
+        assert!(
+            hint.contains("CameraMode.h"),
+            "a peer directory reached via the include root must appear too: {hint}"
+        );
+
+        let without_root = tool_read(
+            &serde_json::json!({ "path": target.to_str().unwrap() }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect("read without root");
+        assert!(
+            !without_root.lines().any(|l| l.starts_with("> Related:")),
+            "control: with no declared root and no .git there is no boundary to resolve \
+             against, so no hint is emitted at all"
+        );
+    }
+
+    /// The "Related:" line of a read response. Panics when absent — every caller here
+    /// asserts about its contents, and "no hint" would silently satisfy a `!contains`.
+    fn hint_of(output: &str) -> &str {
+        output
+            .lines()
+            .find(|l| l.starts_with("> Related:"))
+            .unwrap_or_else(|| panic!("response carries no `> Related:` line:\n{output}"))
     }
 
     #[test]

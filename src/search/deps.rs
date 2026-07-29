@@ -132,7 +132,7 @@ pub fn analyze_deps(
 
     // Local deps via callee resolution
     let callee_names = extract_callee_names(&content, lang, None);
-    let resolved = resolve_callees(&callee_names, path, &content, bloom);
+    let resolved = resolve_callees(&callee_names, path, &content, bloom, boundary.as_deref());
 
     // Group resolved callees by file
     let mut local_by_file: HashMap<PathBuf, Vec<String>> = HashMap::new();
@@ -1176,6 +1176,99 @@ mod tests {
             "it must not ALSO be external — that means the two buckets used different \
              boundaries: {:?}",
             result.uses_external
+        );
+    }
+
+    /// The post-read hint and `deps` must agree about the same include, in both directions,
+    /// in a tree that is not a git checkout (#15).
+    ///
+    /// Only `deps` passed a boundary to the include resolver; the hint and callee resolution
+    /// passed `None` and so needed a `.git` ancestor. Outside a repository that split the two
+    /// apart: `deps` listed `Peer.h` as a local dependency while the hint did not mention it,
+    /// and — because callee resolution shares the same resolver — the `uses_local` entry
+    /// carried no symbols, so `deps` named the file without saying what it used from it.
+    ///
+    /// Both directions are asserted, not just "the hint caught up". During #10's review the
+    /// asymmetry ran the *other* way, with `deps` resolving fewer includes than the hint,
+    /// which a one-sided subset check would have passed.
+    ///
+    /// Set equality is the right assertion for *this* fixture specifically: every local
+    /// dependency here arrives through an `#include`, so the callee-resolved half of
+    /// `uses_local` cannot contribute a path the import-based hint lacks. The fixture also
+    /// stays under `MAX_SUGGESTIONS`, or the hint's cap would break equality on its own.
+    #[test]
+    fn cpp_read_hint_and_deps_agree_about_an_include_root_header_without_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("ModuleRoot");
+        for d in ["Character", "Camera"] {
+            std::fs::create_dir_all(module.join(d)).unwrap();
+        }
+        // Deliberately no `.git`: with one, both paths resolve via the repository fallback
+        // and agree by luck, so the fixture could not detect the split at all.
+        assert!(
+            !module.join(".git").exists() && !dir.path().join(".git").exists(),
+            "fixture must not sit inside a repository, or it proves nothing"
+        );
+        std::fs::write(
+            module.join("Character/Peer.h"),
+            "#pragma once\nvoid ConnectPeer(int id);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Camera/CameraMode.h"),
+            "#pragma once\nvoid ApplyCameraMode(int mode);\n",
+        )
+        .unwrap();
+        // Written relative to the module root, not to the including file: own-directory
+        // resolution looks for `Character/Character/Peer.h` and finds nothing.
+        let target = module.join("Character/HeroComponent.h");
+        std::fs::write(
+            &target,
+            "#pragma once\n\
+             #include \"Character/Peer.h\"\n\
+             #include \"Camera/CameraMode.h\"\n\
+             void Setup() {\n\
+             \x20   ConnectPeer(1);\n\
+             \x20   ApplyCameraMode(2);\n\
+             }\n",
+        )
+        .unwrap();
+
+        // The hint's boundary is the declared project root; deps' is the declared scope.
+        // Here they are the same directory, which is the case the two must agree on.
+        let boundary = crate::read::imports::canonical_boundary(Some(&module));
+        let hint = crate::read::imports::resolve_related_files(&target, boundary.as_deref());
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&target, &module, &bloom).unwrap();
+
+        // Compare canonical forms: deps canonicalizes its target before resolving, the hint
+        // does not, and on Windows that is the difference between `C:\x` and `\\?\C:\x`.
+        let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let hint_set: HashSet<PathBuf> = hint.iter().map(|p| canon(p)).collect();
+        let deps_set: HashSet<PathBuf> = result.uses_local.iter().map(|d| canon(&d.path)).collect();
+
+        assert!(
+            hint_set.iter().any(|p| p.ends_with("Peer.h")),
+            "the include-root-relative header must reach the hint: {hint_set:?}"
+        );
+        assert_eq!(
+            hint_set, deps_set,
+            "the hint and deps must resolve the same includes to the same files"
+        );
+
+        // The half that made `deps` output visibly thinner: callee resolution shares the
+        // hint's resolver, so with no boundary it could not open `Peer.h` and the entry
+        // named the file with an empty symbol list.
+        let peer = result
+            .uses_local
+            .iter()
+            .find(|d| d.path.ends_with("Peer.h"))
+            .expect("Peer.h must be a local dependency");
+        assert!(
+            peer.symbols.iter().any(|s| s == "ConnectPeer"),
+            "the local dep must carry per-symbol detail, got {:?}",
+            peer.symbols
         );
     }
 
