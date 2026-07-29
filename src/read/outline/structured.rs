@@ -14,6 +14,10 @@ use std::path::Path;
 /// the BOM rendering as a stray character in the first YAML key and the `key_value`
 /// passthrough. `toml` strips a BOM itself, so that arm neither needs nor notices this.
 pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
+    // Redundant since #42 moved the same strip up into `generate`, this arm's only caller.
+    // Kept because the reason it is here is a property of *this* function — `yaml_outline`
+    // derives indent from `line.len() - trimmed.len()` — not of who happens to call it, and
+    // a direct caller added later would reintroduce the skew.
     let content = crate::lang::outline::strip_bom(content);
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => json_outline(content, max_lines),
