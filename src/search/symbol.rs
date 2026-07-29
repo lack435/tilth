@@ -87,8 +87,11 @@ const FULL_MAX_MATCHES: usize = 100;
 //    above: a 5-target query on that tree went 22.1s -> 38.2s. Fixed since — `search_multi`
 //    now walks once for every target and partitions afterwards. See its own note for the
 //    measurement.
-//  * Peak RSS at this scale is dominated by `BloomFilterCache`, which holds one filter
-//    per code file walked and is unbounded. Tracked separately.
+//  * Peak RSS grew with the retained match set. Note this path does *not* populate
+//    `BloomFilterCache` — that is the `callers`/`deps` cost, and an earlier version of this
+//    bullet named it here by mistake. What costs on the symbol path is the matches
+//    themselves; `search_multi` now holds every target's at once, measured in its own note.
+//    Tracked with the rest of the memory work in #13.
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -257,6 +260,23 @@ fn assemble(
 ///
 /// Rendered output is byte-identical across the two, verified on that tree for this query
 /// and for the `callers` equivalent — the walk count changed, nothing else.
+///
+/// **This buys wall time with peak memory, and the trade is worth stating.** The sequential
+/// version held one target's raw matches at a time: search, assemble, truncate to ten, move
+/// on. Both walks here return every target's raw matches before any of them is assembled,
+/// so the peak is the sum across targets. `mem::take` frees each bucket as it is assembled,
+/// which shortens the tail but not the peak.
+///
+/// On that tree, same query, peak working set: **93 MB -> 120 MB**, against 76s -> 32s. But
+/// the term that grew scales with *total matches*, not tree size, so a query that matches
+/// far more densely pays far more: on a synthetic 48 MB tree of 4001 files contrived so each
+/// of five symbols matches 240k times, the same measurement is 126 MB -> 427 MB.
+///
+/// Real code sits nearer the first number, and both are inside what `callers` already costs
+/// on the same tree. Bounding it properly means retaining less than everything during the
+/// walk — `rank::selection_score` exists for exactly that — but a *count*-based bound is the
+/// non-determinism #18 removed, so it needs to be a value-based one and that is its own
+/// change. Tracked with the rest of the memory work in #13.
 ///
 /// Both walks are keyed on a single needle in the single-query path — `memmem` on the
 /// query, and a compiled `\bquery\b`. Batching means a multi-needle prefilter and
@@ -589,7 +609,14 @@ fn find_definitions_multi(
             let tree = ts_language
                 .as_ref()
                 .and_then(|ts_lang| parse_tree(ts_lang, &content));
-            let lines: Vec<&str> = content.lines().collect();
+            // Only the tree-sitter arm needs the line index, and it needs it once for the
+            // file rather than once per query. The fallbacks below work off `content`
+            // directly, so a markdown or no-grammar file should not pay for this.
+            let lines: Vec<&str> = if tree.is_some() {
+                content.lines().collect()
+            } else {
+                Vec::new()
+            };
 
             let mut per_query: Vec<(usize, Vec<Match>)> = Vec::new();
             for &i in &present {
@@ -716,18 +743,22 @@ fn find_usages_multi(
             for i in 0..queries.len() {
                 let query = queries[i];
                 let bucket = &mut file_matches[i];
-                // A fresh `Searcher` per query, not one reused across them.
+                // A fresh `Searcher` per query, so this loop body is structurally the same
+                // search `find_usages` performs — one searcher, one `search_slice`, one
+                // file. That is the whole justification, and it is worth being exact about
+                // it: reuse across queries was **not** observed to break anything.
                 //
-                // `Searcher` owns a decoder for BOM-sniffed transcoding, and that decoder
-                // carries state between `search_slice` calls. Reusing one searcher made the
-                // second and later queries under-report on encoded files: measured on a
-                // large C++ tree, a two-target query returned 20077 usages for a symbol that
-                // a lone search reported 20095 of — 18 lines, from the handful of UTF-16
-                // files in the tree, silently missing.
+                // An earlier version of this comment claimed a reused `Searcher` carried
+                // decoder state between `search_slice` calls and under-reported on encoded
+                // files. That is wrong — grep-searcher builds a fresh `DecodeReaderBytes`
+                // per call and clears the line buffer, and hoisting the searcher out of
+                // this loop leaves every test here green. The undercount that prompted it
+                // was entirely the `memmem` gate described above.
                 //
-                // The single-query walk builds one searcher per file, so building one per
-                // (file, query) is what makes the batched buckets identical to it. It is
-                // also the cheap half: the walk and the read are shared, which is the point.
+                // Kept per-query anyway because it costs nothing measurable (three reps on
+                // a large tree: 9.79-9.95s fresh, 10.06-10.37s reused, byte-identical
+                // output) and because matching the single-query shape is what makes the
+                // buckets identical by construction rather than by argument.
                 let mut searcher = Searcher::new();
                 let _ = searcher.search_slice(
                     &matchers[i],
@@ -2390,8 +2421,8 @@ using MyAlias = float;
     /// Five targets must be two walks, not ten.
     ///
     /// `search_multi_symbol_expanded` called `search` once per target, and each of those is
-    /// two full traversals joined by `rayon::join`. Counted at `search::walker`, the single
-    /// place a traversal is built, so this covers both walks rather than the one the test
+    /// two full traversals joined by `rayon::join`. Counted at `search::walker`, which builds
+    /// every traversal on this path, so it covers both walks rather than the one the test
     /// remembered to look for.
     ///
     /// Driven through `search_multi_symbol_expanded` rather than `search_multi` directly,
@@ -2466,14 +2497,20 @@ using MyAlias = float;
 
     /// A BOM-marked UTF-16 file must contribute to every query, not just the first.
     ///
-    /// `Searcher` owns a decoder for BOM-sniffed transcoding and that decoder carries state
-    /// across `search_slice` calls, so a batched walk that reused one searcher per file
-    /// under-reported for the second and later queries. Found on a large C++ tree, where a
-    /// two-target query returned 18 fewer usages of a symbol than a lone search of it — a
-    /// silent undercount in the totals an agent reads, not a crash.
+    /// What this pins is the **absence of a `memmem` needle gate** on the usages walk. The
+    /// gate looks free — `\bq\b` can only match where the literal `q` appears — and is
+    /// wrong here, because `Searcher` BOM-sniffs and transcodes: a UTF-16 file matches
+    /// `\balpha\b` while its raw bytes contain no ASCII `alpha` anywhere. Adding the gate
+    /// back to `find_usages_multi` fails this test.
     ///
-    /// UTF-16 rather than plain UTF-8 because the plain case never engaged the decoder and
-    /// so never reproduced it: every ASCII fixture passed with the bug present.
+    /// Found on a large C++ tree, where a two-target query returned 18 fewer usages of a
+    /// symbol than a lone search of it — a silent undercount in the totals an agent reads,
+    /// not a crash. UTF-16 rather than plain UTF-8 because the plain case never engages the
+    /// decoder and so never reproduces it: every ASCII fixture here passed with the bug
+    /// present.
+    ///
+    /// It does **not** pin the fresh-`Searcher`-per-query shape next to it; hoisting the
+    /// searcher out of that loop leaves this green. See the comment there.
     #[test]
     fn an_encoded_file_contributes_to_every_batched_query() {
         let dir = tempfile::tempdir().unwrap();

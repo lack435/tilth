@@ -107,11 +107,16 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
 
 /// Tree walks constructed, per scope, for tests that assert how many a query performs.
 ///
-/// `walker` is the single place every traversal is built, so counting here counts all of
-/// them — the primary walk, second hops, existence scans, definition and usage walks — with
+/// `walker` builds every traversal on the search paths this measures — the primary caller
+/// walk, second hops, existence scans, definition and usage walks — so counting here needs
 /// no per-call-site instrumentation to fall out of date. Counting construction rather than
 /// completion is deliberate: a walk that is built is a walk that runs, and construction is
 /// where the count is unambiguous.
+///
+/// Not literally every walk in the crate: `find_basename_fallback` below and `map.rs` build
+/// their own. Neither is reachable from the paths under test — `find_basename_fallback` only
+/// through `format_search_result`, which the multi-symbol path does not call — but a
+/// traversal added outside `walker` would be invisible here rather than loudly wrong.
 ///
 /// **Keyed by scope, not a bare counter**, for two reasons that between them rule out the
 /// simpler options. Tests run in parallel in one process, so a global counter is inflated by

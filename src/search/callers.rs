@@ -52,9 +52,9 @@ const FULL_MAX_MATCHES: usize = 100;
 // That per-walk cost is why `search_callers_multi_expanded` no longer runs a walk per
 // target. It used to: the second hop ran inside the render loop and the existence scan
 // behind the no-callers message ran once per empty target, so five targets could be six
-// or more full traversals. It is a fixed two now — see that function. Peak RSS at this
-// scale is dominated by `BloomFilterCache`, which holds one filter per code file walked
-// and is currently unbounded.
+// or more full traversals. It is at most three now, whatever the target count — see that
+// function. Peak RSS at this scale is dominated by `BloomFilterCache`, which holds one
+// filter per code file walked and is currently unbounded.
 //
 // `search::symbol` and `search::content` carried the same count-gated walks and were
 // fixed the same way afterwards — see the notes at the top of those two files for the
@@ -630,10 +630,13 @@ fn write_second_hop_impact(
 /// and starvation of a later target by a hit-rich earlier one is not possible once
 /// every candidate file is visited.
 ///
-/// Cost: **two walks, whatever the target count.** The second hop used to run inside the
-/// render loop, so a 5-target query was one primary walk plus up to five second-hop walks.
-/// Ranking every bucket first, walking the union of their caller names once, and
-/// partitioning by `via` makes that 1+1 and leaves the rendering untouched; see
+/// Cost: **at most three walks, whatever the target count** — the primary walk, one shared
+/// second hop, and one shared existence scan. Two for a query whose targets all have
+/// callers or all have none; three only for a mixed query, which needs both of the latter.
+///
+/// It was 1+N+M: the second hop ran inside the render loop and the existence scan ran once
+/// per target that found nothing. Ranking every bucket first, walking the union of their
+/// caller names once, and partitioning by `via` is what bounds it; see
 /// `write_second_hop_impact` for why the partition is lossless.
 ///
 /// Measured over MCP `tilth_search`, `kind: "callers"`, `expand: 0`, on a large C++ tree
@@ -1174,7 +1177,7 @@ mod tests {
     /// order of 57s on a ~175k-file C++ tree against a 90s request timeout. The existence
     /// scan behind the no-callers message had the same 1-per-target shape.
     ///
-    /// Counted at `search::walker`, the single place a traversal is built, so this covers
+    /// Counted at `search::walker`, which builds every traversal on this path, so it covers
     /// every walk the query performs rather than the ones the test remembered to look for.
     #[test]
     fn multi_target_callers_walks_the_tree_a_bounded_number_of_times() {
@@ -1212,6 +1215,79 @@ mod tests {
             walks, 2,
             "5 absent targets must be one primary walk plus one shared existence scan"
         );
+
+        // Mixed: some targets have callers, some do not, so both shared walks run. Three,
+        // not two — the bound is "one of each", not "two". Worth pinning, because the two
+        // homogeneous cases above are both 2 and would let a doc comment claiming a flat
+        // two go unchallenged.
+        let mixed: Vec<&str> = targets
+            .iter()
+            .take(3)
+            .copied()
+            .chain(["nope_a", "nope_b"])
+            .collect();
+        crate::search::reset_walk_count(dir.path());
+        let out = search_callers_multi_expanded(&mixed, dir.path(), &bloom, 0, None, None, false)
+            .unwrap();
+        let walks = crate::search::walk_count(dir.path());
+        assert!(
+            out.contains("-- impact (2nd hop) --")
+                && out.contains("does not appear anywhere in scope"),
+            "the mixed fixture must exercise both shared walks:\n{out}"
+        );
+        assert_eq!(
+            walks, 3,
+            "a mixed query is the primary walk, one second hop and one existence scan"
+        );
+    }
+
+    /// A caller shared by two targets must appear in both buckets.
+    ///
+    /// The shared second hop walks the union of every target's caller names and each bucket
+    /// filters it by `via`. `write_multi_target_fixture` gives every target disjoint caller
+    /// names, so it never exercises the case where one `via` belongs to two targets — which
+    /// is exactly the shape that would break an implementation that *consumed* entries from
+    /// the shared vector instead of filtering it.
+    #[test]
+    fn a_caller_shared_by_two_targets_appears_in_both_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        // `common` calls both targets, so it is in both `all_caller_names` sets.
+        std::fs::write(
+            dir.path().join("t.rs"),
+            "fn first() {}\nfn second() {}\nfn common() { first(); second(); }\n",
+        )
+        .unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                dir.path().join(format!("h{i}.rs")),
+                format!("fn hop2_{i}() {{ common(); }}\n"),
+            )
+            .unwrap();
+        }
+
+        let targets = ["first", "second"];
+        let multi =
+            search_callers_multi_expanded(&targets, dir.path(), &bloom, 0, None, None, false)
+                .unwrap();
+
+        for name in targets {
+            let single =
+                search_callers_expanded(name, dir.path(), &bloom, 0, None, None, false).unwrap();
+            let bucket = single
+                .rsplit_once("\n\n(")
+                .map_or(single.as_str(), |(body, _)| body);
+            assert!(
+                bucket.contains("-- impact (2nd hop) --"),
+                "{name} must have a second hop for this to test anything:\n{bucket}"
+            );
+            assert!(
+                multi.contains(bucket),
+                "{name}'s bucket must survive a `via` shared with the other target.\n\
+                 --- single ---\n{bucket}\n--- multi ---\n{multi}"
+            );
+        }
     }
 
     /// Every bucket of a multi-target query must be byte-identical to the single-target
