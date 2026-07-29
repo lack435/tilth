@@ -265,12 +265,7 @@ fn find_callers_treesitter_batch(
         return Vec::new();
     };
 
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::lang::parse_masked(content, Some(lang), ts_lang) else {
         return Vec::new();
     };
 

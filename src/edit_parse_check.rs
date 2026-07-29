@@ -63,8 +63,8 @@ pub(crate) fn check(path: &Path, before: &str, after: &str) -> Option<ParseRepor
     // internally) reads as a clean parse via `?`. Intentional advisory
     // limitation — effectively unreachable here: tree-sitter is error-tolerant,
     // the language is always set, and no parse timeout is configured.
-    let pre = parse_errors(&grammar, before)?;
-    let post = parse_errors(&grammar, after)?;
+    let pre = parse_errors(&grammar, before, lang)?;
+    let post = parse_errors(&grammar, after, lang)?;
 
     let total_post = post.len();
     let new_errors = multiset_subtract(&pre, post);
@@ -105,10 +105,16 @@ pub(crate) fn format_report(report: &ParseReport) -> String {
     out
 }
 
-fn parse_errors(grammar: &tree_sitter::Language, source: &str) -> Option<Vec<ParseError>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(grammar).ok()?;
-    let tree = parser.parse(source, None)?;
+/// Masked like every other parse: an export macro is not a syntax error the user
+/// introduced, and counting it as one puts a permanent floor of pre-existing errors
+/// under every Windows C++ header — exactly the files this check is most useful on.
+/// Both sides are masked, so the before/after diff stays honest either way.
+fn parse_errors(
+    grammar: &tree_sitter::Language,
+    source: &str,
+    lang: crate::types::Lang,
+) -> Option<Vec<ParseError>> {
+    let tree = crate::lang::parse_masked(source, Some(lang), grammar)?;
     let mut errors = Vec::new();
     collect_errors(tree.root_node(), source.as_bytes(), &mut errors);
     errors.sort_by_key(|e| (e.line, e.col));
