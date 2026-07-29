@@ -293,7 +293,13 @@ fn fingerprint_inner(root: &Path) -> String {
             // was in every case the silence, not the parse failure — an agent that can see
             // "not UTF-8" can fix its manifest or stop trusting the block, whereas an absent
             // block reads as "this project has no name", which is a claim tilth cannot make.
-            Err(reason) => write!(manifest_line, " — unreadable: {reason}").unwrap(),
+            //
+            // "unusable", not "unreadable": half the reasons are parse failures on a file
+            // that read perfectly well, and telling an agent a syntax error is a read error
+            // sends it to re-save the encoding instead of to the broken line. "Unusable" is
+            // true across all of them — unreadable, unparseable, unsupported — and stays a
+            // single greppable marker.
+            Err(reason) => write!(manifest_line, " — unusable: {reason}").unwrap(),
         }
         lines.push(manifest_line);
     }
@@ -609,18 +615,34 @@ fn parse_manifest(root: &Path, manifest: &str) -> Result<ManifestInfo, String> {
 /// unusual but not exotic. `overview` exists to orient an agent *without* a tool call, so
 /// this is the one place a silent failure is both invisible and load-bearing.
 ///
-/// The reasons are fixed strings rather than the OS error text on purpose. They land in the
-/// fingerprint, which #28 made deterministic and which the byte-lock tests compare
-/// literally, and `io::Error`'s `Display` is free to differ between platforms and locales.
+/// The reasons are fixed strings rather than `io::Error`'s `Display`, which is free to vary
+/// with platform and locale. Nothing currently pins fingerprint text — the two byte-lock
+/// tests cover `SERVER_INSTRUCTIONS` and `EDIT_MODE_EXTRA`, not this — so the guard here is
+/// `unreadable_reasons_do_not_vary_by_platform` plus the deterministic-output property #28
+/// established, not a golden file.
+///
+/// Fixed strings alone are **not** sufficient, because `ErrorKind` itself diverges for the
+/// same logical failure. A directory named `package.json` — which `find_manifest` accepts,
+/// since `Path::exists()` is true for directories — surfaces as `PermissionDenied` on
+/// Windows and `IsADirectory` on Linux. Reporting "permission denied" for that would send an
+/// agent chasing file modes for a problem that is "this is a directory", so the kind is
+/// tested explicitly up front rather than inferred from the error.
 fn read_manifest(path: &Path) -> Result<String, String> {
+    // Ahead of the read, so the answer does not depend on which errno the platform picks.
+    if path.is_dir() {
+        return Err("not a file".to_string());
+    }
     fs::read_to_string(path).map_err(|e| {
         match e.kind() {
-            // What a UTF-16 (or otherwise non-UTF-8) file produces.
+            // What a UTF-16 (or otherwise non-UTF-8) file produces. Raised by std's own
+            // UTF-8 validation rather than by the OS, so it is stable across platforms.
             std::io::ErrorKind::InvalidData => "not UTF-8",
             std::io::ErrorKind::PermissionDenied => "permission denied",
             // `find_manifest` stat'd the file moments ago, so this is a genuine race.
             std::io::ErrorKind::NotFound => "disappeared during the scan",
-            _ => "unreadable",
+            // Deliberately not the word "unreadable": that is the line's own prefix in the
+            // old spelling, and "unreadable: unreadable" told the reader nothing at all.
+            _ => "read failed",
         }
         .to_string()
     })
@@ -721,6 +743,19 @@ fn parse_go_mod(root: &Path) -> Result<ManifestInfo, String> {
                 }
             }
         }
+    }
+
+    // `go.mod` is the one format with no parser to fail, so nothing here could ever report
+    // a reason — a file that yields neither a module name nor a require entry produced a
+    // bare `manifest: go.mod` and looked like an unnamed module rather than a broken file.
+    //
+    // Reachable in exactly the way #43 is about, and not covered by the read check above:
+    // UTF-16 LE *without* a BOM is valid UTF-8, because NUL is a legal UTF-8 byte. So
+    // `read_manifest` returns `Ok("m\0o\0d\0u\0l\0e\0 …")`, every `strip_prefix` misses, and
+    // the failure is silent again. `module` is mandatory in a real `go.mod`, so requiring
+    // one signal or the other costs nothing on a valid file.
+    if name.is_none() && deps.is_empty() {
+        return Err("no module directive".to_string());
     }
 
     let (deps, dep_total) = cap_deps(deps);
@@ -1227,37 +1262,154 @@ mod tests {
     fn an_unreadable_manifest_says_why_and_keeps_the_rest_of_the_block() {
         let body = "{\"name\":\"utf16-app\",\"version\":\"9.9.9\"}";
 
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), utf16le_with_bom(body)).unwrap();
-        std::fs::write(dir.path().join("index.js"), "export const x = 1;\n").unwrap();
-        // A second file so `tests:` has something to find, proving the non-manifest lines
-        // are reached rather than merely absent for their own reasons.
-        std::fs::write(dir.path().join("index.test.js"), "test('x', () => {});\n").unwrap();
+        // Both testable rescued lines are made reachable, not just `tests:`. With only one
+        // live, re-nesting the other back under the parse-success arm would leave this green.
+        //
+        // `git:` is the third and is deliberately uncovered: `git_context` shells out, which
+        // is why `dirty_summary` was split out of it "purely so it is testable". It sits in
+        // the same unconditional block as these two, so what pins the structure pins it too.
+        let build = |dir: &Path, manifest: &[u8]| {
+            std::fs::write(dir.join("package.json"), manifest).unwrap();
+            // -> tests:
+            std::fs::write(dir.join("index.test.js"), "test('x', () => {});\n").unwrap();
+            // Two importers of one module -> hot:
+            std::fs::write(dir.join("util.js"), "export const u = 1;\n").unwrap();
+            for f in ["a.js", "b.js"] {
+                std::fs::write(dir.join(f), "import { u } from './util';\n").unwrap();
+            }
+        };
 
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), &utf16le_with_bom(body));
         let out = fingerprint(dir.path());
 
         assert!(
-            out.contains("manifest: package.json — unreadable: not UTF-8"),
-            "an unreadable manifest must name itself and say why:\n{out}"
+            out.contains("manifest: package.json — unusable: not UTF-8"),
+            "an unusable manifest must name itself and say why:\n{out}"
         );
-        assert!(
-            out.contains("tests:"),
-            "lines that do not depend on the manifest must survive it:\n{out}"
-        );
+        for line in ["hot (× = importers):", "tests:"] {
+            assert!(
+                out.contains(line),
+                "`{line}` does not depend on the manifest and must survive it:\n{out}"
+            );
+        }
 
         // The control: the identical content as UTF-8 reports name and version, so the
         // assertions above are about the encoding and not about a broken fixture.
         let ok_dir = tempfile::tempdir().unwrap();
-        std::fs::write(ok_dir.path().join("package.json"), body).unwrap();
-        std::fs::write(ok_dir.path().join("index.js"), "export const x = 1;\n").unwrap();
+        build(ok_dir.path(), body.as_bytes());
         let ok_out = fingerprint(ok_dir.path());
         assert!(
             ok_out.contains("utf16-app") && ok_out.contains("9.9.9"),
             "fixture is broken: the UTF-8 spelling must parse:\n{ok_out}"
         );
         assert!(
-            !ok_out.contains("unreadable"),
+            !ok_out.contains("unusable"),
             "a readable manifest must not carry the note:\n{ok_out}"
+        );
+
+        // Line order is claimed unchanged by the restructure, so pin it. Without this,
+        // moving the manifest block above hot/git/tests leaves every test in the file green.
+        let idx = |hay: &str, needle: &str| {
+            hay.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}:\n{hay}"))
+        };
+        for text in [&out, &ok_out] {
+            assert!(
+                idx(text, "hot (× = importers):") < idx(text, "tests:")
+                    && idx(text, "tests:") < idx(text, "manifest:"),
+                "emission order must stay hot -> [git] -> tests -> manifest:\n{text}"
+            );
+        }
+    }
+
+    /// Every manifest format must report the same reason for the same failure.
+    ///
+    /// They share `read_manifest`, so this is cheap insurance rather than deep coverage —
+    /// but the issue names all four, and a parser reverting to `.ok()?` on its own would
+    /// otherwise be caught by nothing.
+    #[test]
+    fn every_manifest_format_reports_a_utf16_file() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+            ),
+            ("package.json", "{\"name\":\"p\",\"version\":\"0.1.0\"}"),
+            ("go.mod", "module example.com/g\n"),
+            (
+                "pyproject.toml",
+                "[project]\nname = \"y\"\nversion = \"0.1.0\"\n",
+            ),
+        ];
+
+        for (manifest, body) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(manifest), utf16le_with_bom(body)).unwrap();
+            std::fs::write(dir.path().join("main.go"), "package main\n").unwrap();
+
+            let out = fingerprint(dir.path());
+            assert!(
+                out.contains(&format!("manifest: {manifest} — unusable: not UTF-8")),
+                "{manifest} in UTF-16 must report a reason:\n{out}"
+            );
+        }
+    }
+
+    /// UTF-16 LE *without* a BOM is valid UTF-8 — NUL is a legal UTF-8 byte — so it sails
+    /// past the read check and reaches the parser as NUL-interleaved text.
+    ///
+    /// `go.mod` is the one format with no parse step to fail, so it produced a bare
+    /// `manifest: go.mod`: an unnamed module rather than a broken file, which is #43's
+    /// silence wearing different clothes. PowerShell's `-Encoding Unicode` always writes a
+    /// BOM so this exact spelling is unlikely, but any garbage-but-UTF-8 `go.mod` takes the
+    /// same path.
+    #[test]
+    fn a_bomless_utf16_go_mod_reports_a_reason() {
+        let mut bytes = Vec::new();
+        for unit in "module github.com/acme/widget\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(
+            std::str::from_utf8(&bytes).is_ok(),
+            "fixture must be valid UTF-8, or it proves the wrong thing"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), &bytes).unwrap();
+        std::fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc main() {}\n",
+        )
+        .unwrap();
+
+        let out = fingerprint(dir.path());
+        assert!(
+            out.contains("manifest: go.mod — unusable: no module directive"),
+            "a go.mod yielding neither a module name nor requires must say so:\n{out}"
+        );
+    }
+
+    /// The reason must not depend on which errno the platform chose.
+    ///
+    /// `find_manifest` uses `Path::exists()`, which is true for directories, so a *directory*
+    /// named `package.json` reaches `read_manifest`. `read_to_string` reports that as
+    /// `PermissionDenied` on Windows and `IsADirectory` on Linux — so deriving the reason
+    /// from `ErrorKind` alone both diverged across platforms and told a Windows agent to go
+    /// fix file modes for a problem that is "this is a directory". CI is Linux-only while
+    /// development here is Windows, which is why
+    /// `path_bearing_lines_are_identical_across_platforms` exists; this is the same hazard
+    /// in the same payload.
+    #[test]
+    fn unreadable_reasons_do_not_vary_by_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("package.json")).unwrap();
+        std::fs::write(dir.path().join("index.js"), "export const x = 1;\n").unwrap();
+
+        let out = fingerprint(dir.path());
+        assert!(
+            out.contains("manifest: package.json — unusable: not a file"),
+            "a directory named package.json must report the same reason everywhere:\n{out}"
         );
     }
 
@@ -1274,7 +1426,7 @@ mod tests {
 
         let out = fingerprint(dir.path());
         assert!(
-            out.contains("manifest: package.json — unreadable: malformed JSON"),
+            out.contains("manifest: package.json — unusable: malformed JSON"),
             "a malformed manifest must say so:\n{out}"
         );
     }
