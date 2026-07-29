@@ -3,7 +3,7 @@ name = "tilth"
 # Fork of upstream v0.9.0, carrying C++ type support. The `-lack.N` pre-release
 # suffix keeps `tilth --version` and any pinned SHA unambiguously distinct from an
 # upstream v0.9.0 build.
-version = "0.9.0-lack.5"
+version = "0.9.0-lack.6"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
