@@ -1007,7 +1007,10 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
 /// The `lang` parameter is needed to disambiguate `use` (Rust path vs Elixir module)
 /// and `import` (JS/TS `from` syntax vs Elixir/Python/Go bare module name).
 pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
-    let trimmed = text.trim().trim_end_matches(';');
+    // BOM-aware at the front so a line-1 import in a BOM'd file extracts the same source
+    // as it would without one — and, more importantly, so extraction cannot disagree with
+    // `is_import_line`, which uses the same helper. See `trim_start_bom_aware`.
+    let trimmed = trim_start_bom_aware(text).trim_end().trim_end_matches(';');
 
     // Bash: `source ./lib.sh`, `. ./lib.sh`, or tab-separated variants
     if lang == Some(crate::types::Lang::Bash) {
@@ -1084,6 +1087,39 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .to_string()
 }
 
+/// Leading whitespace stripped, plus a UTF-8 BOM if one is sitting in front of it.
+///
+/// `str::trim_start` trims Unicode `White_Space`, and U+FEFF is *not* in that class — it
+/// was removed from it years ago. So a file saved with a BOM yields a first line whose
+/// text begins with U+FEFF, every `starts_with`/`strip_prefix` test against it fails, and
+/// line 1 is not an import to any consumer: it contributes to neither `uses_local` nor
+/// `uses_external` and vanishes from `tilth_deps` with no warning. Roughly 3% of files in
+/// two large C++ trees carry a BOM; the exposure is worse for Rust, Python and TypeScript,
+/// where line 1 is far more often the first import (58% of tilth's own Rust files open
+/// with `use `).
+///
+/// Only line 1 of a file can be affected — a BOM occurs once, at file start — but this is
+/// the one line-prefix decision shared by every language arm, so one helper covers all of
+/// them. Detection (`read::imports::is_import_line`) and extraction
+/// (`extract_import_source`) must both use it. Fixing only detection would leave the BOM'd
+/// line passing detection and then missing every per-language `strip_prefix` in extraction,
+/// falling through to the generic last-token fallback: `from .mod_a import X` would yield
+/// the dependency name `X`, and `import { A } from './mod';` would yield `'./mod';`. The
+/// fallback happens to be right for Rust, so the damage is language-dependent — but where
+/// it lands it converts a silent drop into a bogus entry, which is not an improvement.
+///
+/// Whitespace on both sides of the BOM is handled, since a BOM is a byte-order marker
+/// rather than a syntactic element and nothing forbids `\u{feff}    use foo;`. Repeats are
+/// handled too: prepending a BOM to an already-BOM'd file is a real artifact of tools that
+/// do not check for one first, and stopping after the first would leave the second in place
+/// and drop the import exactly as before.
+pub(crate) fn trim_start_bom_aware(line: &str) -> &str {
+    // One pass over "whitespace or BOM" rather than chained trims, so any interleaving of
+    // the two is consumed. `str::trim_start` is defined as `char::is_whitespace`, so this
+    // is exactly `trim_start` widened by U+FEFF and nothing else.
+    line.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+}
+
 /// The text following a C/C++ `#include` directive, or `None` when the line is not one.
 ///
 /// Whitespace is legal between the `#` and the directive name — `# include "X.h"`, and
@@ -1101,7 +1137,7 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
 /// `#include_next` is left for `c_include_header_name` to strip, so the returned text is
 /// everything after `include` either way.
 pub(crate) fn c_include_directive_rest(line: &str) -> Option<&str> {
-    line.trim_start()
+    trim_start_bom_aware(line)
         .strip_prefix('#')?
         .trim_start()
         .strip_prefix("include")

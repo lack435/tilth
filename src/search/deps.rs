@@ -788,6 +788,126 @@ mod tests {
         );
     }
 
+    /// A UTF-8 BOM on line 1, driven through the function that produces the buckets.
+    ///
+    /// U+FEFF is not Unicode `White_Space`, so `trim_start` left it in front of the first
+    /// import and every line-prefix test failed. The import went into neither `uses_local`
+    /// nor `uses_external` — the same silent-drop shape as the trailing-comment and
+    /// spaced-`#` include bugs, from a third direction and for every language at once.
+    ///
+    /// The `read::imports` unit tests stop at local resolution; this path also runs
+    /// `is_valid_module_path` and `is_stdlib`, which is where the external half of the
+    /// acceptance criteria lives.
+    ///
+    /// Only line 1 carries the BOM, so which import sits there decides which bucket the
+    /// test actually exercises. The cases put a *local* import on line 1 for C++, Rust and
+    /// Python, then repeat C++ with the order reversed so an external import takes the
+    /// BOM too — without that row the `uses_external` half of the comparison comes from
+    /// two identical un-BOM'd lines and is satisfied trivially.
+    ///
+    /// Each variant gets its own tempdir so the reverse-dependency scan cannot see the
+    /// other one's copy of the fixture.
+    #[test]
+    fn bom_on_line_one_reaches_the_same_buckets_as_an_unmarked_file() {
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+        // (subdirectory, entry file, body, sibling files, expected local, expected external)
+        let cases: &[(&str, &str, &str, &[(&str, &str)], &str, &[&str])] = &[
+            (
+                "",
+                "Main.cpp",
+                "#include \"Local.h\"\n#include <vector>\nvoid F() {}\n",
+                &[("Local.h", "struct S { int V; };\n")],
+                "Local.h",
+                &["vector"],
+            ),
+            (
+                // `crate::` resolution needs a `src` ancestor to anchor on.
+                "src",
+                "main.rs",
+                "use crate::helper;\nuse serde::Deserialize;\nfn f() { helper::go(); }\n",
+                &[("helper.rs", "pub fn go() {}\n")],
+                "helper.rs",
+                &["serde::Deserialize"],
+            ),
+            (
+                "",
+                "app.py",
+                "from .mod_a import X\nimport requests\n",
+                &[("mod_a.py", "X = 1\n")],
+                "mod_a.py",
+                &["requests"],
+            ),
+            (
+                // The BOM lands on the system include this time, so the external bucket is
+                // the one under test: detection, `is_valid_module_path` and the `<…>`
+                // delimiter stripping all have to survive it.
+                "",
+                "Reversed.cpp",
+                "#include <vector>\n#include \"Local.h\"\nvoid F() {}\n",
+                &[("Local.h", "struct S { int V; };\n")],
+                "Local.h",
+                &["vector"],
+            ),
+        ];
+
+        for (subdir, entry, body, siblings, want_local, want_external) in cases {
+            let mut buckets = Vec::new();
+            for prefix in [&[][..], UTF8_BOM] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                let src = root.join(subdir);
+                std::fs::create_dir_all(&src).unwrap();
+                for (name, contents) in *siblings {
+                    std::fs::write(src.join(name), contents).unwrap();
+                }
+                let mut bytes = prefix.to_vec();
+                bytes.extend_from_slice(body.as_bytes());
+                std::fs::write(src.join(entry), &bytes).unwrap();
+
+                let bloom = crate::index::bloom::BloomFilterCache::new();
+                let result = analyze_deps(&src.join(entry), root, &bloom).unwrap();
+                buckets.push((
+                    result
+                        .uses_local
+                        .iter()
+                        .map(|d| {
+                            std::path::Path::new(&d.path)
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect::<Vec<_>>(),
+                    result.uses_external,
+                ));
+            }
+
+            let (plain, bom) = (&buckets[0], &buckets[1]);
+            // Pin the un-BOM'd baseline against literals, so the comparison below cannot
+            // pass by both variants reporting nothing.
+            assert_eq!(
+                plain.0,
+                vec![want_local.to_string()],
+                "fixture is broken: {entry} without a BOM reported local {:?}",
+                plain.0
+            );
+            assert_eq!(
+                plain.1,
+                want_external
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+                "fixture is broken: {entry} without a BOM reported external {:?}",
+                plain.1
+            );
+            assert_eq!(
+                bom, plain,
+                "a BOM changed the dependency buckets of {entry}"
+            );
+        }
+    }
+
     /// A quoted include that does not resolve on disk used to vanish from both lists:
     /// not a system header, so not "external", and unresolvable, so not "local". Any
     /// project whose headers sit behind a build-system include path — most non-trivial
