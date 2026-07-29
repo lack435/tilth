@@ -142,7 +142,7 @@ pub fn analyze_deps(
     // hint, and truncating here loses dependencies outright — an import that resolves is
     // excluded from the external bucket below, so one dropped by a cap would appear in
     // neither list. A C++ translation unit with more than 8 project includes is ordinary.
-    let import_files = resolve_local_imports(path, &content);
+    let import_files = resolve_local_imports(path, &content, Some(scope));
     for import_path in import_files {
         local_by_file.entry(import_path).or_default();
     }
@@ -163,6 +163,10 @@ pub fn analyze_deps(
 
     // External deps via line-level import parsing
     let mut external_set: HashSet<String> = HashSet::new();
+    // Canonicalized once: the loop below asks the same question per include line, and the
+    // answer must match what `resolve_local_imports` used, or an include could land in
+    // both buckets or neither.
+    let boundary = crate::read::imports::canonical_boundary(Some(scope));
     for line in content.lines() {
         if !is_import_line(line, lang) {
             continue;
@@ -186,7 +190,13 @@ pub fn analyze_deps(
         let unresolved_local = !external
             && matches!(lang, crate::types::Lang::C | crate::types::Lang::Cpp)
             && path.parent().is_none_or(|dir| {
-                crate::read::imports::resolve_import_to_file(dir, &source, lang).is_none()
+                crate::read::imports::resolve_import_to_file(
+                    dir,
+                    &source,
+                    lang,
+                    boundary.as_deref(),
+                )
+                .is_none()
             });
 
         if (!external && !unresolved_local) || is_stdlib(&source, lang) {
@@ -883,6 +893,117 @@ mod tests {
                 .iter()
                 .map(|d| (&d.path, &d.symbols))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A trailing comment on an `#include` must not delete the dependency.
+    ///
+    /// The header name used to be the whole rest of the line, so `#include "X.h" // note`
+    /// asked the filesystem for `X.h" // note`, which does not exist — and `is_external`
+    /// still saw the leading quote, so the include was neither local nor external. It
+    /// vanished, with nothing in the output to say a line had been skipped. Per-line, so a
+    /// file mixing commented and clean includes under-reported by exactly the commented
+    /// ones.
+    #[test]
+    fn cpp_include_with_a_trailing_comment_still_counts_as_a_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Sibling.h"), "#pragma once\nclass Sibling {};\n").unwrap();
+        std::fs::create_dir_all(root.join("Sub")).unwrap();
+        std::fs::write(
+            root.join("Sub/Nested.h"),
+            "#pragma once\nclass Nested {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Target.h"),
+            "#pragma once\n\
+             #include \"Sibling.h\" // line comment\n\
+             #include \"Sub/Nested.h\" /* block comment */\n\
+             #include <vector> // still a system header\n\
+             class Target {};\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("Target.h"), root, &bloom).unwrap();
+
+        let local: Vec<String> = result
+            .uses_local
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            local.contains(&"Sibling.h".to_string()) && local.contains(&"Nested.h".to_string()),
+            "both commented includes must resolve, got {local:?}"
+        );
+        assert!(
+            result.uses_external.iter().any(|e| e == "vector"),
+            "the commented system header must still be external, got {:?}",
+            result.uses_external
+        );
+    }
+
+    /// The include-root layout, end to end, in a tree that is not a git checkout.
+    ///
+    /// This is the shape that motivated include-root resolution: a module source root is an
+    /// include root, so a header in `<Module>/Character/` writes `"Character/Peer.h"` to
+    /// reach a sibling. Own-directory resolution turns that into
+    /// `Character/Character/Peer.h`, which does not exist, and the dependency bucketed as
+    /// external. Resolution was gated on finding `.git`, so it also did nothing at all
+    /// outside a repository even though the caller had named a scope.
+    #[test]
+    fn cpp_include_root_relative_deps_resolve_under_a_declared_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("Source").join("TheGame");
+        for d in ["Character", "Camera"] {
+            std::fs::create_dir_all(module.join(d)).unwrap();
+        }
+        // Deliberately no `.git`.
+        std::fs::write(
+            module.join("Character/PawnComponent.h"),
+            "#pragma once\nclass UPawnComponent {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Camera/CameraMode.h"),
+            "#pragma once\nclass UCameraMode {};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("Character/HeroComponent.h"),
+            "#pragma once\n\
+             #include \"Character/PawnComponent.h\"\n\
+             #include \"Camera/CameraMode.h\"\n\
+             #include \"OutOfTree/TagContainer.h\"\n\
+             class UHeroComponent {};\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result =
+            analyze_deps(&module.join("Character/HeroComponent.h"), &module, &bloom).unwrap();
+
+        let local: Vec<String> = result
+            .uses_local
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            local.contains(&"PawnComponent.h".to_string()),
+            "a sibling reached via the include root must be local, got {local:?}"
+        );
+        assert!(
+            local.contains(&"CameraMode.h".to_string()),
+            "a peer directory reached via the include root must be local, got {local:?}"
+        );
+        assert!(
+            result
+                .uses_external
+                .iter()
+                .any(|e| e == "OutOfTree/TagContainer.h"),
+            "an include with no file in scope stays external, got {:?}",
+            result.uses_external
         );
     }
 

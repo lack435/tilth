@@ -1072,7 +1072,7 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
 
     // C/C++: #include "file.h" or #include <header>
     if let Some(rest) = trimmed.strip_prefix("#include") {
-        return rest.trim().to_string(); // preserves quotes/angles for external detection
+        return c_include_header_name(rest);
     }
 
     // Go: `import "source"` — already handled above via "import"
@@ -1082,6 +1082,41 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .last()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// The delimited header name in the text following `#include`, delimiters kept.
+///
+/// Everything after the closing delimiter is discarded. That matters because it is
+/// legal — and in some codebases habitual — to comment an include:
+///
+/// ```text
+/// #include "Widget.h" // forward decls only
+/// ```
+///
+/// Returning the whole remainder made the header name `"Widget.h" // forward decls only`,
+/// which resolves to nothing on disk. `is_external` still saw a leading quote, so the
+/// include was neither local nor external and vanished from `tilth_deps` with no warning:
+/// a file whose every include carried a trailing comment reported no dependencies at all.
+///
+/// The `"…"` / `<…>` delimiters are preserved because `is_external` distinguishes a system
+/// header from a project-relative one by the opening delimiter.
+///
+/// Text that does not begin with a delimiter is returned trimmed and unchanged — an
+/// `#include SOME_MACRO` has no header name to find, and guessing at one is worse than
+/// passing it through for the caller to reject.
+fn c_include_header_name(after_include: &str) -> String {
+    let rest = after_include.trim();
+    let close = match rest.chars().next() {
+        Some('"') => '"',
+        Some('<') => '>',
+        _ => return rest.to_string(),
+    };
+    match rest[1..].find(close) {
+        // +2: one for the opening delimiter, one to include the closing one.
+        Some(end) => rest[..end + 2].to_string(),
+        // Unterminated. Pass it through rather than inventing a boundary.
+        None => rest.to_string(),
+    }
 }
 
 /// Get structured outline entries for file content.
@@ -1101,6 +1136,71 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 
     let lines: Vec<&str> = content.lines().collect();
     walk_top_level(tree.root_node(), &lines, lang)
+}
+
+#[cfg(test)]
+mod c_include_tests {
+    use super::{c_include_header_name, extract_import_source};
+    use crate::types::Lang;
+
+    /// Everything after the closing delimiter must be discarded. Returning the whole
+    /// remainder of the line made a commented include's "path" include the comment, which
+    /// resolved to nothing on disk while `is_external` still saw a leading quote — so the
+    /// include landed in neither the local nor the external bucket and disappeared from
+    /// `tilth_deps` silently. A file whose every include carried a trailing comment
+    /// reported no dependencies at all.
+    #[test]
+    fn trailing_comment_is_not_part_of_the_header_name() {
+        for line in [
+            "#include \"Widget.h\" // forward decls only",
+            "#include \"Widget.h\" /* forward decls only */",
+            "#include \"Widget.h\"\t// tab-separated",
+            "#include \"Widget.h\"   ",
+            "#include\"Widget.h\"// no spaces anywhere",
+        ] {
+            assert_eq!(
+                extract_import_source(line, Some(Lang::Cpp)),
+                "\"Widget.h\"",
+                "line: {line}"
+            );
+        }
+    }
+
+    /// The delimiters are load-bearing: `is_external` tells a system header from a
+    /// project-relative one by the opening one.
+    #[test]
+    fn delimiters_are_preserved_for_both_forms() {
+        assert_eq!(
+            extract_import_source("#include <vector> // std", Some(Lang::Cpp)),
+            "<vector>"
+        );
+        assert_eq!(
+            extract_import_source("#include \"a/b.h\"", Some(Lang::Cpp)),
+            "\"a/b.h\""
+        );
+    }
+
+    /// A comment character inside the header name is part of the path, not a comment.
+    #[test]
+    fn slashes_inside_the_delimiters_survive() {
+        assert_eq!(
+            extract_import_source("#include \"a/b/c.h\" // note", Some(Lang::Cpp)),
+            "\"a/b/c.h\""
+        );
+    }
+
+    /// No delimiter and no close: pass through rather than invent a boundary. An
+    /// `#include SOME_MACRO` has no header name, and an unterminated one is a broken file.
+    #[test]
+    fn undelimited_and_unterminated_forms_pass_through() {
+        assert_eq!(c_include_header_name(" SOME_MACRO"), "SOME_MACRO");
+        assert_eq!(
+            c_include_header_name(" \"unterminated.h"),
+            "\"unterminated.h"
+        );
+        assert_eq!(c_include_header_name(" <unterminated.h"), "<unterminated.h");
+        assert_eq!(c_include_header_name(""), "");
+    }
 }
 
 #[cfg(test)]
