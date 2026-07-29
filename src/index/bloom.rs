@@ -125,6 +125,37 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// for the next fifty calls and nothing it touches is ever admitted. In that regime the cache
 /// is dead weight — bounded, but useless. A generational reset (clear and start over when the
 /// ceiling is hit) would fix it without needing an access order; not done here.
+///
+/// #40 tracks that, and this module now carries the instrumentation and measurement for it. The
+/// regime is real and worse than the paragraph above guesses: on a ~147k-file C++ tree, five
+/// `kind: "callers"` queries scoped to one subtree after one broad query at the root score 0.0%
+/// against 80.0% for the same five queries on a cache that was never poisoned — and the subtree
+/// caches completely in 1.9 MB, so the budget is being spent keeping 32 MB that cannot be used.
+///
+/// A first attempt at the reset was written, measured, and **rejected**. What it established is
+/// worth more than the code was, because all of it is about why the obvious fixes do not work:
+///
+/// * Refusal is a *good* policy when the working set genuinely exceeds the ceiling. Hit rate
+///   degrades smoothly with the ceiling's share of the working set, because whatever got in keeps
+///   earning. Any policy that clears has to beat that, and "clear when full" does not: both the
+///   #40 regime and an overloaded cache are full, so fullness cannot be the trigger.
+/// * A fixed miss-run trigger cannot work, for two compounding reasons. The *steady-state* run is
+///   `~(1 - ceiling/working_set) x probes_per_walk`, confirmed against three fixtures on two
+///   trees — proportional to tree size, so any fixed bound is a per-tree tuning parameter in
+///   disguise. Worse, the *peak* run is simply `probes_per_walk`: the first walk over any scope has
+///   no hits available to interrupt it. Measured at 1993 on a 1993-probe scope at every ceiling
+///   from 0.25x to 1.00x, four reps, identical every time — including 1.00x, where nothing is ever
+///   refused and the cache is perfect. So any threshold below one walk's probe count fires on the
+///   first walk of every workload regardless of whether the cache is useful. A trigger has to be
+///   normalised against something the cache knows; resident entry count is the candidate.
+/// * Refused bytes measured against the ceiling also fails: at a ceiling of ~0.75x the working set
+///   the refused portion is genuinely smaller than the ceiling even though the working set is not,
+///   so it clears a cache that is earning well.
+/// * Exponential backoff on repeated resets does not rescue a bad trigger if the backoff is
+///   forgiven by any hit — an overloaded cache re-hits the block admitted just before each clear,
+///   so the penalty never accumulates and the cache resets once per walk forever.
+///
+/// `peak_miss_run` exists to feed the next attempt at this.
 pub struct BloomFilterCache {
     filters: DashMap<PathBuf, CachedFilter>,
     /// Sum of `CachedFilter::bytes` over the map.
@@ -171,6 +202,18 @@ pub struct BloomFilterCache {
     /// refusals is full and useless, which is exactly the #40 regime; a cache whose misses are
     /// cold is simply warming up. The hit rate alone cannot tell those apart.
     refusals: std::sync::atomic::AtomicUsize,
+    /// Consecutive misses with no intervening hit; zeroed by every hit.
+    miss_run: std::sync::atomic::AtomicUsize,
+    /// Longest value `miss_run` has reached.
+    ///
+    /// Instrumentation only — nothing in this file acts on it. It is here because the length of a
+    /// miss run is the quantity an adaptive-eviction policy has to reason about, and #40's first
+    /// attempt failed precisely by guessing at it. A fixed run-length trigger was measured against
+    /// three fixtures on two trees and the natural run turned out to be
+    /// `~(1 - ceiling/working_set) x probes_per_pass` — proportional to tree size, so any fixed
+    /// bound is a per-tree tuning parameter in disguise. Recording the real distribution is what
+    /// lets the next attempt normalise against something scale-free instead of guessing again.
+    peak_miss_run: std::sync::atomic::AtomicUsize,
 }
 
 struct CachedFilter {
@@ -203,6 +246,8 @@ impl BloomFilterCache {
             builds: std::sync::atomic::AtomicUsize::new(0),
             hits: std::sync::atomic::AtomicUsize::new(0),
             refusals: std::sync::atomic::AtomicUsize::new(0),
+            miss_run: std::sync::atomic::AtomicUsize::new(0),
+            peak_miss_run: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -219,23 +264,49 @@ impl BloomFilterCache {
     }
 
     /// Probes served from a cached filter. Test/diagnostic accessor.
+    ///
+    /// `#[cfg(test)] pub(crate)`, unlike the older `cached_bytes` and `filters_built` above. Those
+    /// are already published and narrowing them would be a breaking change, but there is no reason
+    /// to add semver surface for counters only test code reads — and `pub(crate)` alone would trip
+    /// `dead_code` in a non-test build, which is why the older pair is `pub` at all. The fields
+    /// themselves are written unconditionally, so the counting is never compiled out.
+    #[cfg(test)]
     #[must_use]
-    pub fn cache_hits(&self) -> usize {
+    pub(crate) fn cache_hits(&self) -> usize {
         self.hits.load(Relaxed)
     }
 
     /// Admissions refused for want of budget. Test/diagnostic accessor.
+    #[cfg(test)]
     #[must_use]
-    pub fn admissions_refused(&self) -> usize {
+    pub(crate) fn admissions_refused(&self) -> usize {
         self.refusals.load(Relaxed)
+    }
+
+    /// Longest run of consecutive misses with no intervening hit. Test/diagnostic accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn peak_miss_run(&self) -> usize {
+        self.peak_miss_run.load(Relaxed)
+    }
+
+    /// Extend the current miss run and record it if it is the longest so far.
+    ///
+    /// `fetch_max` rather than load-compare-store: the peak is written from every walk thread, and
+    /// a read-modify-write outside a lock would lose updates and under-report exactly the long runs
+    /// this exists to catch.
+    fn note_miss(&self) {
+        let run = self.miss_run.fetch_add(1, Relaxed) + 1;
+        self.peak_miss_run.fetch_max(run, Relaxed);
     }
 
     /// Hit rate over all probes since construction, or `None` before the first probe.
     ///
     /// Denominator is `hits + builds`, i.e. probes that asked a question — the empty-target early
     /// return in `contains_any` is not a probe and is not counted either way.
+    #[cfg(test)]
     #[must_use]
-    pub fn hit_rate(&self) -> Option<f64> {
+    pub(crate) fn hit_rate(&self) -> Option<f64> {
         let (h, b) = (self.cache_hits(), self.filters_built());
         #[expect(
             clippy::cast_precision_loss,
@@ -362,6 +433,7 @@ impl BloomFilterCache {
         if let Some(entry) = self.filters.get(path) {
             if entry.mtime == mtime {
                 self.hits.fetch_add(1, Relaxed);
+                self.miss_run.store(0, Relaxed);
                 return targets.any(|t| entry.filter.contains(t.as_ref()));
             }
         }
@@ -370,6 +442,7 @@ impl BloomFilterCache {
         // Admission may refuse; the answer is already in hand either way.
         let filter = build_filter(content, code_lang(path));
         self.builds.fetch_add(1, Relaxed);
+        self.note_miss();
         let result = targets.any(|t| filter.contains(t.as_ref()));
         self.admit(path, mtime, filter);
         result
@@ -682,6 +755,27 @@ fn is_ident_continue(b: u8) -> bool {
 /// It exists as a committed test rather than a throwaway script so the numbers in #40 can be
 /// reproduced, and so the *shape* of the measurement is reviewable. It asserts almost nothing —
 /// its output is the deliverable.
+///
+/// **Run every arm several times before believing any difference.** The thrash rows are noisy, and
+/// badly so at the middle ceilings. Refuse-forever behaviour, one fixture, six observations per
+/// row, no code change between them:
+///
+/// ```text
+/// ceiling / working set   observed hit rate   spread
+/// 0.25x                       22.8 - 25.5%     2.7 pts
+/// 0.50x                       36.2 - 47.3%    11.1 pts
+/// 0.75x                       58.3 - 64.2%     5.9 pts
+/// 1.00x                       80.0 - 80.0%     0
+/// ```
+///
+/// The mechanism is the parallel walk: once the ceiling is reached, *which* files won the race into
+/// the cache decides what hits afterwards, and thread scheduling decides that. 1.00x is exactly
+/// deterministic because nothing is ever refused, so there is no race to lose.
+///
+/// This is why the first attempt at #40 reported a "worst regression of 4.0 points" that did not
+/// survive contact with a second fixture: every delta it quoted was a single run of one build
+/// against a single run of another, and all of them were inside the band above. A difference under
+/// ~10 points at 0.50x, or ~6 at 0.75x, is not evidence of anything.
 #[cfg(test)]
 mod adaptivity {
     use super::*;
@@ -694,6 +788,7 @@ mod adaptivity {
         builds: usize,
         refusals: usize,
         bytes: usize,
+        peak_run: usize,
     }
 
     impl Snap {
@@ -703,6 +798,7 @@ mod adaptivity {
                 builds: c.filters_built(),
                 refusals: c.admissions_refused(),
                 bytes: c.cached_bytes(),
+                peak_run: c.peak_miss_run(),
             }
         }
 
@@ -732,9 +828,15 @@ mod adaptivity {
             refusals as f64 / builds as f64 * 100.0
         };
         let resident_mb = after.bytes as f64 / (1024.0 * 1024.0);
+        // `peak_run` is cumulative rather than a delta: the longest run seen so far is the quantity
+        // of interest, because it is what any adaptive trigger would have to threshold on. Printed
+        // because the first attempt at #40 justified a threshold against a run length it never
+        // measured, and adding this line falsified three separate claims immediately.
         println!(
             "{label:28} probes={probes:>8}  hits={hits:>8}  builds={builds:>8}  \
-             hit_rate={rate:>5.1}%  refused/build={refused_share:>5.1}%  resident={resident_mb:.1}MB"
+             hit_rate={rate:>5.1}%  refused/build={refused_share:>5.1}%  \
+             resident={resident_mb:.1}MB  peak_miss_run={:>7}",
+            after.peak_run
         );
     }
 
@@ -768,7 +870,9 @@ mod adaptivity {
     #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
     fn adaptivity_broad_then_narrow_versus_fresh() {
         let Some((root, sub)) = env_tree() else {
-            println!("skipped: set TILTH_ADAPTIVITY_ROOT and TILTH_ADAPTIVITY_SUBTREE");
+            println!(
+                "SKIPPED (no TILTH_ADAPTIVITY_ROOT / TILTH_ADAPTIVITY_SUBTREE) — this run                  measured nothing"
+            );
             return;
         };
         let narrow_calls: usize = std::env::var("TILTH_ADAPTIVITY_CALLS")
@@ -838,8 +942,11 @@ mod adaptivity {
     #[ignore = "needs TILTH_ADAPTIVITY_SUBTREE; see module docs"]
     #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
     fn adaptivity_thrash_working_set_larger_than_ceiling() {
-        let Some((_, sub)) = env_tree() else {
-            println!("skipped: set TILTH_ADAPTIVITY_ROOT and TILTH_ADAPTIVITY_SUBTREE");
+        // Only the subtree is used here, so do not demand the root as well — the earlier version
+        // required both and then ignored one, which contradicted its own `#[ignore]` reason.
+        let Some(sub) = std::env::var_os("TILTH_ADAPTIVITY_SUBTREE").map(std::path::PathBuf::from)
+        else {
+            println!("SKIPPED (no TILTH_ADAPTIVITY_SUBTREE set) — this run measured nothing");
             return;
         };
         let t = targets();
