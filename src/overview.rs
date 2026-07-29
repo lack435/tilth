@@ -604,7 +604,11 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
     }
 
     let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
-    let parsed: CargoToml = toml::from_str(&content).ok()?;
+    // The `toml` crate strips exactly *one* BOM, so a doubled one still fails — and
+    // `.ok()?` turns that into the same silent loss of the whole manifest block as the
+    // `package.json` bug. Cheap to close, and leaving it would make the repeat-stripping
+    // both BOM helpers already do inconsistent with the two parsers that skip them.
+    let parsed: CargoToml = toml::from_str(crate::lang::outline::strip_bom(&content)).ok()?;
     let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
     let (deps, dep_total) = cap_deps(
         parsed
@@ -629,7 +633,12 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
     }
 
     let content = fs::read_to_string(root.join("package.json")).ok()?;
-    let parsed: PackageJson = serde_json::from_str(&content).ok()?;
+    // `.ok()?` on a BOM'd file discarded the whole manifest block — name, version and the
+    // dependency list — from the fingerprint injected at MCP initialize, with no error
+    // anywhere. `overview` exists to orient an agent without a tool call, so failing this
+    // way is failing silently at exactly the wrong moment.
+    let parsed: PackageJson =
+        serde_json::from_str(crate::lang::outline::strip_bom(&content)).ok()?;
     let (deps, dep_total) = cap_deps(
         parsed
             .dependencies
@@ -651,7 +660,10 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
     let mut in_require = false;
 
     for line in content.lines() {
-        let trimmed = line.trim();
+        // `line.trim()` is not BOM-aware, so a BOM'd `go.mod` reported no module name at
+        // all — the same mistake as the import-detection bug, in a file that fix did not
+        // visit. `require` entries were unaffected only because they never sit on line 1.
+        let trimmed = crate::lang::outline::trim_start_bom_aware(line).trim_end();
         if let Some(rest) = trimmed.strip_prefix("module ") {
             name = Some(rest.trim().to_string());
         }
@@ -698,7 +710,8 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
     }
 
     let content = fs::read_to_string(root.join("pyproject.toml")).ok()?;
-    let parsed: PyProject = toml::from_str(&content).ok()?;
+    // Doubled BOM — see `parse_cargo_toml`.
+    let parsed: PyProject = toml::from_str(crate::lang::outline::strip_bom(&content)).ok()?;
     let project = parsed.project.unwrap_or_default();
     let (deps, dep_total) = cap_deps(
         project
@@ -1092,6 +1105,145 @@ mod tests {
     /// the order, and only the ordering half of the bug shows.
     const TIE_DIRS: usize = 15;
     const TIE_FILES_PER_DIR: usize = 3;
+
+    /// A UTF-8 BOM, written as bytes. A manifest fixture built from a `&str` literal
+    /// cannot see any of this, which is how the class of bug kept coming back.
+    const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+    fn write_with_bom(path: &Path, prefix: &[u8], body: &str) {
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(body.as_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// `serde_json` rejects a leading BOM, and `parse_package_json` swallowed that with
+    /// `.ok()?` — so a BOM'd `package.json` dropped name, version *and* the dependency
+    /// list from the fingerprint injected at MCP initialize, with no error anywhere.
+    ///
+    /// This is the worst of the BOM parse failures: `overview` exists to orient an agent
+    /// without a tool call, so failing silently here fails at exactly the wrong moment.
+    #[test]
+    fn bom_package_json_keeps_the_manifest_block() {
+        let body = "{\"name\":\"demo-app\",\"version\":\"2.3.4\",\
+                    \"dependencies\":{\"react\":\"^18\",\"lodash\":\"^4\"}}";
+
+        let mut outs = Vec::new();
+        for prefix in [&[][..], UTF8_BOM] {
+            let dir = tempfile::tempdir().unwrap();
+            write_with_bom(&dir.path().join("package.json"), prefix, body);
+            std::fs::write(dir.path().join("index.js"), "export const x = 1;\n").unwrap();
+            outs.push(fingerprint(dir.path()));
+        }
+
+        // Pinned against literals first: a comparison alone would be satisfied by both
+        // runs losing the manifest, which is precisely the bug.
+        for needle in ["demo-app", "2.3.4", "react", "lodash"] {
+            assert!(
+                outs[0].contains(needle),
+                "fixture is broken: unmarked package.json lost {needle}:\n{}",
+                outs[0]
+            );
+            assert!(
+                outs[1].contains(needle),
+                "a BOM'd package.json lost {needle} from the fingerprint:\n{}",
+                outs[1]
+            );
+        }
+        assert_eq!(outs[1], outs[0], "a BOM changed the fingerprint");
+    }
+
+    /// The `toml` crate strips exactly *one* BOM, so a doubled one still fails to parse and
+    /// `.ok()?` drops the entire manifest block — the same silent loss as the `package.json`
+    /// bug, reached through the format that was supposed to be immune.
+    ///
+    /// A doubled BOM is what a tool that prepends one without checking for an existing one
+    /// produces; both BOM helpers already strip repeats for exactly this reason, so leaving
+    /// these two parsers out would have been an inconsistency rather than a scope decision.
+    #[test]
+    fn doubled_bom_toml_manifests_keep_their_manifest_block() {
+        let doubled = [UTF8_BOM, UTF8_BOM].concat();
+
+        // (manifest, body, needles that must survive)
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo-crate\"\nversion = \"0.4.2\"\n\n\
+                 [dependencies]\nserde = \"1\"\n",
+                &["demo-crate", "0.4.2", "serde"],
+            ),
+            (
+                "pyproject.toml",
+                "[project]\nname = \"demo-pkg\"\nversion = \"1.2.3\"\n\
+                 dependencies = [\"httpx\"]\n",
+                &["demo-pkg", "1.2.3", "httpx"],
+            ),
+        ];
+
+        for (manifest, body, needles) in cases {
+            let mut outs = Vec::new();
+            for prefix in [&[][..], &doubled] {
+                let dir = tempfile::tempdir().unwrap();
+                write_with_bom(&dir.path().join(manifest), prefix, body);
+                let src = dir.path().join("src");
+                std::fs::create_dir_all(&src).unwrap();
+                std::fs::write(src.join("main.rs"), "pub fn a() {}\n").unwrap();
+                outs.push(fingerprint(dir.path()));
+            }
+
+            for needle in *needles {
+                assert!(
+                    outs[0].contains(needle),
+                    "fixture is broken: unmarked {manifest} lost {needle}:\n{}",
+                    outs[0]
+                );
+                assert!(
+                    outs[1].contains(needle),
+                    "a doubled BOM on {manifest} lost {needle} from the fingerprint:\n{}",
+                    outs[1]
+                );
+            }
+            assert_eq!(
+                outs[1], outs[0],
+                "a doubled BOM changed the fingerprint for {manifest}"
+            );
+        }
+    }
+
+    /// `line.trim()` is not BOM-aware, so `parse_go_mod` reported no module name at all for
+    /// a BOM'd `go.mod` — literally the import-detection bug, in a file that fix never
+    /// visited. `require` entries were unaffected only because they never sit on line 1,
+    /// which is why the fixture asserts on both.
+    #[test]
+    fn bom_go_mod_keeps_the_module_name() {
+        let body = "module github.com/acme/widget\n\ngo 1.21\n\n\
+                    require (\n\tgithub.com/gin-gonic/gin v1.9.0\n)\n";
+
+        let mut outs = Vec::new();
+        for prefix in [&[][..], UTF8_BOM] {
+            let dir = tempfile::tempdir().unwrap();
+            write_with_bom(&dir.path().join("go.mod"), prefix, body);
+            std::fs::write(
+                dir.path().join("main.go"),
+                "package main\n\nfunc main() {}\n",
+            )
+            .unwrap();
+            outs.push(fingerprint(dir.path()));
+        }
+
+        for needle in ["github.com/acme/widget", "gin"] {
+            assert!(
+                outs[0].contains(needle),
+                "fixture is broken: unmarked go.mod lost {needle}:\n{}",
+                outs[0]
+            );
+            assert!(
+                outs[1].contains(needle),
+                "a BOM'd go.mod lost {needle} from the fingerprint:\n{}",
+                outs[1]
+            );
+        }
+        assert_eq!(outs[1], outs[0], "a BOM changed the fingerprint");
+    }
 
     /// `dirs` directories, each holding `files_per_dir` Rust files, so every module has an
     /// identical primary-language count.

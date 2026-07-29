@@ -1,7 +1,20 @@
 use std::path::Path;
 
 /// Depth-limited outline for JSON, YAML, TOML.
+///
+/// A leading BOM is dropped once, here, rather than in each arm. `serde_json` rejects one
+/// outright, so a BOM'd `.json` file outlined as `[parse error: …]` instead of its
+/// structure — and PowerShell's `Set-Content -Encoding utf8` writes a BOM, so this is the
+/// ordinary way to produce such a file on Windows rather than an exotic one.
+///
+/// Stripping at this level and not inside `yaml_outline` is deliberate: that arm derives
+/// its indent from `line.len() - trimmed.len()`, and a BOM removed per-line after the
+/// split would leave a 3-byte skew in the indent of the first key. Removing it from the
+/// content before anything splits it keeps the byte offsets honest, and incidentally stops
+/// the BOM rendering as a stray character in the first YAML key and the `key_value`
+/// passthrough. `toml` strips a BOM itself, so that arm neither needs nor notices this.
 pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
+    let content = crate::lang::outline::strip_bom(content);
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => json_outline(content, max_lines),
         Some("yaml" | "yml") => yaml_outline(content, max_lines),
@@ -228,6 +241,122 @@ fn key_value_outline(content: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A UTF-8 BOM. Written as bytes and read back off disk, because a fixture built from
+    /// a `&str` literal is exactly what let this class of bug survive three times.
+    const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+    /// The BOM'd and unmarked forms of `body`, both round-tripped through real files in
+    /// `dir` so the BOM travels the route it does in production, and both returned with the
+    /// path `outline` should be called with.
+    ///
+    /// The caller owns `dir` and must keep it alive for the duration of the test. An
+    /// earlier version created the `TempDir` here and let it drop on return, which worked
+    /// only because `outline` reads nothing but the extension — any future filesystem touch
+    /// would have turned these tests into confusing failures.
+    fn bom_and_plain(
+        dir: &Path,
+        stem: &str,
+        ext: &str,
+        body: &str,
+    ) -> (std::path::PathBuf, String, String) {
+        let mut written = Vec::new();
+        for (name, prefix) in [
+            (format!("{stem}_plain.{ext}"), &[][..]),
+            (format!("{stem}_bom.{ext}"), UTF8_BOM),
+        ] {
+            let path = dir.join(name);
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            written.push((path, content));
+        }
+        let (path, plain) = written[0].clone();
+        let bom = written[1].1.clone();
+        // Asserted for every format, not just JSON: without it, a `read_to_string` that
+        // silently dropped the BOM would leave each test comparing two identical unmarked
+        // runs and passing for no reason. That is the exact vacuous pass these fixtures
+        // exist to rule out.
+        assert!(
+            bom.starts_with('\u{feff}') && !plain.starts_with('\u{feff}'),
+            "fixture is broken: the BOM did not survive the write/read round trip, so this \
+             test proves nothing"
+        );
+        (path, plain, bom)
+    }
+
+    /// `serde_json` rejects a leading BOM rather than skipping it, so a BOM'd `.json` file
+    /// outlined as `[parse error: expected value at line 1 column 1]` instead of its
+    /// structure. PowerShell's `Set-Content -Encoding utf8` writes a BOM, so this is the
+    /// ordinary way to produce such a file on Windows, not an exotic one.
+    #[test]
+    fn bom_json_outlines_identically_to_the_unmarked_file() {
+        let body = "{\"name\":\"demo\",\"version\":\"1.0.0\",\"scripts\":{\"build\":\"tsc\"}}";
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, plain, bom) = bom_and_plain(dir.path(), "cfg", "json", body);
+
+        let plain_out = outline(&path, &plain, 50);
+        // Pinned against a literal as well as compared, so two parse errors cannot agree.
+        assert!(
+            plain_out.contains("name: \"demo\" (string)")
+                && plain_out.contains("scripts.build: \"tsc\" (string)"),
+            "fixture is broken: unmarked JSON outline changed: {plain_out}"
+        );
+        assert_eq!(
+            outline(&path, &bom, 50),
+            plain_out,
+            "a BOM changed the JSON outline"
+        );
+    }
+
+    /// The BOM used to render as a stray character in the first key. Not a parse failure —
+    /// YAML is line-scanned here — but the same unstripped bytes, and stripping them at the
+    /// `outline` entry point rather than per-line is what keeps `yaml_outline`'s
+    /// `line.len() - trimmed.len()` indent arithmetic free of a 3-byte skew.
+    #[test]
+    fn bom_yaml_outlines_identically_to_the_unmarked_file() {
+        let body = "name: demo\nversion: 1.0.0\njobs:\n  build:\n    runs-on: ubuntu\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, plain, bom) = bom_and_plain(dir.path(), "cfg", "yaml", body);
+
+        let plain_out = outline(&path, &plain, 50);
+        assert!(
+            plain_out.contains("name"),
+            "fixture is broken: unmarked YAML outline changed: {plain_out}"
+        );
+        let bom_out = outline(&path, &bom, 50);
+        assert!(
+            !bom_out.contains('\u{feff}'),
+            "the BOM leaked into the YAML outline: {bom_out:?}"
+        );
+        assert_eq!(bom_out, plain_out, "a BOM changed the YAML outline");
+    }
+
+    /// The `toml` crate strips a BOM itself, so this arm never had the bug. Pinned anyway:
+    /// the uniform strip at the `outline` entry point must not disturb the one format that
+    /// was already correct, and a future `toml` bump that stopped stripping would otherwise
+    /// reintroduce the failure silently.
+    #[test]
+    fn bom_toml_outlines_identically_to_the_unmarked_file() {
+        let body = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let (path, plain, bom) = bom_and_plain(dir.path(), "cfg", "toml", body);
+
+        let plain_out = outline(&path, &plain, 50);
+        assert!(
+            plain_out.contains("[package]"),
+            "fixture is broken: unmarked TOML outline changed: {plain_out}"
+        );
+        assert_eq!(
+            outline(&path, &bom, 50),
+            plain_out,
+            "a BOM changed the TOML outline"
+        );
+    }
 
     /// Pins the contract that `toml::Value` exposes `Table` and `Array` enum
     /// variants and that top-level tables render as `[section]` headers. If a

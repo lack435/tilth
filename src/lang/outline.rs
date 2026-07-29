@@ -1087,6 +1087,28 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .to_string()
 }
 
+/// A leading UTF-8 BOM removed, and nothing else touched.
+///
+/// The counterpart to `trim_start_bom_aware`, for callers that hand their content to a
+/// *parser* rather than testing it for a line prefix. Those callers must not have their
+/// leading whitespace eaten — it is either legal input the parser already handles (JSON,
+/// YAML) or load-bearing indentation — so the two cannot be the same function.
+///
+/// `serde_json` rejects a leading BOM outright rather than skipping it, which is not a
+/// quirk of ours to work around elsewhere: it is why a BOM'd `.json` file outlined as
+/// `[parse error: expected value at line 1 column 1]`, why a BOM'd `package.json` dropped
+/// the entire manifest block from the initialize fingerprint, and why `tilth install`
+/// aborted on a BOM'd host config claiming it was "invalid JSON" when it was valid JSON.
+/// The `toml` crate strips a BOM itself, so TOML never needed this; calling it there
+/// anyway is a harmless no-op and keeps the treatment uniform.
+///
+/// Repeats are stripped for the same reason `trim_start_bom_aware` does it — a tool that
+/// prepends a BOM without checking for an existing one leaves two, and serde rejects the
+/// second exactly as it rejected the first.
+pub(crate) fn strip_bom(content: &str) -> &str {
+    content.trim_start_matches('\u{feff}')
+}
+
 /// Leading whitespace stripped, plus a UTF-8 BOM if one is sitting in front of it.
 ///
 /// `str::trim_start` trims Unicode `White_Space`, and U+FEFF is *not* in that class — it
