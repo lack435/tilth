@@ -377,6 +377,78 @@ fn first_identifier_child(node: tree_sitter::Node, lines: &[&str]) -> Option<Str
     found
 }
 
+/// How far below its `compound_statement` body a misparsed class member can sit.
+///
+/// An access specifier wraps what follows it in a `labeled_statement`, and recovery
+/// packs members it could not repair into nested `ERROR`s — `ERROR` inside `ERROR`
+/// inside a `labeled_statement` is the deepest nesting observed.
+const MISPARSED_BODY_DEPTH: usize = 4;
+
+/// Name of the macro-misparsed class whose body encloses `node`, if any.
+///
+/// Members of such a body are not all direct children of the `compound_statement`:
+/// an access specifier wraps the members after it, and recovery buries the ones it
+/// could not repair in `ERROR`s. Walking up through just those two wrappers keeps
+/// this precise — anything else in the chain means `node` is not a class member —
+/// and cheap enough to ask per candidate, which is why the enclosing class does not
+/// have to be threaded through every outline call.
+pub(crate) fn enclosing_misparsed_class_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+) -> Option<String> {
+    let mut cur = node;
+    for _ in 0..MISPARSED_BODY_DEPTH {
+        let parent = cur.parent()?;
+        if parent.kind() == "compound_statement" {
+            return cpp_misparsed_class_name(parent.parent()?, lines);
+        }
+        if !matches!(parent.kind(), "ERROR" | "labeled_statement") {
+            return None;
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// The member a recovery artifact inside a misparsed class body declares, by name.
+///
+/// Constructors and destructors have no return type, so once the class head has
+/// misparsed there is nothing left for tree-sitter to read them as a declaration —
+/// a constructor becomes a *call*, and a destructor a stranded declarator inside an
+/// `ERROR`. Both are ordinary members that the outline (and through it deps' exported
+/// symbols and blast radius) would otherwise lose entirely.
+///
+/// `class` is the enclosing class's real name, from `cpp_misparsed_class_name`. It is
+/// what separates a constructor from a zero-argument macro invocation
+/// (`GENERATED_BODY()`), which recovery reshapes into the identical call — the same
+/// rule `is_cpp_macro_invocation` applies to bodies that parsed cleanly, which cannot
+/// see this shape.
+pub(crate) fn misparsed_member_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    class: &str,
+) -> Option<String> {
+    match node.kind() {
+        // `Widget();` and `Widget(int a, float b);` — a call, with the arguments
+        // re-read as an expression list.
+        "call_expression" => {
+            let callee = node.child_by_field_name("function")?;
+            let name = node_text_simple(callee, lines);
+            (callee.kind() == "identifier" && name == class).then_some(name)
+        }
+        // `~Widget();`, and `explicit Widget(int a);` where a specifier keyword kept
+        // recovery from reaching the call reading above. Both name themselves through
+        // the declarator chain, the same way they do when the class parses cleanly —
+        // so a destructor renders exactly as written rather than reconstructed.
+        "function_declarator" => {
+            let inner = node.child_by_field_name("declarator")?;
+            let name = c_declarator_name(inner, lines)?;
+            (inner.kind() == "destructor_name" || name == class).then_some(name)
+        }
+        _ => None,
+    }
+}
+
 /// True when a C/C++ `declaration` is really a macro invocation rather than a member.
 ///
 /// A *zero-argument* macro invocation inside a class body — `GENERATED_BODY()` — parses as
@@ -1542,6 +1614,69 @@ mod tests {
         );
         // Multiple inheritance is a third shape entirely.
         assert_eq!(multi_kind, "declaration");
+    }
+
+    /// Tripwire. Recovering a misparsed class's constructors and destructors means
+    /// pattern-matching tree-sitter-cpp's error recovery, which is not a stable
+    /// contract — the head repair already differs with the length of the base-class
+    /// name. This pins the body shapes `misparsed_member_kind` relies on so a grammar
+    /// bump fails here, loudly, instead of silently dropping members again.
+    ///
+    /// If this fires: re-dump the tree for these sources, and update
+    /// `misparsed_member_kind` (and this test) to the new shapes. The outline parity
+    /// test `cpp_outline_export_macro_costs_no_members` is the behaviour to restore.
+    #[test]
+    fn misparsed_class_body_repair_shapes_are_unchanged() {
+        /// Every `parent > child` kind edge in the tree, as `"parent>child"`.
+        fn edges(src: &str) -> Vec<String> {
+            let tree = parse(src, Lang::Cpp);
+            let mut out = Vec::new();
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    out.push(format!("{}>{}", node.kind(), child.kind()));
+                    stack.push(child);
+                }
+            }
+            out
+        }
+
+        let declared = edges(
+            "class API Widget : public Base\n{\npublic:\n\tWidget();\n\t~Widget();\n\tint Value;\n};\n",
+        );
+        // The head misparses into a `function_definition` whose body is a statement
+        // block rather than a `field_declaration_list`. Everything below follows from
+        // that: statements, not member declarations.
+        assert!(
+            declared.contains(&"function_definition>compound_statement".to_string()),
+            "misparsed class body is no longer a compound_statement: {declared:?}"
+        );
+        // A constructor has no return type, so recovery reads it as a call.
+        assert!(
+            declared.contains(&"expression_statement>call_expression".to_string()),
+            "a declared constructor is no longer a call expression: {declared:?}"
+        );
+        // A destructor is left as a bare declarator inside an ERROR.
+        assert!(
+            declared.contains(&"ERROR>function_declarator".to_string())
+                && declared.contains(&"function_declarator>destructor_name".to_string()),
+            "a declared destructor is no longer a stranded function_declarator: {declared:?}"
+        );
+        // A data member stays a `declaration`, which is why it needs reclassifying
+        // from local variable to property rather than recovering.
+        assert!(
+            declared.contains(&"compound_statement>declaration".to_string()),
+            "a data member is no longer a declaration: {declared:?}"
+        );
+
+        // A specifier keyword blocks the call reading and leaves the constructor as a
+        // declarator instead — the second shape `misparsed_member_kind` handles.
+        let specified = edges("class API Widget\n{\n\texplicit Widget(int A);\n};\n");
+        assert!(
+            specified.contains(&"ERROR>function_declarator".to_string()),
+            "an `explicit` constructor is no longer a stranded declarator: {specified:?}"
+        );
     }
 
     /// An attribute macro sits between the type and the *variable* name here, not

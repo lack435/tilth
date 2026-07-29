@@ -1,7 +1,7 @@
 use crate::lang::treesitter::{
     c_declarator_name, cpp_misparsed_class_name, declarator_chain_has_function,
-    is_bodied_specifier, is_cpp_macro_invocation, is_named_bodied_specifier, node_text_simple,
-    SPECIFIER_KINDS,
+    enclosing_misparsed_class_name, is_bodied_specifier, is_cpp_macro_invocation,
+    is_named_bodied_specifier, misparsed_member_name, node_text_simple, SPECIFIER_KINDS,
 };
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
@@ -286,6 +286,13 @@ fn node_to_entry(
             if declarator_chain_has_function(node) {
                 let sig = extract_signature(node, lines);
                 (OutlineKind::Function, name, Some(sig))
+            } else if enclosing_misparsed_class_name(node, lines).is_some() {
+                // A data member of a misparsed class body is shaped exactly like a
+                // local variable — the body is a `compound_statement`, so `int Value;`
+                // is an ordinary `declaration` rather than a `field_declaration`.
+                // Without this it outlines as `let Value` where the same class without
+                // its export macro gives `prop Value`.
+                (OutlineKind::Property, name, None)
             } else {
                 (OutlineKind::Variable, name, None)
             }
@@ -510,29 +517,124 @@ fn collect_children(
             || (cpp_family && k == "compound_statement")
     });
 
+    // Constructors and destructors of a misparsed class survive only as recovery
+    // artifacts, and telling one from a macro invocation needs the class's real name.
+    let misparsed_class = if cpp_family {
+        cpp_misparsed_class_name(node, lines)
+    } else {
+        None
+    };
+
     let parent = body.unwrap_or(node);
     let mut cursor2 = parent.walk();
 
     for child in parent.children(&mut cursor2) {
-        // `public:` / `private:` inside a misparsed class body parse as a
-        // `labeled_statement` wrapping the members that follow it. Flatten it so
-        // those members are collected rather than hidden behind the access
-        // specifier — one labeled_statement can hold several of them.
-        if child.kind() == "labeled_statement" && matches!(lang, Lang::C | Lang::Cpp) {
-            let mut inner = child.walk();
-            for grandchild in child.children(&mut inner) {
-                if let Some(entry) = node_to_entry(grandchild, lines, lang, depth) {
-                    children.push(entry);
-                }
-            }
-            continue;
-        }
-        if let Some(entry) = node_to_entry(child, lines, lang, depth) {
-            children.push(entry);
-        }
+        collect_member(
+            child,
+            lines,
+            lang,
+            depth,
+            misparsed_class.as_deref(),
+            &mut children,
+        );
     }
 
     children
+}
+
+/// Emit the outline entries for one node in a class/impl/module body.
+///
+/// Most members map one-to-one through `node_to_entry`. Two shapes do not, both from
+/// C/C++ class bodies: an access specifier wraps the members that follow it, and a
+/// misparsed body can pack several members into a single `ERROR` — so this pushes
+/// into a vector rather than returning one entry.
+fn collect_member(
+    child: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+    misparsed_class: Option<&str>,
+    out: &mut Vec<OutlineEntry>,
+) {
+    // `public:` / `private:` inside a misparsed class body parse as a
+    // `labeled_statement` wrapping the members that follow it. Flatten it so those
+    // members are collected rather than hidden behind the access specifier — one
+    // labeled_statement can hold several of them.
+    if child.kind() == "labeled_statement" && matches!(lang, Lang::C | Lang::Cpp) {
+        let mut inner = child.walk();
+        for grandchild in child.children(&mut inner) {
+            collect_member(grandchild, lines, lang, depth, misparsed_class, out);
+        }
+        return;
+    }
+    if let Some(class) = misparsed_class {
+        if push_misparsed_members(child, lines, class, out) {
+            return;
+        }
+    }
+    if let Some(entry) = node_to_entry(child, lines, lang, depth) {
+        out.push(entry);
+    }
+}
+
+/// Push any constructors and destructors hidden inside a recovery artifact.
+///
+/// Returns true when `node` is such an artifact and has been consumed — including
+/// when it yields nothing, since neither an `ERROR` nor an `expression_statement` is
+/// ever a member in its own right.
+///
+/// One `ERROR` can cover several members (`explicit Widget(int); ~Widget();` repairs
+/// into a single one), so this recurses and can push more than one entry. Each entry
+/// takes its range from the node that actually matched, not from the enclosing
+/// `ERROR`, which may span the whole run.
+fn push_misparsed_members(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    class: &str,
+    out: &mut Vec<OutlineEntry>,
+) -> bool {
+    match node.kind() {
+        // `Widget();` — the statement, not the call inside it, so the entry's range
+        // covers the trailing `;` the same way the unmisparsed `declaration` does.
+        "expression_statement" => {
+            let mut cursor = node.walk();
+            let name = node
+                .children(&mut cursor)
+                .find_map(|c| misparsed_member_name(c, lines, class));
+            if let Some(name) = name {
+                out.push(misparsed_entry(node, name, lines));
+            }
+            true
+        }
+        "ERROR" => {
+            let mut cursor = node.walk();
+            let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+            for child in children {
+                match misparsed_member_name(child, lines, class) {
+                    Some(name) => out.push(misparsed_entry(child, name, lines)),
+                    None => {
+                        push_misparsed_members(child, lines, class, out);
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Build the outline entry for a constructor or destructor recovered from a
+/// misparsed class body, matching what the same member yields when the class parses.
+fn misparsed_entry(node: tree_sitter::Node, name: String, lines: &[&str]) -> OutlineEntry {
+    OutlineEntry {
+        kind: OutlineKind::Function,
+        name,
+        start_line: node.start_position().row as u32 + 1,
+        end_line: node.end_position().row as u32 + 1,
+        signature: Some(extract_signature(node, lines)),
+        children: Vec::new(),
+        doc: extract_doc(node, lines),
+    }
 }
 
 /// Extract the first line as a function signature (name + params + return type).

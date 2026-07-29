@@ -279,6 +279,31 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
+    /// Blast radius reads the outline, so a member the outline loses is a member no
+    /// edit can ever trigger. A constructor behind an export macro was exactly that:
+    /// invisible to the outline, and so silently un-analysed when edited.
+    #[test]
+    fn export_macro_constructor_triggers() {
+        let src = "\
+class MYLIB_API Widget : public Base
+{
+public:
+    Widget();
+    ~Widget();
+};
+";
+        let entries = crate::lang::outline::get_outline_entries(src, crate::types::Lang::Cpp);
+        // Line 4 is `Widget();`, line 5 `~Widget();`.
+        let names = |line: usize| {
+            touched_symbols(&[make_edit(line, line)], &entries)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(4), vec!["Widget".to_string()]);
+        assert_eq!(names(5), vec!["~Widget".to_string()]);
+    }
+
     #[test]
     fn no_edits_no_results() {
         let entries = vec![make_fn("foo", 10, 30)];

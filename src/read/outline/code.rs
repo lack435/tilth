@@ -454,6 +454,114 @@ public:
         assert!(outline.contains("fn Work"), "actual:\n{outline}");
     }
 
+    /// The export macro must cost nothing at all: the same class with and without it
+    /// has to outline identically, member for member and kind for kind.
+    ///
+    /// It did not. Once the head misparses the body is a `compound_statement`, and a
+    /// constructor — which has no return type to anchor a declaration — is re-read as
+    /// a *call*, a destructor as a stranded declarator inside an `ERROR`. Neither
+    /// reached an outline arm, so both vanished; and `int Value;` in a statement body
+    /// is an ordinary local, so it came out `let` where the plain class gives `prop`.
+    /// Losing a constructor is not cosmetic: it is also absent from deps' exported
+    /// symbols and gets no blast radius when edited.
+    #[test]
+    fn cpp_outline_export_macro_costs_no_members() {
+        let with_macro = "\
+class MYLIB_API Widget : public Base
+{
+public:
+    Widget();
+    ~Widget();
+    void Work();
+    int Value;
+};
+";
+        let plain = with_macro.replace("class MYLIB_API ", "class ");
+
+        let macro_outline = outline(with_macro, Lang::Cpp, 1000);
+        let plain_outline = outline(&plain, Lang::Cpp, 1000);
+        assert_eq!(
+            macro_outline, plain_outline,
+            "export macro changed the outline\nwith macro:\n{macro_outline}\nplain:\n{plain_outline}"
+        );
+        for expected in [
+            "class Widget",
+            "fn Widget",
+            "fn ~Widget",
+            "fn Work",
+            "prop Value",
+        ] {
+            assert!(
+                macro_outline.contains(expected),
+                "missing {expected:?}:\n{macro_outline}"
+            );
+        }
+    }
+
+    /// The constructor recovery reads a *call*, which is also exactly what a
+    /// zero-argument macro invocation becomes — so the class's own name is the only
+    /// thing separating them. `is_cpp_macro_invocation` enforces the same rule for
+    /// bodies that parsed cleanly, but it cannot see this shape.
+    #[test]
+    fn cpp_outline_misparsed_body_keeps_macros_out() {
+        let cpp_code = "\
+class MYLIB_API Widget : public Base
+{
+    GENERATED_BODY()
+public:
+    Widget();
+    void Work();
+};
+";
+        let outline = outline(cpp_code, Lang::Cpp, 1000);
+        assert!(outline.contains("fn Widget"), "actual:\n{outline}");
+        assert!(
+            !outline.contains("GENERATED_BODY"),
+            "a macro invocation must not outline as a member:\n{outline}"
+        );
+    }
+
+    /// Recovery does not repair every member into the same shape: a specifier keyword
+    /// (`explicit`) or an inline body moves a constructor into a different artifact,
+    /// and one `ERROR` can swallow two members at once.
+    #[test]
+    fn cpp_outline_export_macro_members_across_recovery_shapes() {
+        let cases: &[(&str, &[&str])] = &[
+            // `explicit` keeps recovery from reading a call; this `ERROR` holds both
+            // the constructor and the destructor.
+            (
+                "class API Widget\n{\npublic:\n    Widget(int A, float B);\n    explicit Widget(int A);\n    ~Widget();\nprivate:\n    int Value;\n    static int Count;\n};\n",
+                &["fn Widget", "fn ~Widget", "prop Value", "prop Count"],
+            ),
+            // Inline bodies: the destructor and method parse as real definitions, the
+            // constructor still does not.
+            (
+                "class API Widget\n{\npublic:\n    Widget() {}\n    ~Widget() {}\n    void Work() { Value = 1; }\n    int Value;\n};\n",
+                &["fn Widget", "fn ~Widget", "fn Work", "prop Value"],
+            ),
+            // No base class, no access specifier — the members sit directly in the body.
+            (
+                "struct API Point\n{\n    Point();\n    ~Point();\n    int X;\n};\n",
+                &["fn Point", "fn ~Point", "prop X"],
+            ),
+            // A longer base-class name tips the head into the other repair (see
+            // `macro_class_head_recovery_shapes_are_genuinely_different`).
+            (
+                "class API Widget : public VeryLongBaseClassNameHere\n{\npublic:\n    Widget();\n    virtual ~Widget();\n    int Value;\n};\n",
+                &["fn Widget", "fn ~Widget", "prop Value"],
+            ),
+        ];
+        for (src, expected) in cases {
+            let rendered = outline(src, Lang::Cpp, 1000);
+            for want in *expected {
+                assert!(
+                    rendered.contains(want),
+                    "missing {want:?} for {src:?}:\n{rendered}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cpp_outline_omits_forward_declarations() {
         // A specifier with no body is an elaborated type specifier — a forward
