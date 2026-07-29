@@ -39,7 +39,25 @@ where
         return None;
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let content = std::fs::read_to_string(path).ok()?;
+    let mut content = std::fs::read_to_string(path).ok()?;
+
+    // A leading BOM comes off here, at the shared reader for every relational query
+    // (callers, callees, deps), and before `contains_any` so the filter tokenises line 1 the
+    // same way every other consumer sees it (#51).
+    //
+    // The concrete leak this closes is `callers::find_callers_treesitter_batch`, which builds
+    // `call_text` as `lines[row].trim()` — and `str::trim` does not remove U+FEFF — then
+    // renders it as `-> {call_text}`. So a call site on line 1 of a BOM'd file printed the
+    // glyph. Stripping at the reader rather than at that one site is what stops the next
+    // consumer of this helper having to remember, which is how this bug family kept
+    // recurring across #35, #41, #42 and #43.
+    //
+    // Drained in place so a large file is not copied; a BOM carries no newline, so no line
+    // number any consumer derives from this content shifts.
+    let bom_len = content.len() - crate::lang::outline::strip_bom(&content).len();
+    if bom_len > 0 {
+        content.drain(..bom_len);
+    }
 
     if !bloom.contains_any(path, mtime, &content, targets) {
         return None;

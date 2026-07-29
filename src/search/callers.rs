@@ -466,6 +466,12 @@ fn write_caller_bucket(
                 let Ok(file_content) = std::fs::read_to_string(&caller.path) else {
                     continue;
                 };
+                // This read bypasses `bloom_walk::read_with_bloom_check`, so it does not
+                // inherit that reader's BOM strip and needs its own (#51): the lines below are
+                // rendered into the expanded caller block, where a BOM'd line 1 showed the
+                // glyph. `caller_range` is unaffected — a BOM carries no newline — so the
+                // clamping either side of this stays correct.
+                let file_content = crate::lang::outline::strip_bom(&file_content);
                 let lines: Vec<&str> = file_content.lines().collect();
                 // `caller_range` came from the content read during the walk, which on a
                 // large tree can be seconds earlier. If the file shrank in between — a
@@ -854,6 +860,62 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A callers query over a BOM'd file must render and rank exactly as without one.
+    ///
+    /// `callers` has two content paths and a BOM leaked through both (#51), neither of which
+    /// the search-side `Match.text` fix covered — this is the site my own audit of #51 turned
+    /// up after the first pass, so it is pinned rather than left to a reader:
+    ///
+    ///   * `find_callers_treesitter_batch` builds `call_text` as `lines[row].trim()`, and
+    ///     `str::trim` does not remove U+FEFF, so a call site on **line 1** carried the glyph
+    ///     into the `-> {call_text}` line. Now stripped at
+    ///     `bloom_walk::read_with_bloom_check`, the shared reader, so callees and deps get it
+    ///     too — and before `contains_any`, so the bloom filter tokenises line 1 the same way.
+    ///   * The expansion re-reads the file directly, bypassing that reader, so it needs its
+    ///     own strip for the expanded caller block.
+    ///
+    /// Line 1 is a *function containing the call*, which is what reaches both paths, and both
+    /// halves of that are load-bearing. A BOM only ever affects line 1, so a fixture whose
+    /// call sits lower cannot detect either bug. And the call must be inside a function: with
+    /// a bare top-level `target_fn();` on line 1, `caller_range` is `None`, the expansion
+    /// `continue`s before its read, and the second strip goes unpinned — verified by neutering
+    /// it and watching an earlier version of this test still pass.
+    #[test]
+    fn a_bom_does_not_change_callers_output() {
+        let body =
+            "fn caller_one() { target_fn(); }\nfn target_fn() {}\nfn other() { target_fn(); }\n";
+
+        let run = |prefix: &[u8], expand: usize| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(dir.path().join("a.rs"), &bytes).unwrap();
+            let bloom = crate::index::bloom::BloomFilterCache::new();
+            let out =
+                search_callers_expanded("target_fn", dir.path(), &bloom, expand, None, None, false)
+                    .unwrap();
+            out.replace(&dir.path().to_string_lossy().to_string(), "<TMP>")
+        };
+
+        for expand in [0, 2] {
+            let plain = run(&[], expand);
+            let bommed = run(&[0xEF, 0xBB, 0xBF], expand);
+
+            assert!(
+                plain.contains("target_fn"),
+                "expand={expand}: fixture is broken, no callers found:\n{plain}"
+            );
+            assert!(
+                !bommed.contains('\u{feff}'),
+                "expand={expand}: a BOM reached callers output:\n{bommed}"
+            );
+            assert_eq!(
+                bommed, plain,
+                "expand={expand}: a BOM changed callers output"
+            );
+        }
+    }
 
     /// `rank_callers` computes its key once per caller instead of inside the comparator,
     /// where it walked `strip_prefix(scope).components().count()` for both sides of every
