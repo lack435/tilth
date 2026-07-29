@@ -1,3 +1,4 @@
+pub mod cpp_macro;
 pub mod detection;
 pub mod outline;
 pub mod treesitter;
@@ -5,6 +6,41 @@ pub mod treesitter;
 use std::path::Path;
 
 use crate::types::{FileType, Lang};
+
+/// Parse source for `lang`, blanking C/C++ export macros first.
+///
+/// Every tilth feature that reads a C++ AST goes through here, so a class behind an
+/// export macro parses as a class everywhere — outline, symbol search, callers,
+/// callees, siblings, scope and diff alike — instead of each having to recognise
+/// whatever shape tree-sitter's error recovery happened to leave behind.
+///
+/// **Read text from `content`, never from the masked copy.** Masking replaces an
+/// identifier with the same number of spaces, so every offset, line and column in the
+/// tree is a position in the original source; that is the whole reason it is done this
+/// way. The returned `Tree` owns its structure and does not borrow either string.
+/// `lang` is optional because some callers resolve a grammar for a file whose
+/// language they never classified; those simply never mask.
+pub fn parse_masked(
+    content: &str,
+    lang: Option<Lang>,
+    ts_lang: &tree_sitter::Language,
+) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(ts_lang).ok()?;
+    match mask_for(content, lang) {
+        Some(masked) => parser.parse(&masked, None),
+        None => parser.parse(content, None),
+    }
+}
+
+/// The masked form of `content`, or `None` when masking does not apply or changes
+/// nothing — which is every non-C/C++ file and most C++ ones.
+fn mask_for(content: &str, lang: Option<Lang>) -> Option<String> {
+    if !matches!(lang, Some(Lang::C | Lang::Cpp)) {
+        return None;
+    }
+    cpp_macro::mask_export_macros(content)
+}
 
 /// Detect file type by extension, then by name.
 pub fn detect_file_type(path: &Path) -> FileType {

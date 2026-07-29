@@ -104,9 +104,7 @@ impl OutlineCache {
         };
         let ts_lang = crate::lang::outline::outline_language(lang)?;
         let content = std::fs::read_to_string(path).ok()?;
-        let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&ts_lang).ok()?;
-        let tree = parser.parse(&content, None)?;
+        let tree = crate::lang::parse_masked(&content, Some(lang), &ts_lang)?;
         let file = Arc::new(ParsedFile {
             content: Arc::new(content),
             tree,
