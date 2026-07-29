@@ -243,10 +243,33 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
                 .find_map(|c| c_declarator_name_at(c, lines, depth + 1))
         }
         // Every other declarator kind wraps the next one down.
-        _ => node
-            .child_by_field_name("declarator")
-            .and_then(|d| c_declarator_name_at(d, lines, depth + 1)),
+        _ => inner_declarator(node).and_then(|d| c_declarator_name_at(d, lines, depth + 1)),
     }
+}
+
+/// The next declarator down a C/C++ declarator chain.
+///
+/// Most kinds expose the declarator they wrap as a `declarator` field, but
+/// `reference_declarator` — `T& Get()`, `T&& Take()` — holds it as an *unnamed*
+/// child, the same way `parenthesized_declarator` does. A bare field probe therefore
+/// stops one link short of the name on every reference return, which is not a corner:
+/// it is how a C++ singleton accessor, `at()`, `front()` and `operator[]` are all
+/// spelled. The symbol resolved to nothing, so it was never indexed as a definition —
+/// silently, since text search still matched the line and reported it as a usage.
+fn inner_declarator(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        return Some(declarator);
+    }
+    if !matches!(
+        node.kind(),
+        "reference_declarator" | "parenthesized_declarator"
+    ) {
+        return None;
+    }
+    let mut cursor = node.walk();
+    // Bind rather than returning in tail position: `children` borrows `cursor`.
+    let found = node.children(&mut cursor).find(tree_sitter::Node::is_named);
+    found
 }
 
 /// True when `node` is a class head that an unknown macro made tree-sitter misparse.
@@ -579,13 +602,17 @@ fn has_error_child(node: tree_sitter::Node) -> bool {
 
 /// True when `node`'s C/C++ declarator chain contains a node of `kind`.
 /// Walks the chain, so layers added by pointers, references and arrays are seen too.
+///
+/// Bounded by `MAX_DECLARATOR_DEPTH` for the same reason `c_declarator_name` is: the
+/// nesting is input-controlled and `outline::generate` is a fuzz target.
 fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
-    let mut current = node.child_by_field_name("declarator");
-    while let Some(n) = current {
+    let mut current = inner_declarator(node);
+    for _ in 0..MAX_DECLARATOR_DEPTH {
+        let Some(n) = current else { return false };
         if n.kind() == kind {
             return true;
         }
-        current = n.child_by_field_name("declarator");
+        current = inner_declarator(n);
     }
     false
 }
@@ -1859,6 +1886,69 @@ mod tests {
         let _ = crate::lang::outline::get_outline_entries(&arrays, Lang::Cpp);
         let quals = format!("void {}f() {{}}\n", "A::".repeat(5000));
         let _ = crate::lang::outline::get_outline_entries(&quals, Lang::Cpp);
+    }
+
+    /// `reference_declarator` holds its inner declarator as an *unnamed* child, so the
+    /// field probe that walks every other declarator kind stopped one link short and
+    /// the name resolved to nothing. Every reference return was affected — a C++
+    /// singleton accessor, `at()`, `front()`, `operator[]` — and the symbol was simply
+    /// never indexed as a definition. Silent, because text search still matched the
+    /// line and labelled it a usage.
+    #[test]
+    fn reference_returns_resolve_their_name() {
+        let cases: &[(&str, &str)] = &[
+            ("Holder& FreeRef() { return L; }", "FreeRef"),
+            ("Holder&& FreeMove() { return {}; }", "FreeMove"),
+            ("const Holder& FreeConst() { return L; }", "FreeConst"),
+            ("Holder* FreePtr() { return nullptr; }", "FreePtr"),
+            // A reference to a pointer, and a pointer chain, both stack layers on.
+            ("Holder*& RefToPtr() { return P; }", "RefToPtr"),
+            ("Holder** PtrToPtr() { return nullptr; }", "PtrToPtr"),
+            // Out-of-line definitions resolve to the trailing segment.
+            ("Holder& Outer::Member() { return L; }", "Member"),
+        ];
+        for (src, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = tree.root_node().named_child(0).expect("a top-level node");
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "wrong name for {src:?} (node kind {})",
+                node.kind()
+            );
+            assert!(
+                is_definition_node(node, Some(Lang::Cpp)),
+                "{src:?} must be a definition"
+            );
+        }
+    }
+
+    /// The same missing link broke the *other* chain walk: a reference-returning
+    /// prototype has a `function_declarator` in its chain, but the walk could not reach
+    /// it, so the member was classified as data rather than as a function.
+    #[test]
+    fn reference_returning_prototype_is_seen_as_a_function() {
+        let cases = [
+            "struct S { Holder& Get(); };",
+            "struct S { Holder&& Take(); };",
+            "struct S { const Holder& Peek() const; };",
+        ];
+        for src in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let spec = tree.root_node().named_child(0).expect("a top-level node");
+            let body = spec
+                .child_by_field_name("body")
+                .expect("a field_declaration_list");
+            let member = body.named_child(0).expect("one member");
+            assert!(
+                declarator_chain_has_function(member),
+                "{src:?} member ({}) must read as a function",
+                member.kind()
+            );
+        }
     }
 
     /// A `parenthesized_declarator` wraps its inner declarator as an *unnamed* child,

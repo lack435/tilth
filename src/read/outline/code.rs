@@ -585,6 +585,40 @@ public:
         }
     }
 
+    /// A reference return is how a C++ singleton accessor, `at()`, `front()` and
+    /// `operator[]` are all spelled, and `reference_declarator` hides its inner
+    /// declarator from the field probe both declarator walks used. The name resolved
+    /// to nothing and the chain walk could not see the `function_declarator`, so these
+    /// members were unnamed *and* classified as data.
+    #[test]
+    fn cpp_outline_names_reference_returning_members() {
+        let rendered = outline(
+            "class Holder\n{\npublic:\n    static Holder& Get();\n    const Holder& Peek() const;\n    Holder&& Take();\n    Holder* Ptr();\n    Holder*& RefToPtr();\n    int Value;\n};\n",
+            Lang::Cpp,
+            1000,
+        );
+        for want in [
+            "fn Get",
+            "fn Peek",
+            "fn Take",
+            "fn Ptr",
+            "fn RefToPtr",
+            "prop Value",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+        assert!(
+            !rendered.contains("<anonymous>"),
+            "no member should be anonymous:\n{rendered}"
+        );
+        // The classification half: a reference return is a function, not a field.
+        assert_eq!(
+            rendered.matches("prop ").count(),
+            1,
+            "only `Value` is data:\n{rendered}"
+        );
+    }
+
     /// One `ERROR` can hold two constructors, and a `contains` check cannot tell one
     /// from two — so count. This is the specific claim the recursion in
     /// `push_misparsed_members` exists to satisfy.
