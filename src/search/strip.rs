@@ -65,9 +65,13 @@ pub(crate) fn strip_noise(
 
         // BOM-aware, because `str::trim` is not: U+FEFF was removed from Unicode
         // `White_Space` years ago, so on a BOM'd file every `starts_with` test below fails
-        // for line 1 and a shebang or opening comment survives stripping (#42). Only line 1
-        // can be affected — a BOM occurs once, at file start — but this is the single funnel
-        // all three rules read from, so one call covers them. Same helper as
+        // for line 1 and an opening comment survives stripping (#42). Python is where this
+        // actually bites — a leading `# comment` is strippable there. Not Bash: `is_strippable_comment`
+        // exempts `#!` deliberately, so a BOM'd shebang surviving was already the right
+        // answer, reached by accident.
+        //
+        // Only line 1 can be affected — a BOM occurs once, at file start — but this is the
+        // single funnel all three rules read from, so one call covers them. Same helper as
         // `read::imports::is_import_line`, which is the other line-prefix judgement.
         let trimmed = crate::lang::outline::trim_start_bom_aware(line).trim_end();
 

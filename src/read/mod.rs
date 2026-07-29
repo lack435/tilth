@@ -225,6 +225,12 @@ pub fn would_outline(path: &Path) -> bool {
 /// fence-state tracking the previous hand-rolled scanner needed is now
 /// the parser's responsibility.
 fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
+    // Same strip as `read::outline::generate` applies before parsing, and it has to be: the
+    // outline is where an agent gets the heading anchors it then passes back here. While
+    // only the outline stripped, a doubled-BOM markdown file outlined its headings and then
+    // had every one of them rejected as "heading not found". A BOM carries no newline, so
+    // the line numbers this returns are unaffected.
+    let buf = crate::lang::outline::strip_bom_bytes(buf);
     let heading_trimmed = heading.trim_end();
     let query_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
     if query_level == 0 || query_level > 6 {
@@ -333,6 +339,13 @@ fn section_end_line(section: tree_sitter::Node) -> usize {
 /// matches first; this is acceptable for a hint and aligned with the rest
 /// of the project's `edit_distance` use.
 fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
+    // These suggestions are rendered verbatim as "Closest matches", and an agent pastes one
+    // straight back as `section`. Unstripped, a BOM'd file suggested `\u{feff}# Title` — and
+    // `resolve_range` gates on `range.starts_with('#')`, which the BOM defeats, so the retry
+    // did not even reach the heading resolver: tilth answered its own suggestion with
+    // "expected format: start-end or heading". A hint is a string tilth synthesised, not the
+    // file's bytes, so unlike the full view there is nothing here to preserve.
+    let buf = crate::lang::outline::strip_bom_bytes(buf);
     let q_text = query.trim_end().trim_start_matches('#').trim();
     if q_text.is_empty() {
         return Vec::new();
@@ -768,6 +781,80 @@ mod tests {
 
         std::env::remove_var("TILTH_FULL_SIZE_CAP");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A heading tilth suggests must be one tilth accepts, on a BOM'd file.
+    ///
+    /// `suggest_headings` rendered line 1 verbatim, so a BOM'd file suggested
+    /// `\u{feff}# Title` as a "Closest match" — and `resolve_range` gates on
+    /// `range.starts_with('#')`, which the BOM defeats, so pasting that suggestion back did
+    /// not even reach the heading resolver. The agent got `expected format: "start-end" or
+    /// heading` for a string tilth had just handed it.
+    ///
+    /// Distinct from the full-view decision: a suggestion is a string tilth synthesised, not
+    /// the file's bytes, and it carries no hash anchor.
+    #[test]
+    fn a_suggested_heading_is_one_the_resolver_accepts_on_a_bom_file() {
+        let body = "# Title\nfoo\n## Sub\nbar\n";
+        for n in 1..=2 {
+            let mut input = Vec::new();
+            for _ in 0..n {
+                input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            input.extend_from_slice(body.as_bytes());
+
+            let suggestions = suggest_headings(&input, "# Titel", 5);
+            let suggested = suggestions
+                .iter()
+                .find(|h| h.contains("Title"))
+                .unwrap_or_else(|| {
+                    panic!("{n} BOM(s): no suggestion for 'Title': {suggestions:?}")
+                });
+            assert!(
+                !suggested.contains('\u{feff}'),
+                "{n} BOM(s): the suggestion carries a BOM: {suggested:?}"
+            );
+            // The round trip: feed the suggestion back exactly as an agent would.
+            assert!(
+                resolve_range(&input, suggested).is_ok(),
+                "{n} BOM(s): tilth rejected its own suggestion {suggested:?}"
+            );
+        }
+    }
+
+    /// The outline and the section resolver must agree about which headings exist.
+    ///
+    /// `read::outline::generate` strips a BOM before parsing; while `resolve_heading` did
+    /// not, a doubled-BOM markdown file outlined its headings and then had every one of them
+    /// rejected as "heading not found" — an anchor advertised by one half of the same tool
+    /// and denied by the other.
+    #[test]
+    fn the_outline_and_the_heading_resolver_agree_on_a_bom_file() {
+        let body = "# Title\nfoo\n## Sub\nbar\n";
+        for n in 0..=2 {
+            let mut input = Vec::new();
+            for _ in 0..n {
+                input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            input.extend_from_slice(body.as_bytes());
+            let content = String::from_utf8(input.clone()).unwrap();
+
+            let outline = outline::generate(
+                Path::new("readme.md"),
+                FileType::Markdown,
+                &content,
+                &input,
+                false,
+            );
+            assert!(
+                outline.contains("Title"),
+                "{n} BOM(s): the outline lost its heading: {outline:?}"
+            );
+            assert!(
+                resolve_heading(&input, "# Title").is_some(),
+                "{n} BOM(s): the outline advertises a heading the resolver denies"
+            );
+        }
     }
 
     #[test]
