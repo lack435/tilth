@@ -68,13 +68,38 @@ use crate::types::{FileType, Lang};
 ///
 /// ~53% off peak RSS. The 5-target row is ~13% slower, and unlike the single-target differences
 /// that one is resolvable: both ranges have ~7% internal spread and they are disjoint. It also
-/// has a known mechanism — `bloom_walk::read_with_bloom_check` calls `contains` once per target,
-/// so a refused admission makes every target rebuild the same filter instead of one building it
-/// and the rest hitting. That is worth fixing on its own and is tracked separately.
+/// had a known mechanism — `bloom_walk::read_with_bloom_check` called `contains` once per target,
+/// so a refused admission made every target rebuild the same filter instead of one building it
+/// and the rest hitting. Unbounded, refusal only happened on a cold entry; with a ceiling it is
+/// the steady state once the budget is full, which turned a non-issue into an N x multiplier on
+/// filter-building work.
+///
+/// #34 fixed that by hoisting the build out of the per-target loop — see `contains_any`. Measured
+/// on a ~147k-file C++ tree, `kind: "callers"`, three reps per session and two interleaved
+/// A/B/A/B rounds per row (n=6), against the commit before the fix:
+///
+/// ```text
+///                 before                     after
+/// 5-target        9520-10446ms (mean 10088)  8334-9362ms (mean 8925)
+/// single-target   7122-8086ms  (mean 7748)   7110-8185ms (mean 7782)
+/// ```
+///
+/// -11.5% on the 5-target mean. Within-row spread is ~10-15%, wider than the 158ms gap between
+/// the two 5-target ranges, so the ranges being disjoint is not by itself the argument. What
+/// makes it resolvable is that all six "after" reps beat all six "before" reps — a perfect split
+/// of twelve observations, ~0.1% under the null — *and* that the single-target row, where there
+/// is no fan-out to remove, moves -0.4% with fully overlapping ranges. The effect appears exactly
+/// where the mechanism predicts it and nowhere else.
+///
+/// Peak RSS is unchanged (109-130 MB either side, n=2 per cell, overlapping). It should be: the
+/// fix removes redundant *transient* builds, not retained bytes, so the ceiling still sets peak.
+/// This tree is not the one the table above was measured on, so these numbers size the fix, not
+/// the ceiling — do not read them against the rows above.
 ///
 /// Output is unaffected at every setting — verified byte-identical with the cache unbounded,
-/// bounded and disabled, and it must be: a filter is only ever a pre-filter ahead of a real
-/// `memmem` check and a parse, so a miss costs work and never a wrong answer.
+/// bounded and disabled, and again across the #34 fix (same MD5 over the response text on every
+/// rep of every row). It must be: a filter is only ever a pre-filter ahead of a real `memmem`
+/// check and a parse, so a miss costs work and never a wrong answer.
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Fixed cost of one cache entry, beyond its bit array.
@@ -136,6 +161,12 @@ pub struct BloomFilterCache {
     /// for a *configurable* ceiling, and a 32 MB constant also made the growth test take 5s of
     /// a 5.7s suite because reaching the bound meant tokenising ~28M identifiers.
     ceiling: usize,
+    /// Count of filters built, whether or not admission accepted them.
+    ///
+    /// Report-only — nothing reads it to decide control flow. It exists because "one build per
+    /// file, not one per target" is the whole point of `contains_any` and the only way to assert
+    /// it deterministically. A timing assertion would be flaky; a build count is exact.
+    builds: std::sync::atomic::AtomicUsize,
 }
 
 struct CachedFilter {
@@ -165,6 +196,7 @@ impl BloomFilterCache {
             filters: DashMap::new(),
             bytes: std::sync::atomic::AtomicUsize::new(0),
             ceiling,
+            builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -172,6 +204,12 @@ impl BloomFilterCache {
     #[must_use]
     pub fn cached_bytes(&self) -> usize {
         self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Filters built since construction, admitted or not. Test/diagnostic accessor.
+    #[must_use]
+    pub fn filters_built(&self) -> usize {
+        self.builds.load(Relaxed)
     }
 
     /// Check if `symbol` might appear in the file at `path`.
@@ -183,16 +221,58 @@ impl BloomFilterCache {
     /// `false` if it is DEFINITELY absent.
     #[must_use]
     pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
-        // Fast path: check existing cached entry
+        self.contains_any(path, mtime, content, [symbol])
+    }
+
+    /// Check if **any** of `targets` might appear in the file at `path`.
+    ///
+    /// Semantically `targets.any(|t| self.contains(path, mtime, content, t))`, but it builds at
+    /// most one filter for the file rather than one per target. That distinction is the whole
+    /// reason this exists: with the cache bounded, a refused admission is the steady state once
+    /// the budget is full, and per-target `contains` then rebuilt the identical filter N times.
+    /// Callers pass whole target sets — `find_callers_batch` every target of a `callers` query,
+    /// `blast_radius` every symbol a `tilth_write` batch touched — so N is 5 or 20, not 1, and
+    /// the result was strictly worse than having no cache at all. Keeping the fan-out here
+    /// rather than in each caller makes "one build per file" structural.
+    ///
+    /// Returns `true` if some target MIGHT be in the file (possible false positive), `false` if
+    /// every target is DEFINITELY absent. Empty `targets` is vacuously `false`, and costs no
+    /// build — matching `any` on an empty iterator.
+    ///
+    /// The cached-filter arm holds the `DashMap` shard read lock across the target loop, so
+    /// `targets` must not itself touch this cache; every caller passes a plain collection.
+    #[must_use]
+    pub fn contains_any<I, S>(
+        &self,
+        path: &Path,
+        mtime: SystemTime,
+        content: &str,
+        targets: I,
+    ) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut targets = targets.into_iter().peekable();
+        // No target means no question to answer, and building a filter to answer it would charge
+        // the budget for a probe that cannot return true.
+        if targets.peek().is_none() {
+            return false;
+        }
+
+        // Fast path: check existing cached entry. One lookup, then every target queried against
+        // the filter we already hold.
         if let Some(entry) = self.filters.get(path) {
             if entry.mtime == mtime {
-                return entry.filter.contains(symbol);
+                return targets.any(|t| entry.filter.contains(t.as_ref()));
             }
         }
 
         // Cache miss or stale: build outside any lock, answer from the fresh filter, then admit.
+        // Admission may refuse; the answer is already in hand either way.
         let filter = build_filter(content, code_lang(path));
-        let result = filter.contains(symbol);
+        self.builds.fetch_add(1, Relaxed);
+        let result = targets.any(|t| filter.contains(t.as_ref()));
         self.admit(path, mtime, filter);
         result
     }
@@ -573,6 +653,128 @@ mod tests {
         // Whatever happened, the ceiling still holds and answers are still correct.
         assert!(cache.cached_bytes() <= 64 * 1024);
         assert!(cache.contains(&path, newer, &content, "ident_7"));
+    }
+
+    /// A probe with N targets must build one filter per file, not one per target — including when
+    /// the cache is full and refuses to admit it.
+    ///
+    /// This is the #34 regression guard. Before `contains_any`, `read_with_bloom_check` looped
+    /// `contains` per target: with an unbounded cache target 1 built and 2..N hit, but once the
+    /// ceiling landed in #32 a refused admission became the steady state and all N built the
+    /// identical filter. The build count is asserted rather than the wall time because the
+    /// difference is a constant factor, and a timing assertion at that resolution is flaky.
+    #[test]
+    fn a_refused_admission_builds_one_filter_per_file_not_per_target() {
+        // Ceiling of 0 refuses every admission, which is exactly the full-cache steady state the
+        // multiplier lived in — and it makes the test independent of how big a filter happens to
+        // be. `cache_stops_growing_at_the_ceiling_and_stays_correct` covers the partial case.
+        let cache = BloomFilterCache::with_ceiling(0);
+        let mtime = SystemTime::UNIX_EPOCH;
+        let content = ident_content(200);
+        let path = PathBuf::from("/synthetic/refused.rs");
+
+        // Five targets, none present, so `any` cannot short-circuit and every target is queried.
+        // A present target would let `any` return on the first one and hide the fan-out.
+        let targets = ["absent_a", "absent_b", "absent_c", "absent_d", "absent_e"];
+        // The answer is not assertable either way: at a 1% target FPR over five probes a `true`
+        // here is legitimate. Correctness of the answer is covered by the present-symbol tests;
+        // what this test pins down is that refusing admission did not turn one build into five.
+        let _ = cache.contains_any(&path, mtime, &content, targets);
+
+        assert_eq!(
+            cache.filters_built(),
+            1,
+            "a {}-target probe built {} filters for one file; the build is back inside the \
+             per-target loop",
+            targets.len(),
+            cache.filters_built()
+        );
+        assert_eq!(
+            cache.cached_bytes(),
+            0,
+            "a 0-byte ceiling admitted an entry"
+        );
+
+        // And the count still does not scale with N across repeated refused probes: each probe
+        // costs exactly one more build, not one per target.
+        for _ in 0..3 {
+            let _ = cache.contains_any(&path, mtime, &content, targets);
+        }
+        assert_eq!(
+            cache.filters_built(),
+            4,
+            "four refused probes should cost four builds"
+        );
+    }
+
+    /// A cached filter answers every target with no build at all — the property that made the
+    /// per-target loop harmless before the cache was bounded, and which must survive the change.
+    #[test]
+    fn a_cached_filter_answers_many_targets_without_rebuilding() {
+        let cache = BloomFilterCache::with_ceiling(16 * 1024 * 1024);
+        let mtime = SystemTime::UNIX_EPOCH;
+        let content = ident_content(200);
+        let path = PathBuf::from("/synthetic/admitted.rs");
+
+        assert!(cache.contains_any(&path, mtime, &content, ["ident_7"]));
+        assert_eq!(cache.filters_built(), 1);
+        assert!(cache.cached_bytes() > 0, "nothing was admitted");
+
+        // A present target last, so the whole set is walked before `any` returns.
+        assert!(cache.contains_any(
+            &path,
+            mtime,
+            &content,
+            ["absent_a", "absent_b", "absent_c", "absent_d", "ident_7"]
+        ));
+        assert_eq!(
+            cache.filters_built(),
+            1,
+            "querying a cached filter rebuilt it"
+        );
+    }
+
+    /// An empty target set is vacuously false and must not pay for a filter, matching `any` on an
+    /// empty iterator. Reachable from `callees`, which passes its shrinking `remaining` set.
+    #[test]
+    fn no_targets_costs_no_build() {
+        let cache = BloomFilterCache::with_ceiling(16 * 1024 * 1024);
+        let empty: [&str; 0] = [];
+        assert!(!cache.contains_any(
+            Path::new("/synthetic/empty.rs"),
+            SystemTime::UNIX_EPOCH,
+            &ident_content(200),
+            empty
+        ));
+        assert_eq!(cache.filters_built(), 0);
+        assert_eq!(cache.cached_bytes(), 0);
+    }
+
+    /// `contains_any` must agree with per-target `contains` on the same filter, target for target.
+    /// The optimisation is only sound if it changes cost and nothing else.
+    #[test]
+    fn contains_any_agrees_with_per_target_contains() {
+        let content = "fn alpha() { beta(); }";
+        let mtime = SystemTime::UNIX_EPOCH;
+        let path = Path::new("/synthetic/agree.rs");
+
+        for targets in [
+            vec!["alpha"],
+            vec!["beta"],
+            vec!["alpha", "beta"],
+            vec!["nope_xyzzy", "alpha"],
+            vec!["alpha", "nope_xyzzy"],
+            vec!["nope_xyzzy", "nope_plugh"],
+        ] {
+            // Separate caches so neither run sees the other's admissions.
+            let a = BloomFilterCache::new();
+            let b = BloomFilterCache::new();
+            let via_any = a.contains_any(path, mtime, content, targets.iter().copied());
+            let via_each = targets
+                .iter()
+                .any(|t| b.contains(path, mtime, content, t.as_ref()));
+            assert_eq!(via_any, via_each, "disagreement on {targets:?}");
+        }
     }
 
     /// Two threads missing on the **same** path must charge the budget once, not twice.

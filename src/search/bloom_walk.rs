@@ -19,6 +19,11 @@ pub(super) const MAX_FILE_SIZE: u64 = 500_000;
 /// Bloom is probabilistic: a positive may be a false positive. Callers that
 /// need a tighter pre-AST filter (e.g. memchr) should run it on the returned
 /// content before paying for tree-sitter.
+///
+/// The whole target set goes to `contains_any` in one call rather than being looped over
+/// `contains`. That is load-bearing, not style: the cache is byte-bounded, so once the budget is
+/// full admission is refused and a per-target loop rebuilt the same file's filter once per
+/// target. See `BloomFilterCache::contains_any`.
 pub(super) fn read_with_bloom_check<I, S>(
     path: &Path,
     targets: I,
@@ -36,10 +41,7 @@ where
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let content = std::fs::read_to_string(path).ok()?;
 
-    if !targets
-        .into_iter()
-        .any(|t| bloom.contains(path, mtime, &content, t.as_ref()))
-    {
+    if !bloom.contains_any(path, mtime, &content, targets) {
         return None;
     }
 
@@ -84,6 +86,34 @@ mod tests {
         let targets: HashSet<String> = ["alpha".to_string()].into_iter().collect();
         let (content, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).unwrap();
         assert!(content.contains("alpha"));
+    }
+
+    /// The prefilter must cost one filter build per file however many targets it is given, even
+    /// when the cache is full and refuses to admit. This is the #34 path: `find_callers_batch`
+    /// hands the whole target set to this helper for every candidate file, so a per-target build
+    /// is an N x multiplier on the walk.
+    #[test]
+    fn a_full_cache_costs_one_build_per_file_not_per_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.rs");
+        fs::write(&p, "fn alpha() { beta(); }\n").unwrap();
+
+        // Ceiling of 0 refuses every admission — the steady state once the real 32 MB budget is
+        // full, and the regime where the old per-target loop rebuilt the same filter N times.
+        let bloom = BloomFilterCache::with_ceiling(0);
+        // Ordered, and with the only present target last, so nothing short-circuits early: a
+        // `HashSet` iterates arbitrarily and could hit `alpha` first, hiding the fan-out.
+        let targets = ["absent_a", "absent_b", "absent_c", "absent_d", "alpha"];
+
+        assert!(read_with_bloom_check(&p, targets, &bloom, MAX_FILE_SIZE).is_some());
+        assert_eq!(
+            bloom.filters_built(),
+            1,
+            "{} targets cost {} builds for one file; the prefilter is looping `contains` per \
+             target again",
+            targets.len(),
+            bloom.filters_built()
+        );
     }
 
     #[test]
