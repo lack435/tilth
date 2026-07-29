@@ -38,6 +38,9 @@ pub fn fingerprint(root: &Path) -> String {
 /// this is accounted for by the `+N more` suffix rather than silently dropped.
 const MAX_LISTED_DIRS: usize = 10;
 
+/// How many dependencies the `deps:` line lists. See `cap_deps`.
+const MAX_LISTED_DEPS: usize = 10;
+
 fn fingerprint_inner(root: &Path) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -71,15 +74,26 @@ fn fingerprint_inner(root: &Path) -> String {
 
     let lang_name = primary_lang.map_or("Unknown", lang_display_name);
 
-    // Every code file found, not the primary language's share of them.
+    // The file count, and the noun that says what it counted.
     //
-    // This used to resolve to `lang_counts[primary_lang]` while the header called the number
-    // "source files", so a tied Rust/Python tree of 8 files reported "4 source files". Worse,
-    // the no-primary-language fallback *did* sum, so the number meant one of two different
-    // things depending on whether a language was detected at all. Summing unconditionally is
-    // what makes the label true; the primary language is already named by `{lang_name}
-    // project` immediately before it.
-    let total_files: usize = walk.lang_counts.values().sum();
+    // This was `lang_counts[primary_lang]` under a label reading "source files", so a tied
+    // 4-Rust/4-Python tree of 8 files reported "4 source files" — while the fallback for a
+    // tree with no detected language *summed* instead, so the number meant one of two
+    // different things depending on the tree.
+    //
+    // Naming the language is the fix rather than summing, because the header's *other*
+    // number is primary-language-scoped too: a directory qualifies as a module on its count
+    // of primary-language files (see below). Summing here would have made one sentence
+    // report two differently-measured populations — `Rust project — 95 source files, 8
+    // directories`, where the 8 directories account for 39 of the 95. One population, named.
+    //
+    // The old fallback is now provably dead rather than merely unused: `primary_lang` is
+    // `None` only when `max_by_key` saw an empty map, and `lang_counts` holds no zero
+    // entries, so no primary language implies no code files at all.
+    let (file_count, file_noun) = match primary_lang {
+        Some(l) => (walk.lang_counts.get(&l).copied().unwrap_or(0), lang_name),
+        None => (0, "source"),
+    };
 
     // Modules: dirs with >=2 files of the primary language, with common prefix stripped.
     // Keys in module_lang_counts may be "dir" or "dir/subdir" (for deeply nested projects).
@@ -205,8 +219,8 @@ fn fingerprint_inner(root: &Path) -> String {
 
     // Header line. Both nouns are pluralised — this said "1 directories".
     lines.push(format!(
-        "[tilth] {lang_name} project — {total_files} source file{}, {qualifying_dirs} director{}",
-        if total_files == 1 { "" } else { "s" },
+        "[tilth] {lang_name} project — {file_count} {file_noun} file{}, {qualifying_dirs} director{}",
+        if file_count == 1 { "" } else { "s" },
         if qualifying_dirs == 1 { "y" } else { "ies" }
     ));
 
@@ -225,10 +239,18 @@ fn fingerprint_inner(root: &Path) -> String {
     // Manifest — name, version, deps
     if let Some(manifest) = find_manifest(root) {
         if let Some(info) = parse_manifest(root, &manifest) {
-            // Deps line
+            // Deps line. Same disclosure as `dirs:` above — this line drops more than it
+            // shows on a real manifest (tilth: 10 of 40, alphabetical, so every
+            // `tree-sitter-*` grammar falls off the end), and saying nothing about that in
+            // an orientation payload is the defect this change exists to fix.
             if !info.deps.is_empty() {
                 let dep_str = info.deps.join(", ");
-                lines.push(format!("  deps: {dep_str}"));
+                let mut deps_line = format!("  deps: {dep_str}");
+                let hidden = info.dep_total.saturating_sub(info.deps.len());
+                if hidden > 0 {
+                    write!(deps_line, " +{hidden} more").unwrap();
+                }
+                lines.push(deps_line);
             }
 
             // Hot files (only for projects with local imports)
@@ -543,6 +565,20 @@ struct ManifestInfo {
     name: Option<String>,
     version: Option<String>,
     deps: Vec<String>,
+    /// How many dependencies the manifest declared, before the cap. The renderer needs this
+    /// to say what it dropped.
+    dep_total: usize,
+}
+
+/// Sort, record the true count, then cap.
+///
+/// One place for all four manifest formats, so the count and the cap cannot drift apart —
+/// which is exactly how `dir_count` came to disagree with the `dirs:` line it introduces.
+fn cap_deps(mut deps: Vec<String>) -> (Vec<String>, usize) {
+    deps.sort();
+    let total = deps.len();
+    deps.truncate(MAX_LISTED_DEPS);
+    (deps, total)
 }
 
 fn parse_manifest(root: &Path, manifest: &str) -> Option<ManifestInfo> {
@@ -570,16 +606,17 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
     let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let parsed: CargoToml = toml::from_str(&content).ok()?;
     let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
-    let mut deps: Vec<String> = parsed
-        .dependencies
-        .map(|d| d.into_iter().map(|(k, _)| k).collect())
-        .unwrap_or_default();
-    deps.sort();
-    deps.truncate(10);
+    let (deps, dep_total) = cap_deps(
+        parsed
+            .dependencies
+            .map(|d| d.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default(),
+    );
     Some(ManifestInfo {
         name,
         version,
         deps,
+        dep_total,
     })
 }
 
@@ -593,16 +630,17 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
 
     let content = fs::read_to_string(root.join("package.json")).ok()?;
     let parsed: PackageJson = serde_json::from_str(&content).ok()?;
-    let mut deps: Vec<String> = parsed
-        .dependencies
-        .map(|d| d.into_iter().map(|(k, _)| k).collect())
-        .unwrap_or_default();
-    deps.sort();
-    deps.truncate(10);
+    let (deps, dep_total) = cap_deps(
+        parsed
+            .dependencies
+            .map(|d| d.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default(),
+    );
     Some(ManifestInfo {
         name: parsed.name,
         version: parsed.version,
         deps,
+        dep_total,
     })
 }
 
@@ -637,13 +675,13 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
         }
     }
 
-    deps.sort();
-    deps.truncate(10);
+    let (deps, dep_total) = cap_deps(deps);
 
     Some(ManifestInfo {
         name,
         version: None,
         deps,
+        dep_total,
     })
 }
 
@@ -662,24 +700,25 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
     let content = fs::read_to_string(root.join("pyproject.toml")).ok()?;
     let parsed: PyProject = toml::from_str(&content).ok()?;
     let project = parsed.project.unwrap_or_default();
-    let mut deps: Vec<String> = project
-        .dependencies
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|spec| {
-            let bare = spec
-                .split(&['>', '<', '=', '~', '!', ';', '[', ' '][..])
-                .next()?
-                .trim();
-            (!bare.is_empty()).then(|| bare.to_string())
-        })
-        .collect();
-    deps.sort();
-    deps.truncate(10);
+    let (deps, dep_total) = cap_deps(
+        project
+            .dependencies
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|spec| {
+                let bare = spec
+                    .split(&['>', '<', '=', '~', '!', ';', '[', ' '][..])
+                    .next()?
+                    .trim();
+                (!bare.is_empty()).then(|| bare.to_string())
+            })
+            .collect(),
+    );
     Some(ManifestInfo {
         name: project.name,
         version: project.version,
         deps,
+        dep_total,
     })
 }
 
@@ -743,15 +782,20 @@ fn git_context(root: &Path) -> Option<String> {
 
     let dirty_count = git_output(root, &["status", "--porcelain"]).map_or(0, |s| s.lines().count());
 
-    // "1 uncommitted files" — same defect as the header's "1 directories", same line's worth
-    // of fix, so corrected together rather than left as the one ungrammatical count left.
-    let dirty_str = match dirty_count {
+    Some(format!("branch {branch}, {}", dirty_summary(dirty_count)))
+}
+
+/// "1 uncommitted files" — the same defect as the header's "1 directories", one line away,
+/// so corrected with it rather than left as the only ungrammatical count in the payload.
+///
+/// Split out from `git_context` purely so it is testable: `git_context` shells out to `git`,
+/// and this is the one behaviour change here that would otherwise have no coverage.
+fn dirty_summary(dirty_count: usize) -> String {
+    match dirty_count {
         0 => "clean".to_string(),
         1 => "1 uncommitted file".to_string(),
         n => format!("{n} uncommitted files"),
-    };
-
-    Some(format!("branch {branch}, {dirty_str}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,17 +1153,17 @@ mod tests {
             .find(|l| l.trim_start().starts_with("dirs:"))
             .unwrap_or_else(|| panic!("no dirs: line in fingerprint:\n{out}"));
 
-        // Sorted by (count desc, name asc) then truncated to 10 → m00..m09.
-        for d in 0..10 {
+        // Sorted by (count desc, name asc) then capped → m00..m09.
+        for d in 0..MAX_LISTED_DIRS {
             assert!(
                 dirs_line.contains(&format!("m{d:02}/")),
-                "expected m{d:02}/ in the first ten:\n{dirs_line}"
+                "expected m{d:02}/ within the cap:\n{dirs_line}"
             );
         }
-        for d in 10..TIE_DIRS {
+        for d in MAX_LISTED_DIRS..TIE_DIRS {
             assert!(
                 !dirs_line.contains(&format!("m{d:02}/")),
-                "m{d:02}/ is past the first ten and must not be listed:\n{dirs_line}"
+                "m{d:02}/ is past the cap and must not be listed:\n{dirs_line}"
             );
         }
     }
@@ -1210,9 +1254,11 @@ mod tests {
 
     /// `primary_lang`'s tie-break assumes display names are unique — lock that in.
     ///
-    /// The key is `(count, Reverse(lang_display_name(lang)))`. It is a total order *only*
-    /// because no two `Lang` variants share a display string, which is what makes
-    /// `max_by_key`'s return-the-last-maximum behaviour unreachable. Add
+    /// The key is `(count, Reverse(lang_tiebreak_rank(lang)), Reverse(lang_display_name(lang)))`.
+    /// The rank does not carry the guarantee — it is deliberately near-flat, so most pairs
+    /// reach the name. It is a total order *only* because no two `Lang` variants share a
+    /// display string, which is what makes `max_by_key`'s return-the-last-maximum behaviour
+    /// unreachable. Add
     /// `Lang::Hpp => "C++"` or `Lang::Mjs => "JavaScript"` and the key silently stops being
     /// total, restoring hash-order dependence with nothing else failing. This is that
     /// nothing-else.
@@ -1334,14 +1380,18 @@ mod tests {
         }
     }
 
-    /// "source files" must mean every code file, not the primary language's share of them.
+    /// The file count's label must say which files it counted.
     ///
-    /// The number resolved to `lang_counts[primary_lang]` under a label that said otherwise,
-    /// so this tied 4-Rust/4-Python tree of 8 files reported "4 source files". The
-    /// no-primary-language fallback summed, so the label meant one of two different things
-    /// depending on the tree.
+    /// It was `lang_counts[primary_lang]` under a label reading "source files", so this tied
+    /// 4-Rust/4-Python tree of 8 files reported "4 source files" — a number that is neither
+    /// the languages' total nor described by its own noun. Naming the language is the fix
+    /// rather than summing, because the header's other number (directories) is
+    /// primary-language-scoped too, and one sentence should report one population.
+    ///
+    /// So this pins both halves: reverting to the old label fails on "4 Python files", and
+    /// switching to a cross-language sum fails on the same assertion from the other side.
     #[test]
-    fn source_file_count_covers_every_language_not_just_the_primary() {
+    fn file_count_is_labelled_with_the_language_it_counted() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1350,23 +1400,46 @@ mod tests {
             std::fs::write(src.join(format!("b{f}.py")), "def a():\n    pass\n").unwrap();
         }
 
+        // The tie resolves to Python by the name tie-break, per
+        // `tied_language_counts_resolve_deterministically`.
         let header = header_of(&fingerprint(dir.path()));
         assert!(
-            header.contains("8 source files"),
-            "8 code files across two languages must count as 8:\n{header}"
+            header.contains("4 Python files"),
+            "the count is the primary language's, so the label must name it:\n{header}"
+        );
+        assert!(
+            !header.contains("source files"),
+            "an unqualified 'source files' is the label that was wrong:\n{header}"
         );
     }
 
-    /// `[tilth] Rust project — 6 source files, 1 directories`.
+    /// With no language detected there is nothing to name, and the count is provably zero:
+    /// `primary_lang` is `None` only when `lang_counts` is empty. The old fallback summed
+    /// here, which is how one label came to mean two things.
+    #[test]
+    fn a_tree_with_no_code_falls_back_to_the_generic_noun() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# nothing to see\n").unwrap();
+
+        let header = header_of(&fingerprint(dir.path()));
+        assert!(
+            header.contains("0 source files"),
+            "no language means no count to attribute:\n{header}"
+        );
+    }
+
+    /// `[tilth] Rust project — 6 source files, 1 directories` — neither noun pluralised.
+    ///
+    /// The zero case is checked as well as the one case, because the obvious wrong fix is
+    /// `if n <= 1`, which reads correctly for one and breaks "0 directories".
     #[test]
     fn header_pluralises_both_nouns() {
-        // One code file at the root: one source file, and nothing nested to qualify as a
-        // module.
+        // One code file at the root: one file, and nothing nested to qualify as a module.
         let flat = tempfile::tempdir().unwrap();
         std::fs::write(flat.path().join("main.rs"), "pub fn a() {}\n").unwrap();
         let header = header_of(&fingerprint(flat.path()));
         assert!(
-            header.contains("1 source file,"),
+            header.contains("1 Rust file,"),
             "singular for one file:\n{header}"
         );
         assert!(
@@ -1383,9 +1456,66 @@ mod tests {
             "singular for one directory:\n{header}"
         );
         assert!(
-            header.contains(&format!("{TIE_FILES_PER_DIR} source files")),
+            header.contains(&format!("{TIE_FILES_PER_DIR} Rust files")),
             "plural for several files:\n{header}"
         );
+    }
+
+    /// The `deps:` line drops more than it shows on a real manifest, and said nothing about
+    /// it — the same defect as the header's directory count, one line below it.
+    ///
+    /// On tilth that is 10 of 40, alphabetical, so every `tree-sitter-*` grammar falls off
+    /// the end: the truncation deletes the most identifying fact about the project from a
+    /// payload whose whole job is orientation.
+    #[test]
+    fn deps_line_declares_what_the_cap_hid() {
+        let over = tempfile::tempdir().unwrap();
+        let mut manifest = String::from("[package]\nname = \"d\"\n\n[dependencies]\n");
+        let declared = MAX_LISTED_DEPS + 4;
+        for n in 0..declared {
+            writeln!(manifest, "dep{n:02} = \"1\"").unwrap();
+        }
+        std::fs::write(over.path().join("Cargo.toml"), &manifest).unwrap();
+        std::fs::write(over.path().join("main.rs"), "pub fn a() {}\n").unwrap();
+
+        let deps_line = line_starting(&fingerprint(over.path()), "deps:");
+        // Count entries, not occurrences of "dep" — the `deps:` label contains it too.
+        let listed = deps_line
+            .trim_start()
+            .trim_start_matches("deps:")
+            .split(", ")
+            .count();
+        assert_eq!(
+            listed, MAX_LISTED_DEPS,
+            "the deps: line must show the cap:\n{deps_line}"
+        );
+        assert!(
+            deps_line.contains(&format!("+{} more", declared - MAX_LISTED_DEPS)),
+            "and declare the rest:\n{deps_line}"
+        );
+
+        // Under the cap, nothing is hidden and nothing should be claimed hidden.
+        let under = tempfile::tempdir().unwrap();
+        std::fs::write(
+            under.path().join("Cargo.toml"),
+            "[package]\nname = \"d\"\n\n[dependencies]\nonly = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(under.path().join("main.rs"), "pub fn a() {}\n").unwrap();
+
+        let deps_line = line_starting(&fingerprint(under.path()), "deps:");
+        assert!(
+            !deps_line.contains("more"),
+            "nothing was hidden:\n{deps_line}"
+        );
+    }
+
+    /// `git_context` shells out, so the pluralisation lives in a helper that does not.
+    #[test]
+    fn dirty_summary_pluralises() {
+        assert_eq!(dirty_summary(0), "clean");
+        assert_eq!(dirty_summary(1), "1 uncommitted file");
+        assert_eq!(dirty_summary(2), "2 uncommitted files");
     }
 
     /// The `tests:` and `hot` lines must describe the same tree identically on every platform.
