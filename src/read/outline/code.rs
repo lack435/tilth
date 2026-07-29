@@ -648,9 +648,12 @@ public:
 
     /// A reference return is how a C++ singleton accessor, `at()`, `front()` and
     /// `operator[]` are all spelled, and `reference_declarator` hides its inner
-    /// declarator from the field probe both declarator walks used. The name resolved
-    /// to nothing and the chain walk could not see the `function_declarator`, so these
-    /// members were unnamed *and* classified as data.
+    /// declarator from the field probe both declarator walks used.
+    ///
+    /// The name resolved to nothing, and the declaration arms bail on an unresolved
+    /// name before classifying, so these members were absent from the outline
+    /// altogether — not mislabelled. The `prop` count below is what pins the second
+    /// half of the fix: with only the name walk repaired they come back as data.
     #[test]
     fn cpp_outline_names_reference_returning_members() {
         let rendered = outline(

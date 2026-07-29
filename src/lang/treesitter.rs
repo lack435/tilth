@@ -122,6 +122,7 @@ const C_DECLARATOR_KINDS: &[&str] = &[
     "reference_declarator",
     "array_declarator",
     "parenthesized_declarator",
+    "attributed_declarator",
     "init_declarator",
     "qualified_identifier",
 ];
@@ -249,27 +250,54 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
 
 /// The next declarator down a C/C++ declarator chain.
 ///
-/// Most kinds expose the declarator they wrap as a `declarator` field, but
-/// `reference_declarator` — `T& Get()`, `T&& Take()` — holds it as an *unnamed*
-/// child, the same way `parenthesized_declarator` does. A bare field probe therefore
-/// stops one link short of the name on every reference return, which is not a corner:
-/// it is how a C++ singleton accessor, `at()`, `front()` and `operator[]` are all
-/// spelled. The symbol resolved to nothing, so it was never indexed as a definition —
-/// silently, since text search still matched the line and reported it as a usage.
+/// Most kinds expose the declarator they wrap as a `declarator` field. Three do not,
+/// holding it as an *unnamed* child instead:
+///
+///   * `reference_declarator` — `T& Get()`, `T&& Take()`. Stopping here loses every
+///     reference return, which is how a C++ singleton accessor, `at()`, `front()` and
+///     `operator[]` are all spelled.
+///   * `parenthesized_declarator` — `(*Cb)` in a function-pointer type.
+///   * `attributed_declarator` — `int f [[gnu::const]] ()`. Not reference-specific;
+///     a plain `[[nodiscard]]` function was anonymous too.
+///
+/// The child is found by *allowlist* rather than by taking the first named one. Three
+/// kinds of node get in the way, and picking one of them silently yields a wrong
+/// answer rather than no answer:
+///
+///   * a `comment` is a tree-sitter extra, so it is a named child and can come first
+///     (`T& /* alias */ Get()`);
+///   * `attributed_declarator` puts its attributes *after* the declarator, so "last
+///     named child" fails where "first" works, and vice versa;
+///   * `parenthesized_declarator` can lead with an `ms_call_modifier` (`(__cdecl *Cb)`).
+///
+/// An unrecognised child therefore yields `None` — the behaviour before any of this
+/// existed — rather than a name read off the wrong node.
 fn inner_declarator(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     if let Some(declarator) = node.child_by_field_name("declarator") {
         return Some(declarator);
     }
     if !matches!(
         node.kind(),
-        "reference_declarator" | "parenthesized_declarator"
+        "reference_declarator" | "parenthesized_declarator" | "attributed_declarator"
     ) {
         return None;
     }
     let mut cursor = node.walk();
     // Bind rather than returning in tail position: `children` borrows `cursor`.
-    let found = node.children(&mut cursor).find(tree_sitter::Node::is_named);
+    let found = node
+        .children(&mut cursor)
+        .find(|c| is_declarator_link(c.kind()));
     found
+}
+
+/// True for kinds that can be the next link in a declarator chain — another
+/// declarator, or the name that ends one.
+fn is_declarator_link(kind: &str) -> bool {
+    C_DECLARATOR_KINDS.contains(&kind)
+        || matches!(
+            kind,
+            "identifier" | "field_identifier" | "type_identifier" | "destructor_name"
+        )
 }
 
 /// True when `node` is a class head that an unknown macro made tree-sitter misparse.
@@ -603,8 +631,13 @@ fn has_error_child(node: tree_sitter::Node) -> bool {
 /// True when `node`'s C/C++ declarator chain contains a node of `kind`.
 /// Walks the chain, so layers added by pointers, references and arrays are seen too.
 ///
-/// Bounded by `MAX_DECLARATOR_DEPTH` for the same reason `c_declarator_name` is: the
-/// nesting is input-controlled and `outline::generate` is a fuzz target.
+/// The bound is *not* here for safety — this walk is iterative and every step returns
+/// a strict child, so it can neither recurse nor cycle. It is here so this walk and
+/// `c_declarator_name` give up at the same place. Unbounded, this one reported a
+/// function one link deeper than the name walk could name it, so a declarator at
+/// exactly that depth resolved as an anonymous *function* rather than being skipped:
+/// a disagreement, not merely a difference in reach. `both_declarator_walks_reach_the_same_depth`
+/// pins the two together.
 fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
     let mut current = inner_declarator(node);
     for _ in 0..MAX_DECLARATOR_DEPTH {
@@ -1925,9 +1958,138 @@ mod tests {
         }
     }
 
+    /// A comment is a tree-sitter *extra*: it is a **named** child and can be the
+    /// first one. Taking the first named child therefore lands on the comment, the
+    /// walk dead-ends, and the symbol is not indexed — issue #54's exact symptom,
+    /// inside the fix for #54.
+    ///
+    /// `attributed_declarator` (`int f [[gnu::const]] ();`) hides its inner declarator
+    /// the same way `reference_declarator` does and was simply missing from the list.
+    /// Not reference-specific: a plain `[[nodiscard]]` function was anonymous too.
+    #[test]
+    fn declarator_walk_steps_over_comments_and_attributes() {
+        let cases: &[(&str, &str)] = &[
+            ("Holder& /* alias */ Commented() { return L; }", "Commented"),
+            (
+                "Holder& // trailing\nLineCommented() { return L; }",
+                "LineCommented",
+            ),
+            ("int AttrFree [[gnu::const]] () { return 0; }", "AttrFree"),
+            ("Holder& AttrRef [[nodiscard]] () { return L; }", "AttrRef"),
+            (
+                "Holder* /* c */ CommentedPtr() { return nullptr; }",
+                "CommentedPtr",
+            ),
+        ];
+        for (src, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = tree.root_node().named_child(0).expect("a top-level node");
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "wrong name for {src:?} (node kind {})",
+                node.kind()
+            );
+        }
+    }
+
+    /// `parenthesized_declarator` is the other kind routed through the fallback, and
+    /// nothing exercised it there — the name path shadows it with its own arm, so only
+    /// `declarator_chain_has_kind` reaches it. `ms_call_modifier` sorts before the
+    /// inner declarator, so "first named child" lands on the wrong node.
+    #[test]
+    fn declarator_walk_steps_over_calling_conventions() {
+        let cases = [
+            "struct S { void (__cdecl *Cb)(int); };",
+            "struct S { void (*Plain)(int); };",
+        ];
+        for src in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let spec = tree.root_node().named_child(0).expect("a top-level node");
+            let body = spec.child_by_field_name("body").expect("a body");
+            let member = body.named_child(0).expect("one member");
+            let lines: Vec<&str> = owned.lines().collect();
+            assert!(
+                declarator_chain_has_function(member),
+                "{src:?} must read as a function pointer"
+            );
+            assert!(
+                c_declarator_name(
+                    member
+                        .child_by_field_name("declarator")
+                        .expect("declarator"),
+                    &lines
+                )
+                .is_some(),
+                "{src:?} must resolve a name"
+            );
+        }
+    }
+
+    /// A side effect of reaching past the reference link, not claimed by the issue:
+    /// `is_definition_node` recognises an out-of-line *data* definition by finding a
+    /// `qualified_identifier` in the chain, which it could not do through a reference
+    /// either. Pinned so the change is deliberate rather than incidental.
+    #[test]
+    fn out_of_line_reference_data_is_a_definition() {
+        let cases: &[(&str, bool)] = &[
+            ("Holder& Cls::sRef = L;", true),
+            ("Holder* Cls::sPtr = &L;", true),
+            // A local of reference type is not a definition — no qualifier.
+            ("Holder& local = L;", false),
+        ];
+        for (src, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let node = tree.root_node().named_child(0).expect("a top-level node");
+            assert_eq!(
+                is_definition_node(node, Some(Lang::Cpp)),
+                *expected,
+                "{src:?} (node kind {})",
+                node.kind()
+            );
+        }
+    }
+
+    /// The two declarator walks must agree on how far they will follow a chain: a name
+    /// resolvable at depth N while the chain answers "no function" at the same N is a
+    /// disagreement no caller expects. Pins where the shared limit lands.
+    #[test]
+    fn both_declarator_walks_reach_the_same_depth() {
+        // `int` + N `*` + `g();` nests N `pointer_declarator`s above the
+        // `function_declarator`, so the function sits at link N + 1.
+        let probe = |stars: usize| {
+            let src = format!("int {}g();\n", "*".repeat(stars));
+            let tree = parse(&src, Lang::Cpp);
+            let lines: Vec<&str> = src.lines().collect();
+            let node = tree.root_node().named_child(0).expect("a top-level node");
+            let declarator = node.child_by_field_name("declarator").expect("declarator");
+            (
+                c_declarator_name(declarator, &lines).as_deref() == Some("g"),
+                declarator_chain_has_function(node),
+            )
+        };
+        for stars in [1, 32, MAX_DECLARATOR_DEPTH - 1, MAX_DECLARATOR_DEPTH] {
+            let (named, has_fn) = probe(stars);
+            assert_eq!(
+                named, has_fn,
+                "the two walks disagree at {stars} pointer levels: named={named}, has_fn={has_fn}"
+            );
+        }
+    }
+
     /// The same missing link broke the *other* chain walk: a reference-returning
-    /// prototype has a `function_declarator` in its chain, but the walk could not reach
-    /// it, so the member was classified as data rather than as a function.
+    /// prototype has a `function_declarator` in its chain, but the walk could not
+    /// reach it.
+    ///
+    /// This half was never independently observable. `node_to_entry`'s declaration
+    /// arms resolve the name *before* consulting this predicate and return early on
+    /// `None`, so the member was dropped from the outline entirely rather than
+    /// mislabelled — which is why fixing only the name walk would have produced
+    /// `prop Get` for a method, and why the two fixes have to land together.
     #[test]
     fn reference_returning_prototype_is_seen_as_a_function() {
         let cases = [
