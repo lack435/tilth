@@ -20,6 +20,23 @@ const VENDOR_DIRS: &[&str] = &[
 
 /// Sort matches by score (highest first). Deterministic: same inputs, same order.
 /// When `context` is provided, matches near the context file are boosted.
+///
+/// `score` is evaluated exactly **once per match**, not inside the comparator.
+///
+/// It used to be called twice per comparison, i.e. ~2·n·log n times, and it is not a
+/// cheap function — `incidental_text_penalty` lowercases the whole matched line, so each
+/// call allocates. That was free while an early-quit threshold held `n` to ~80 entries.
+/// Once the search walks were made to complete (so that results stop varying run to run)
+/// `n` became the true match count, and on a dense 400-file fixture with ~2.4M matches
+/// this function was **99% of a search's wall time**: 32.3s out of 32.6s total, measured
+/// by comparing against a build with the sort stubbed out (0.35s).
+///
+/// The ordering is unchanged — same key, same stability — so output is byte-identical.
+///
+/// Sorting an index permutation rather than using `sort_by_cached_key` is deliberate: a
+/// cached key would have to own its `PathBuf` to break ties on path, which is ~100 bytes
+/// per match on a path that is already resident. Indices cost 8. `scores`/`order`/`dest`
+/// together add ~20 bytes per match against the ~380 a `Match` already occupies.
 pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&Path>) {
     // Pre-compute context's package root once (same for entire batch)
     let ctx_parent = context.and_then(|c| c.parent());
@@ -29,32 +46,54 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
 
     // Cache package roots for match paths — avoids repeated stat walks
     let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-    // Capture now once so the sort comparator does not call SystemTime::now() O(n log n) times.
+    // Capture now once so scoring does not call SystemTime::now() per match.
     let now = SystemTime::now();
 
-    matches.sort_by(|a, b| {
-        let sa = score(
-            a,
-            query,
-            scope,
-            ctx_parent,
-            ctx_pkg_root.as_ref(),
-            &mut pkg_cache,
-            now,
-        );
-        let sb = score(
-            b,
-            query,
-            scope,
-            ctx_parent,
-            ctx_pkg_root.as_ref(),
-            &mut pkg_cache,
-            now,
-        );
-        sb.cmp(&sa)
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.line.cmp(&b.line))
+    let scores: Vec<i32> = matches
+        .iter()
+        .map(|m| {
+            score(
+                m,
+                query,
+                scope,
+                ctx_parent,
+                ctx_pkg_root.as_ref(),
+                &mut pkg_cache,
+                now,
+            )
+        })
+        .collect();
+
+    // Sort indices, so the comparator reads scores by index and paths by reference.
+    // Stable, and the tie-break chain is the same one the old comparator used — equal
+    // keys therefore keep their original relative order, which is what the "one
+    // contiguous block per file" invariant in `symbol.rs` relies on for determinism.
+    let mut order: Vec<usize> = (0..matches.len()).collect();
+    order.sort_by(|&i, &j| {
+        scores[j]
+            .cmp(&scores[i])
+            .then_with(|| matches[i].path.cmp(&matches[j].path))
+            .then_with(|| matches[i].line.cmp(&matches[j].line))
     });
+
+    // `order[k]` is the index of the element that belongs at position `k`. Invert that
+    // into "where does the element currently at p belong", then apply it with cycle
+    // swaps — in place, so no second buffer of `Match` is ever allocated.
+    let mut dest: Vec<usize> = vec![0; order.len()];
+    for (k, &from) in order.iter().enumerate() {
+        dest[from] = k;
+    }
+    drop(order);
+
+    for i in 0..matches.len() {
+        // Each swap puts one element at its final position, so this is O(n) overall.
+        // `dest` is swapped alongside so it keeps describing current positions.
+        while dest[i] != i {
+            let j = dest[i];
+            matches.swap(i, j);
+            dest.swap(i, j);
+        }
+    }
 }
 
 /// Ranking function. Each match gets a score — no floating point, no randomness.
@@ -489,6 +528,145 @@ mod tests {
             def_weight: if is_definition { 80 } else { 0 },
             impl_target: None,
         }
+    }
+
+    /// `sort` scores once per match and applies a hand-rolled index permutation, replacing
+    /// a `sort_by` that recomputed `score` inside the comparator. This pins the refactor
+    /// against a reference implementation of the *old* shape: same key, same stability,
+    /// so the two must agree element for element on any input.
+    ///
+    /// Worth having because the permutation is applied with cycle swaps rather than by
+    /// collecting into a new vector — a wrong inversion there would silently mis-order
+    /// results rather than fail loudly, and the ordering is what every caller reads.
+    #[test]
+    fn score_once_permutation_matches_a_reference_comparator_sort() {
+        use super::score;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        let scope = PathBuf::from("/repo/src");
+        let query = "handleAuth";
+
+        // Deliberately includes exact score ties (same score, differing path/line) and
+        // repeated paths, so the tie-break chain and the stability both get exercised.
+        let build = || {
+            let mut v = Vec::new();
+            for (i, dir) in ["a", "b", "c", "zz"].iter().enumerate() {
+                for f in 0..7 {
+                    let mut m = make_match(
+                        &format!("/repo/src/{dir}/f{f}.rs"),
+                        "handleAuth(user)",
+                        f % 3 == 0,
+                        if f % 3 == 0 { Some("handleAuth") } else { None },
+                    );
+                    m.line = u32::try_from((i * 7 + f) % 5).unwrap() + 1;
+                    v.push(m);
+                }
+            }
+            // Same path, identical text (hence identical score), differing lines, pushed
+            // out of order — the only case where the *line* tie-break decides anything.
+            // Without it the path comparison always resolves first and a flipped line
+            // ordering goes undetected. Verified: it did.
+            for line in [9u32, 3, 7] {
+                let mut m = make_match("/repo/src/tie.rs", "handleAuth(same)", false, None);
+                m.line = line;
+                v.push(m);
+            }
+            // Two matches sharing a path *and* line — the case where the key genuinely
+            // compares Equal, so only stability decides.
+            v.push(make_match(
+                "/repo/src/a/f0.rs",
+                "handleAuth(x)",
+                true,
+                Some("handleAuth"),
+            ));
+            v.push(make_match(
+                "/repo/src/a/f0.rs",
+                "handleAuth(y)",
+                true,
+                Some("handleAuth"),
+            ));
+            v
+        };
+
+        let mut actual = build();
+        sort(&mut actual, query, &scope, None);
+
+        // Reference: the pre-refactor shape, scoring inside the comparator.
+        let mut expected = build();
+        let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+        let now = SystemTime::now();
+        let ctx_parent: Option<&Path> = None;
+        expected.sort_by(|a, b| {
+            let sa = score(a, query, &scope, ctx_parent, None, &mut pkg_cache, now);
+            let sb = score(b, query, &scope, ctx_parent, None, &mut pkg_cache, now);
+            sb.cmp(&sa)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+
+        let key = |v: &[Match]| {
+            v.iter()
+                .map(|m| format!("{}:{}:{}", m.path.display(), m.line, m.text))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            key(&actual),
+            key(&expected),
+            "score-once permutation disagreed with the reference comparator sort"
+        );
+        assert_eq!(
+            actual.len(),
+            33,
+            "fixture size changed — retune the assertion"
+        );
+    }
+
+    /// The permutation must be a permutation: every input element present exactly once.
+    /// A cycle-swap bug can duplicate or drop elements as easily as it can misorder them.
+    #[test]
+    fn sort_preserves_the_multiset_of_matches() {
+        let scope = PathBuf::from("/repo/src");
+        let mut matches: Vec<Match> = (0..64)
+            .map(|i| {
+                let mut m = make_match(
+                    &format!("/repo/src/d{}/f{i}.rs", i % 5),
+                    "handleAuth(user)",
+                    i % 4 == 0,
+                    if i % 4 == 0 { Some("handleAuth") } else { None },
+                );
+                m.line = i % 9 + 1;
+                m
+            })
+            .collect();
+
+        let mut before: Vec<String> = matches
+            .iter()
+            .map(|m| format!("{}:{}", m.path.display(), m.line))
+            .collect();
+        sort(&mut matches, "handleAuth", &scope, None);
+        let mut after: Vec<String> = matches
+            .iter()
+            .map(|m| format!("{}:{}", m.path.display(), m.line))
+            .collect();
+
+        assert_eq!(after.len(), 64, "sort changed the element count");
+        before.sort();
+        after.sort();
+        assert_eq!(before, after, "sort lost or duplicated elements");
+    }
+
+    /// Degenerate lengths must not panic — the cycle-swap loop indexes `dest` directly.
+    #[test]
+    fn sort_handles_empty_and_single_element_slices() {
+        let scope = PathBuf::from("/repo/src");
+        let mut empty: Vec<Match> = Vec::new();
+        sort(&mut empty, "q", &scope, None);
+        assert!(empty.is_empty());
+
+        let mut one = vec![make_match("/repo/src/a.rs", "q()", false, None)];
+        sort(&mut one, "q", &scope, None);
+        assert_eq!(one.len(), 1);
     }
 
     #[test]
