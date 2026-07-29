@@ -151,6 +151,21 @@ pub fn read_file(
     }
 
     // Canonical full-content view — shared by the small-file gate and OGATE below.
+    //
+    // A leading BOM is deliberately NOT stripped here, unlike in the outline funnel (#42).
+    // Two reasons, and the second is the load-bearing one:
+    //
+    //   * A full view is supposed to be the file's actual bytes. A stray glyph at the top of
+    //     one is arguably the honest rendering of a file that really does start with one.
+    //   * In edit mode this emits `hashlines(&content, 1)`, and `edit::apply_batch` verifies
+    //     an anchor by hashing the line as `fs::read_to_string` yields it — BOM included.
+    //     Stripping here would hand the caller a hash for `name,age` while verification
+    //     computes one for `\u{feff}name,age`, so every hash-mode edit touching line 1 of a
+    //     BOM'd file would be rejected with a stale-anchor error. That trades a cosmetic
+    //     defect for a correctness one.
+    //
+    // Pinned by `hash_mode_edits_line_one_of_a_bom_file`, so a future strip here fails a
+    // test rather than silently breaking editing.
     let full_view = || {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {

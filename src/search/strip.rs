@@ -63,7 +63,13 @@ pub(crate) fn strip_noise(
             None => break,
         };
 
-        let trimmed = line.trim();
+        // BOM-aware, because `str::trim` is not: U+FEFF was removed from Unicode
+        // `White_Space` years ago, so on a BOM'd file every `starts_with` test below fails
+        // for line 1 and a shebang or opening comment survives stripping (#42). Only line 1
+        // can be affected — a BOM occurs once, at file start — but this is the single funnel
+        // all three rules read from, so one call covers them. Same helper as
+        // `read::imports::is_import_line`, which is the other line-prefix judgement.
+        let trimmed = crate::lang::outline::trim_start_bom_aware(line).trim_end();
 
         // --- Rule (a): Consecutive blank line collapse ---
         if trimmed.is_empty() {
@@ -225,6 +231,32 @@ mod tests {
 
     fn path(ext: &str) -> PathBuf {
         PathBuf::from(format!("test.{ext}"))
+    }
+
+    /// `str::trim` does not remove U+FEFF — it was dropped from Unicode `White_Space` years
+    /// ago — so on a BOM'd file every `starts_with` test here failed for line 1 and the
+    /// opening comment or debug call survived stripping (#42).
+    ///
+    /// Only line 1 can be affected, since a BOM occurs once at file start, which is exactly
+    /// why it was easy to miss: the identical line anywhere else in the file strips fine.
+    /// Both spellings are asserted for that reason.
+    #[test]
+    fn a_bom_does_not_defeat_stripping_on_line_one() {
+        let body = "// leading comment\nfn foo() {\n    debug!(\"hi\");\n}\n";
+        let bommed = format!("\u{feff}{body}");
+
+        let plain = strip_noise(body, &path("rs"), Some((1, 4)));
+        let with_bom = strip_noise(&bommed, &path("rs"), Some((1, 4)));
+
+        assert!(
+            plain.contains(&1),
+            "fixture is broken: an unmarked leading comment must strip"
+        );
+        assert!(
+            with_bom.contains(&1),
+            "a BOM'd line 1 must strip like any other line, got {with_bom:?}"
+        );
+        assert_eq!(with_bom, plain, "a BOM changed which lines were stripped");
     }
 
     #[test]

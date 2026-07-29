@@ -546,6 +546,97 @@ mod tests {
         format::line_hash(lines[line - 1].as_bytes())
     }
 
+    /// The anchor an edit-mode read hands out for line 1 must be the anchor verification
+    /// expects, on a file that starts with a UTF-8 BOM.
+    ///
+    /// #42 removes a BOM from the *outline* funnel, and the obvious next step is to remove it
+    /// from the full-content view too — it is the same stray glyph. That would be a
+    /// correctness bug rather than a cosmetic fix: `read_file` in edit mode emits
+    /// `hashlines(&content, 1)`, while `apply_edits` hashes the line as `read_to_string`
+    /// yields it. Strip one side and the caller is handed a hash for `name,age` while
+    /// verification computes one for `\u{feff}name,age`, so every hash-mode edit touching
+    /// line 1 of a BOM'd file is rejected as a stale anchor.
+    ///
+    /// The anchor is parsed out of the real read output rather than recomputed with
+    /// `hash_at`, because recomputing it would agree with `apply_edits` by construction and
+    /// prove nothing about what an agent was actually told.
+    ///
+    /// Note what is deliberately *not* asserted: that replacing line 1 preserves the BOM. It
+    /// does not, and should not — the BOM is part of line 1's text, so an agent that replaces
+    /// that line has replaced the BOM along with it. The encoding marker only has to survive
+    /// edits that do not target the line it lives on, which is the second phase below.
+    #[test]
+    fn hash_mode_edits_line_one_of_a_bom_file() {
+        const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+        // The hash an edit-mode read hands the agent for `line`.
+        let anchor_from_read = |path: &std::path::Path, line: usize| -> u16 {
+            let cache = crate::cache::OutlineCache::new();
+            let view = crate::read::read_file(path, None, false, &cache, true).unwrap();
+            let prefix = format!("{line}:");
+            let hashline = view
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("edit-mode read must emit a hashline for line {line}"));
+            let hash_str = hashline
+                .split_once(':')
+                .and_then(|(_, rest)| rest.split_once('|'))
+                .map(|(h, _)| h)
+                .expect("hashline must be `{line}:{hash}|{text}`");
+            u16::from_str_radix(hash_str.trim(), 16).expect("hash must be hex")
+        };
+
+        let write_bom_csv = |dir: &std::path::Path| {
+            let path = dir.join("data.csv");
+            let mut bytes = BOM.to_vec();
+            bytes.extend_from_slice(b"name,age\nalice,30\n");
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        };
+
+        // Phase 1 — the hazard: line 1 is where the BOM lives, so it is the line whose
+        // read-side and verify-side hashes can disagree.
+        let d1 = tempfile::tempdir().unwrap();
+        let p1 = write_bom_csv(d1.path());
+        let h1 = anchor_from_read(&p1, 1);
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: h1,
+            end_line: 1,
+            end_hash: h1,
+            content: "name,years".into(),
+        }];
+        match apply_edits(&p1, &edits).unwrap() {
+            EditResult::Applied { .. } => {}
+            EditResult::HashMismatch(msg) => {
+                panic!("the anchor the read handed out was rejected by verification: {msg}")
+            }
+        }
+
+        // Phase 2 — an edit that does not touch line 1 must leave the file's encoding marker
+        // alone. `tilth_write` must never silently re-encode a file it was asked to edit.
+        let d2 = tempfile::tempdir().unwrap();
+        let p2 = write_bom_csv(d2.path());
+        let h2 = anchor_from_read(&p2, 2);
+        let edits = vec![Edit {
+            start_line: 2,
+            start_hash: h2,
+            end_line: 2,
+            end_hash: h2,
+            content: "alice,31".into(),
+        }];
+        match apply_edits(&p2, &edits).unwrap() {
+            EditResult::Applied { .. } => {}
+            EditResult::HashMismatch(msg) => panic!("line 2 anchor rejected: {msg}"),
+        }
+        let after = std::fs::read(&p2).unwrap();
+        assert!(
+            after.starts_with(BOM),
+            "an edit below line 1 must leave the BOM in place, got {:?}",
+            &after[..after.len().min(8)]
+        );
+    }
+
     #[test]
     fn single_line_replacement() {
         let content = "aaa\nbbb\nccc\n";
