@@ -45,7 +45,11 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 /// nor the external list and vanish from the report.
 ///
 /// `boundary` is the caller's declared search scope, used to confine C/C++ include-root
-/// resolution. Pass `None` when there is no scope — see `resolve_c_include`.
+/// resolution. It must already be canonical — build it with `canonical_boundary` — because
+/// a caller that also classifies non-resolving imports has to ask the *same* question here
+/// and there. `search::deps` does exactly that, and an include that resolves under one
+/// boundary but not the other lands in both of its buckets or in neither. Pass `None` when
+/// there is no scope; see `resolve_c_include`.
 pub(crate) fn resolve_local_imports(
     file_path: &Path,
     content: &str,
@@ -59,8 +63,6 @@ pub(crate) fn resolve_local_imports(
         return Vec::new();
     };
 
-    let boundary = canonical_boundary(boundary);
-
     let mut results = Vec::new();
     for line in content.lines() {
         if !is_import_line(line, lang) {
@@ -70,7 +72,7 @@ pub(crate) fn resolve_local_imports(
         if source.is_empty() || is_external(&source, lang) {
             continue;
         }
-        if let Some(path) = resolve_import_to_file(dir, &source, lang, boundary.as_deref()) {
+        if let Some(path) = resolve_import_to_file(dir, &source, lang, boundary) {
             if !results.contains(&path) {
                 results.push(path);
             }
@@ -324,12 +326,22 @@ const CONVENTIONAL_INCLUDE_ROOTS: &[&str] = &["include", "inc"];
 /// path inside it. Without that, a `..` in the include could let resolution reach files
 /// outside the project entirely.
 ///
-/// `boundary` — the caller's declared search scope — is that root when supplied, falling
-/// back to the enclosing `.git` repository. It has to come first. Requiring `.git` was the
-/// only rule at one point, and it meant include-root resolution did nothing whatsoever in
-/// a tree that is not a git checkout: every project-relative include silently bucketed as
-/// external. A caller that passed an explicit scope had already stated the boundary, and
-/// ignoring it in favour of looking for `.git` answered a question nobody asked.
+/// Two things can supply that root, and it matters that they *compose* rather than one
+/// replacing the other:
+///
+///   * `boundary` — the caller's declared search scope. Requiring `.git` was once the only
+///     rule, and it meant include-root resolution did nothing whatsoever in a tree that is
+///     not a git checkout: every project-relative include silently bucketed as external.
+///     A caller that named a scope has already stated the boundary.
+///   * the enclosing `.git` repository, derived from the *including file*.
+///
+/// The scope wins only when it actually contains the file. A declared scope is not
+/// guaranteed to be related to the file being analysed — `tilth_deps` with an absolute
+/// `path` and no `scope` resolves the scope to the server's process cwd, which may be a
+/// different checkout entirely — and letting an unrelated root win rejected every
+/// candidate and silently reclassified real local includes as external. That was a
+/// regression against the `.git`-only rule, which at least always derived its root from
+/// the file. So: the scope when it contains the file, the repository otherwise.
 fn resolve_c_include(dir: &Path, source: &str, boundary: Option<&Path>) -> Option<PathBuf> {
     let clean = source.trim_matches('"');
 
@@ -345,7 +357,7 @@ fn resolve_c_include(dir: &Path, source: &str, boundary: Option<&Path>) -> Optio
         return None;
     }
 
-    let root = match boundary {
+    let root = match boundary.filter(|b| is_within(dir, b)) {
         Some(b) => b.to_path_buf(),
         None => enclosing_repo_root(dir)?,
     };
@@ -680,18 +692,61 @@ mod tests {
     }
 
     /// The declared scope bounds the walk as strictly as `.git` did.
+    ///
+    /// The positive control is not optional. Without it this test passes for the wrong
+    /// reason: reintroduce the `.git`-only rule and, since the fixture has no `.git`,
+    /// resolution is disabled outright — so "nothing resolved" is satisfied by nothing
+    /// being *attempted*. The in-scope header proves the walk was live and still refused
+    /// the out-of-scope one.
     #[test]
     fn c_include_walk_stops_at_the_declared_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("proj/src")).unwrap();
+        fs::create_dir_all(root.join("proj/inside")).unwrap();
         fs::create_dir_all(root.join("outside")).unwrap();
+        fs::write(root.join("proj/inside/ok.h"), "// in scope\n").unwrap();
         fs::write(root.join("outside/leak.h"), "// outside\n").unwrap();
 
+        let from = root.join("proj/src");
         let scope = root.join("proj").canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_c_include(&from, "\"inside/ok.h\"", Some(&scope)),
+            Some(root.join("proj/inside/ok.h")),
+            "positive control: the walk must be live inside the scope"
+        );
         assert!(
-            resolve_c_include(&root.join("proj/src"), "\"outside/leak.h\"", Some(&scope)).is_none(),
+            resolve_c_include(&from, "\"outside/leak.h\"", Some(&scope)).is_none(),
             "the walk must not resolve outside the declared scope"
+        );
+    }
+
+    /// A declared scope that has nothing to do with the file must not disable resolution.
+    ///
+    /// `tilth_deps` given an absolute `path` and no `scope` resolves the scope to the
+    /// server's process cwd, which can be an unrelated checkout. Letting that win as the
+    /// containment root rejected every candidate and silently reclassified real local
+    /// includes as external — a regression against the `.git`-only rule it replaced, which
+    /// at least always derived its root from the file. The scope wins only when it contains
+    /// the file; otherwise the enclosing repository does.
+    #[test]
+    fn c_include_falls_back_to_the_repo_when_the_scope_excludes_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("proj/.git")).unwrap();
+        fs::create_dir_all(root.join("proj/Alpha")).unwrap();
+        fs::create_dir_all(root.join("proj/Gamma")).unwrap();
+        fs::create_dir_all(root.join("elsewhere")).unwrap();
+        fs::write(root.join("proj/Alpha/Beta.h"), "// target\n").unwrap();
+
+        let from = root.join("proj/Gamma");
+        let unrelated = root.join("elsewhere").canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_c_include(&from, "\"Alpha/Beta.h\"", Some(&unrelated)),
+            Some(root.join("proj/Alpha/Beta.h")),
+            "an unrelated scope must fall back to the file's repository, not veto resolution"
         );
     }
 
