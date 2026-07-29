@@ -1,6 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -15,24 +15,61 @@ use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
-use crate::types::{FacetTotals, FileType, Match, SearchResult};
+use crate::types::{FileType, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw definition matches.
-const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
-/// Stop walking once we have this many raw usage matches.
-const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Match-count cap when `--full` is set. Generous but bounded so a `tilth
 /// foo --full` on a huge repo can't blow up output.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set. Proportional to
-/// `FULL_MAX_MATCHES` the same way the default thresholds are.
-const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
-const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
+
+// Both walks below used to stop once a shared `AtomicUsize` crossed a raw-match
+// threshold (`EARLY_QUIT_THRESHOLD_DEFINITIONS = 50`, `EARLY_QUIT_THRESHOLD_USAGES =
+// 30`, and `--full` variants). That made `tilth_search` **non-deterministic**, for
+// exactly the reason spelled out above `find_callers_batch` in `callers.rs`: the walk
+// is parallel, the counter is read once per file callback, and a single in-flight file
+// can add many matches, so how far the walk got depended on thread scheduling.
+//
+// Six identical consecutive runs, one symbol, 176k-file C++ tree, nothing changed
+// between runs: **six distinct renderings**, with the reported usage count moving over
+// 30, 30, 30, 39, 28, 30. The definition count sat at exactly 50 every time, which is
+// the tell — that was the threshold clamping, reported as if it were a total.
+//
+// Removing the bound was measured rather than assumed, because unlike `callers` this is
+// the most-used path. Measured over MCP `tilth_search` with `expand: 0` — the path an
+// agent actually takes, and the only one that exercises these default thresholds; the
+// CLI promotes `--full` whenever stdout is not a TTY (`main.rs`), which silently
+// substitutes the 300-match `--full` variants and makes piped `tilth` a poor benchmark
+// for them. Three reps each, same tree, nothing changed between reps:
+//
+//   query               bounded                        walk completes
+//   moderate symbol     5.31-5.68s / 48 MB, 3 of 3     3.55-4.06s / 56 MB, identical
+//   hot symbol          8.39-9.04s / 41 MB, 3 of 3     13.4-13.7s / 89 MB, identical
+//
+// "3 of 3" is distinct renderings in three runs. The bound was not even buying time in
+// the moderate case — it cost ~1.7s there. The reason is that `find_definitions` reads
+// every file it visits before the `memmem` needle check, so 50 definitions on a large
+// tree is not reached until most of the tree has been read anyway; quitting then saves
+// only the tail, and pays for the two walks contending as they wind down. Only a
+// genuinely hot symbol pays, at ~5s and ~48 MB.
+//
+// Both are far inside the 90s request timeout, and both are cheaper than the ~9.5s
+// `callers` walk whose bound was removed in the same spirit. So the walks complete and
+// the `MAX_MATCHES` / `FULL_MAX_MATCHES` caps below apply afterwards, to a fully
+// collected and ranked set — the caps now truncate a stable ranking rather than
+// deciding which matches ever got seen.
+//
+// Two costs this shifts onto neighbouring code, both measured:
+//
+//  * Multi-symbol (comma) queries run one `search` per target, so they multiply the
+//    above. A 5-target query on that tree went 22.1s -> 38.2s. It fits in the timeout,
+//    but it is the symbol-path twin of the 1+N second-hop walks in `callers.rs` and
+//    wants the same fix — one walk over the union of targets, partitioned afterwards.
+//  * Peak RSS at this scale is dominated by `BloomFilterCache`, which holds one filter
+//    per code file walked and is unbounded. Tracked separately.
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -48,10 +85,11 @@ fn stratum_for_display(m: &Match) -> u8 {
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
 ///
-/// `full` controls the truncation cap and walker early-quit thresholds:
-/// `false` (default) uses the tight defaults that keep agent token budgets
-/// in check; `true` raises both caps so interactive `--full` callers see
-/// every match instead of "... and N more matches."
+/// `full` controls the truncation cap: `false` (default) uses the tight
+/// default that keeps agent token budgets in check; `true` raises it so
+/// interactive `--full` callers see every match instead of "... and N more
+/// matches." It does not affect how much of the tree is walked — both walks
+/// always complete, so the same query returns the same answer either way.
 pub fn search(
     query: &str,
     scope: &Path,
@@ -59,19 +97,7 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
-        (
-            FULL_MAX_MATCHES,
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
-        )
-    } else {
-        (
-            MAX_MATCHES,
-            EARLY_QUIT_THRESHOLD_DEFINITIONS,
-            EARLY_QUIT_THRESHOLD_USAGES,
-        )
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -81,26 +107,28 @@ pub fn search(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob, def_threshold),
-        || find_usages(query, &matcher, scope, glob, usage_threshold),
+        || find_definitions(query, scope, glob),
+        || find_usages(query, &matcher, scope, glob),
     );
 
     let defs = defs?;
-    let usages = usages?;
+    let mut usages = usages?;
 
     // Deduplicate: remove usage matches that overlap with definition matches.
-    // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
+    //
+    // This was a nested scan, quadratic in (definitions × usages). That was free while
+    // an early-quit threshold held definitions to ~50; now that both walks complete, a
+    // symbol defined in many files across a large tree makes it the dominant cost. A
+    // `HashSet` of the definition sites keeps it linear, and `retain` filters in place
+    // so the usage set is never held twice.
     let mut merged: Vec<Match> = defs;
     let def_count = merged.len();
 
-    for m in usages {
-        let dominated = merged[..def_count]
-            .iter()
-            .any(|d| d.path == m.path && d.line == m.line);
-        if !dominated {
-            merged.push(m);
-        }
-    }
+    let def_sites: HashSet<(&Path, u32)> =
+        merged.iter().map(|d| (d.path.as_path(), d.line)).collect();
+    usages.retain(|m| !def_sites.contains(&(m.path.as_path(), m.line)));
+    // `def_sites` borrows `merged`; NLL ends that borrow here, before the extend.
+    merged.extend(usages);
 
     let total = merged.len();
     let usage_count = total - def_count;
@@ -118,20 +146,10 @@ pub fn search(
     merged.sort_by_key(stratum_for_display);
 
     // Compute per-subfacet totals on the *pre-cap* set so the renderer can
-    // print `displayed/total` headings + per-facet hidden-count lines.
-    // `merged` is bounded by the early-quit thresholds (~80 entries), so the
-    // clone is cheap. Faceting is pure / side-effect-free.
-    let totals = {
-        let snapshot = merged.clone();
-        let f = super::facets::facet_matches(snapshot, scope);
-        FacetTotals {
-            definitions: f.definitions.len(),
-            implementations: f.implementations.len(),
-            tests: f.tests.len(),
-            usages_local: f.usages_local.len(),
-            usages_cross: f.usages_cross.len(),
-        }
-    };
+    // print `displayed/total` headings + per-facet hidden-count lines. Counted
+    // by borrow — this used to clone the whole set, which was justified by the
+    // early-quit bound holding it to ~80 entries. See `facets::facet_totals`.
+    let totals = super::facets::facet_totals(&merged, scope);
 
     merged.truncate(max_matches);
 
@@ -153,31 +171,24 @@ pub fn search(
 ///
 /// Single-read design: reads each file once, checks for symbol via
 /// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
-/// Early termination: quits the parallel walker once enough defs are found.
+///
+/// The walk completes. It is not cut short on a match count — see the note on
+/// determinism at the top of this file. Per-file work is still bounded by the
+/// size gate and the `memmem` needle check below.
 fn find_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
-    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let found_count = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
-        let found_count = &found_count;
 
         Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -275,7 +286,6 @@ fn find_definitions(
             }
 
             if !file_defs.is_empty() {
-                found_count.fetch_add(file_defs.len(), Ordering::Relaxed);
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -577,30 +587,22 @@ fn find_defs_heuristic_buf(
 
 /// Find all usages via ripgrep (word-boundary matching).
 /// Collects per-file, locks once per file (not per line).
-/// Early termination once enough usages found.
+///
+/// The walk completes — see the determinism note at the top of this file.
 fn find_usages(
     query: &str,
     matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
-    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
-    let found_count = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
-        let found_count = &found_count;
 
         Box::new(move |entry| {
-            // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -672,7 +674,6 @@ fn find_usages(
             );
 
             if !file_matches.is_empty() {
-                found_count.fetch_add(file_matches.len(), Ordering::Relaxed);
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);

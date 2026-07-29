@@ -1,21 +1,45 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::file_metadata;
 
 use crate::error::TilthError;
 use crate::search::rank;
-use crate::types::{FacetTotals, Match, SearchResult};
+use crate::types::{Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
-const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+
+// This walk used to stop once a shared `AtomicUsize` crossed `EARLY_QUIT_THRESHOLD`
+// (30, or 300 under `--full`), which made content search **non-deterministic** for the
+// same reason as the symbol and caller walks: parallel walk, counter read once per file
+// callback, many matches addable per file. Measured on a 176k-file C++ tree: three
+// distinct renderings in six identical runs.
+//
+// It hid better here than on the symbol path, because the header reported the display
+// cap rather than a total, so the instability was only visible by diffing full output.
+// Both halves of that are fixed: the walk completes, and `facet_totals` below is
+// computed on the pre-cap set so the rendered `shown/total` labels are true totals.
+//
+// Cost of completing the walk, measured over MCP `tilth_search` with `kind: "content"`
+// and `expand: 0` on that tree — see the note in `symbol.rs` on why the CLI is not the
+// right harness for these defaults. Three reps each:
+//
+//   query                            bounded                       walk completes
+//   literal, 137 matches             0.59-0.79s, 3 of 3 distinct   2.23-2.41s / 27 MB
+//   literal in nearly every file     0.043s,     3 of 3 distinct   4.56-4.74s / 34 MB
+//
+// The second row is the worst case and the honest cost of this fix: a search for
+// something ubiquitous goes from instant to ~4.6s, because "how many are there" cannot
+// be answered without looking. It is well inside the 90s request timeout and cheaper
+// than the symbol path's hot case, and note what the bounded column actually bought —
+// 43ms for an answer that was different every single time it was asked. An agent that
+// asks the same question twice and gets two different answers cannot reason about
+// either. Per-file work is still bounded by the size gate and minified checks below.
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -26,11 +50,7 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, early_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
-    } else {
-        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
     } else {
@@ -42,22 +62,14 @@ pub fn search(
     })?;
 
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let total_found = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matcher = &matcher;
         let matches = &matches;
-        let total_found = &total_found;
 
         Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -130,27 +142,29 @@ pub fn search(
             );
 
             if !file_matches.is_empty() {
-                total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 all.extend(file_matches);
             }
 
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                ignore::WalkState::Quit
-            } else {
-                ignore::WalkState::Continue
-            }
+            ignore::WalkState::Continue
         })
     });
 
-    let total = total_found.load(Ordering::Relaxed);
     let mut all_matches = matches
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total = all_matches.len();
 
     rank::sort(&mut all_matches, pattern, scope, context);
+
+    // Per-facet totals on the *pre-cap* set. Content search used to return
+    // `FacetTotals::default()`, i.e. all zeros, which made `count_label` print a bare
+    // `10` and suppressed every hidden-count tail — so a query with 34290 matches
+    // rendered exactly like one with 10. The counts are now true totals.
+    let facet_totals = super::facets::facet_totals(&all_matches, scope);
+
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {
@@ -160,6 +174,6 @@ pub fn search(
         total_found: total,
         definitions: 0,
         usages: total,
-        facet_totals: FacetTotals::default(),
+        facet_totals,
     })
 }

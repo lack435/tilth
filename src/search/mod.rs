@@ -214,7 +214,7 @@ pub fn search_multi_symbol_expanded(
         let mut out = format::search_header(
             &result.query,
             &result.scope,
-            result.matches.len(),
+            result.total_found,
             result.definitions,
             result.usages,
         );
@@ -1027,7 +1027,7 @@ fn format_search_result(
     let header = format::search_header(
         &result.query,
         &result.scope,
-        result.matches.len(),
+        result.total_found,
         result.definitions,
         result.usages,
     );
@@ -1536,6 +1536,156 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    /// Files in the search-determinism fixture below.
+    ///
+    /// A count-based cutoff quits a parallel walk *between* files, so what defeats it is
+    /// a fixture with far more files than the cutoff admits — not merely more matches.
+    /// `callers.rs` records the trap that cost a round of review there: a 12-file
+    /// fixture holding 60 matches was past the threshold on matches, but the walker's
+    /// threads consumed all 12 files before the shared counter was ever read, so the
+    /// exact-total assertion stayed green with the bug reintroduced, 12/12 runs.
+    ///
+    /// 400 files is comfortably past the point where that can happen for the highest
+    /// threshold these paths ever used (`FULL_EARLY_QUIT_* = 300`), and still writes in
+    /// well under a second.
+    const DETERMINISM_FIXTURE_FILES: usize = 400;
+    const DETERMINISM_FIXTURE_USES_PER_FILE: usize = 2;
+
+    /// Write `DETERMINISM_FIXTURE_FILES` Rust files, each defining `target_sym` once and
+    /// calling it `DETERMINISM_FIXTURE_USES_PER_FILE` times.
+    ///
+    /// Returns `(definitions, usages)`: one definition per file, and one usage per call
+    /// site. The definition's own line also matches the usage regex, but `symbol::search`
+    /// dedups a usage that sits on a definition's exact (path, line), so it does not count.
+    fn write_search_determinism_fixture(dir: &Path) -> (usize, usize) {
+        for f in 0..DETERMINISM_FIXTURE_FILES {
+            let mut src = String::from("fn target_sym() {}\n");
+            for i in 0..DETERMINISM_FIXTURE_USES_PER_FILE {
+                src.push_str(&format!("fn caller_{f}_{i}() {{ target_sym(); }}\n"));
+            }
+            std::fs::write(dir.join(format!("m{f}.rs")), src).unwrap();
+        }
+        (
+            DETERMINISM_FIXTURE_FILES,
+            DETERMINISM_FIXTURE_FILES * DETERMINISM_FIXTURE_USES_PER_FILE,
+        )
+    }
+
+    /// Symbol search must report *every* definition and usage, not however many a shared
+    /// counter happened to admit before a parallel walk noticed it had crossed a threshold.
+    ///
+    /// `EARLY_QUIT_THRESHOLD_DEFINITIONS = 50` and `EARLY_QUIT_THRESHOLD_USAGES = 30` made
+    /// this non-deterministic. Six identical runs against a 176k-file C++ tree produced six
+    /// distinct renderings, with the usage count moving over 30, 30, 30, 39, 28 and 30 while
+    /// the definition count sat at exactly 50 — the threshold, reported as a total.
+    ///
+    /// The assertions are on exact totals, so a reintroduced cutoff fails outright rather
+    /// than merely varying.
+    #[test]
+    fn symbol_search_reports_every_match_past_the_old_early_quit_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (expected_defs, expected_usages) = write_search_determinism_fixture(dir.path());
+
+        let result = search_symbol_raw("target_sym", dir.path(), None).unwrap();
+
+        assert_eq!(
+            result.definitions, expected_defs,
+            "expected every definition, got {}",
+            result.definitions
+        );
+        assert_eq!(
+            result.usages, expected_usages,
+            "expected every usage, got {}",
+            result.usages
+        );
+        assert_eq!(
+            result.total_found,
+            expected_defs + expected_usages,
+            "total_found must be the true pre-cap total"
+        );
+    }
+
+    /// Content search had the same cutoff (`EARLY_QUIT_THRESHOLD = 30`), and hid it better:
+    /// the header reported the display cap rather than a total, so the instability was only
+    /// visible by diffing full output — three distinct renderings in six identical runs.
+    #[test]
+    fn content_search_reports_every_match_past_the_old_early_quit_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (defs, usages) = write_search_determinism_fixture(dir.path());
+        // Every line mentioning `target_sym`: the definition line plus each call site.
+        let expected = defs + usages;
+
+        let result = search_content_raw("target_sym", dir.path(), None).unwrap();
+
+        assert_eq!(
+            result.total_found, expected,
+            "expected every matching line, got {}",
+            result.total_found
+        );
+    }
+
+    /// Repeated identical runs must agree byte for byte. Weaker than the exact-total
+    /// assertions above, but it fails for *any* source of instability, not just a count
+    /// cutoff — including an unranked truncation of an unordered vector, which is how the
+    /// second-hop block in `callers.rs` stayed unstable after its walk was fixed.
+    #[test]
+    fn symbol_and_content_output_is_byte_identical_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_search_determinism_fixture(dir.path());
+        let cache = OutlineCache::new();
+
+        let symbol_runs: Vec<String> = (0..6)
+            .map(|_| search_symbol("target_sym", dir.path(), &cache, None).unwrap())
+            .collect();
+        assert!(
+            symbol_runs.windows(2).all(|w| w[0] == w[1]),
+            "symbol search rendered {} distinct outputs in 6 identical runs",
+            symbol_runs.iter().collect::<HashSet<_>>().len()
+        );
+
+        let content_runs: Vec<String> = (0..6)
+            .map(|_| search_content("target_sym", dir.path(), &cache, None).unwrap())
+            .collect();
+        assert!(
+            content_runs.windows(2).all(|w| w[0] == w[1]),
+            "content search rendered {} distinct outputs in 6 identical runs",
+            content_runs.iter().collect::<HashSet<_>>().len()
+        );
+    }
+
+    /// The header must state the true total, not the number of matches it went on to
+    /// render. It used to be passed `result.matches.len()`, so every capped result headed
+    /// "10 matches" regardless of whether 10 or 34290 existed — a clamped number presented
+    /// as a total, which is the half of this bug an agent reads first.
+    #[test]
+    fn search_header_reports_the_true_total_not_the_display_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (defs, usages) = write_search_determinism_fixture(dir.path());
+        let total = defs + usages;
+        let cache = OutlineCache::new();
+
+        for (label, out) in [
+            (
+                "symbol",
+                search_symbol("target_sym", dir.path(), &cache, None).unwrap(),
+            ),
+            (
+                "content",
+                search_content("target_sym", dir.path(), &cache, None).unwrap(),
+            ),
+        ] {
+            let header = out.lines().next().unwrap_or_default();
+            assert!(
+                header.contains(&format!("{total} matches")),
+                "{label} header must report the true total {total}, got: {header}"
+            );
+            assert!(
+                !header.contains("10 matches"),
+                "{label} header must not report the display cap as a total, got: {header}"
+            );
+        }
+    }
 
     /// Collect all file paths from a walker into a sorted Vec.
     fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {
