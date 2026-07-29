@@ -317,9 +317,16 @@ pub fn search(
 ///
 /// That inversion is what lets a `BinaryHeap` — a max-heap — hold the *best* `MAX_RETAINED`
 /// candidates: its top is the worst kept, so it is the one to evict. The key is
-/// `(score desc, path asc, line asc)`, the same chain `rank::sort` uses, which makes it a
-/// total order over distinct matches: a truncation can therefore never be resolved by the
-/// order the walk's threads happened to arrive in.
+/// `(score desc, path asc, line asc)` — the first three levels of `rank::sort`'s key, which has
+/// since grown two more (`def_range`, `text`) for the symbol path. Three is enough *here*, and only
+/// here: every content match has `is_definition: false` and a unique `(path, line)`, so those three
+/// are already a total order on this input and a truncation can never be resolved by the order the
+/// walk's threads happened to arrive in.
+///
+/// This duplicates `search::retain`, which exists so that logic lives in one place. It was not
+/// migrated with the symbol path because this version is measured and reviewed as it stands and the
+/// migration is not free — `retain`'s sink also tallies facets this path counts its own way. Worth
+/// doing, but as its own change; until then, a fix to either one has to be applied to both.
 struct Candidate {
     score: i32,
     m: Match,

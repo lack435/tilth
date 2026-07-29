@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::file_metadata;
@@ -60,26 +59,34 @@ const FULL_MAX_MATCHES: usize = 100;
 // deciding which matches ever got seen.
 //
 // Completing the walk is necessary but not by itself sufficient, and the rest of the
-// argument is load-bearing enough to write down. `rank::sort` is stable but its key
-// (`score`, then `path`, then `line`) is *not* a total order — two matches sharing a
-// path and line compare equal, which happens for real (two overload declarations on one
-// line whose `def_range`s differ, so `dedupe_same_span_definitions` keeps both). A
-// stable sort leaves equal elements in input order, and input order here is the order
-// the parallel walk appended them. So determinism additionally requires:
+// argument is load-bearing enough to write down. `rank::sort` is stable, and its key used
+// to be (`score`, then `path`, then `line`) — which is *not* a total order, because two
+// matches sharing a path and line compare equal. That happens for real: two overload
+// declarations on one line whose `def_range`s differ, which
+// `dedupe_same_span_definitions` deliberately keeps both of. A stable sort leaves equal
+// elements in input order, and input order here was the order the parallel walk appended
+// them, so determinism additionally required:
 //
 //   **each file's matches are appended as one contiguous block, in a deterministic
 //   within-file order, under a single lock acquisition.**
 //
-// That holds at every `all.extend(...)` below, so threads can only
-// interleave whole files, and ties can only ever be between matches from the same file —
-// whose relative order is fixed. `merged.sort_by_key(stratum_for_display)` inherits it.
-// Locking per match, or parallelising within a file, would reintroduce the bug without
-// touching a line of the walk logic.
+// **That requirement is gone, and with it the `all.extend(...)` calls it described.**
+// Arrival order was a ceiling on this file: a bounded retention sink has to be able to
+// drop a match from the middle, which destroys contiguity, so retention could not be
+// bounded while determinism rested on arrival. `rank::sort`'s key is now a genuine total
+// order — extended with `def_range` then `text`, both data the match carries — so ties are
+// resolved by content instead of by scheduling, and the four walks below feed
+// `retain::BoundedRetain` in any order they like. See `search::retain`.
 //
-// `content.rs` no longer appends contiguous per-file blocks — it feeds a bounded heap —
-// and does not need to. Every content match has `is_definition: false` and a unique
-// `(path, line)`, so `rank::sort`'s key is already a total order on that input and there
-// are no ties for arrival order to resolve.
+// What replaced the invariant is a test rather than a convention:
+// `rank`'s `sort_is_order_independent_for_matches_tied_on_path_and_line` fails if any
+// tie-break level is dropped, and `retain`'s
+// `among_equal_scores_every_tie_break_level_agrees_with_the_ranker` fails if the sink's
+// eviction order disagrees with the ranker at any level.
+//
+// `content.rs` never needed the invariant either, for a narrower reason: every content
+// match has `is_definition: false` and a unique `(path, line)`, so the old three-part key
+// was already total on that input.
 //
 // Two costs this shifts onto neighbouring code, both measured:
 //
@@ -90,8 +97,9 @@ const FULL_MAX_MATCHES: usize = 100;
 //  * Peak RSS grew with the retained match set. Note this path does *not* populate
 //    `BloomFilterCache` — that is the `callers`/`deps` cost, and an earlier version of this
 //    bullet named it here by mistake. What costs on the symbol path is the matches
-//    themselves; `search_multi` now holds every target's at once, measured in its own note.
-//    Tracked with the rest of the memory work in #13.
+//    themselves. Bounded since, in `search::retain`: 1147 MB -> 60 MB on a 2.4M-match
+//    fixture. `search_multi` still holds every target's retained set at once, so its peak is
+//    the sum across targets — now bounded per target rather than unbounded.
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -173,11 +181,22 @@ pub fn search(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob),
-        || find_usages(query, &matcher, scope, glob),
+        || find_definitions(query, scope, context, glob),
+        || find_usages(query, &matcher, scope, context, glob),
     );
 
-    Ok(assemble(query, scope, context, defs?, usages?, max_matches))
+    let (defs, def_tally) = defs?;
+    let (usages, usage_tally) = usages?;
+    Ok(assemble(
+        query,
+        scope,
+        context,
+        defs,
+        def_tally,
+        usages,
+        usage_tally,
+        max_matches,
+    ))
 }
 
 /// Turn one query's raw definition and usage matches into its `SearchResult`.
@@ -186,14 +205,22 @@ pub fn search(
 /// `search_multi` runs one pair of walks for several queries and then calls this per
 /// query, so a batched query's result is identical to a lone `search`'s by construction
 /// rather than by two implementations agreeing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "exact facet tallies travel with their match sets; a struct would move the same values"
+)]
 fn assemble(
     query: &str,
     scope: &Path,
     context: Option<&Path>,
     defs: Vec<Match>,
+    def_tally: super::retain::ExactTallies,
     mut usages: Vec<Match>,
+    usage_tally: super::retain::ExactTallies,
     max_matches: usize,
 ) -> SearchResult {
+    let def_offered = def_tally.total();
+    let usage_offered = usage_tally.total();
     // Deduplicate: remove usage matches that overlap with definition matches.
     //
     // This was a nested scan, quadratic in (definitions × usages). That was free while
@@ -202,16 +229,37 @@ fn assemble(
     // `HashSet` of the definition sites keeps it linear, and `retain` filters in place
     // so the usage set is never held twice.
     let mut merged: Vec<Match> = defs;
-    let def_count = merged.len();
 
     let def_sites: HashSet<(&Path, u32)> =
         merged.iter().map(|d| (d.path.as_path(), d.line)).collect();
+    let usages_before_dedup = usages.len();
     usages.retain(|m| !def_sites.contains(&(m.path.as_path(), m.line)));
+    let usages_after_dedup = usages.len();
+    debug_assert!(usages_after_dedup <= usages_before_dedup);
     // `def_sites` borrows `merged`; NLL ends that borrow here, before the extend.
     merged.extend(usages);
 
-    let total = merged.len();
-    let usage_count = total - def_count;
+    // Totals come from what the walks *offered*, not from what retention kept. Deriving them from
+    // `merged.len()` is what made a bounded search announce 2.4M matches as 20k.
+    //
+    // The dedup above is why this is not simply the sum: a usage on a definition's line is removed,
+    // and a usage that retention clipped may have been one of those. #19 named this and asked for
+    // either a per-file dedup before capping or a documented approximation; this is the latter.
+    // Two consequences of `def_sites` covering only *retained* definitions, both under clipping
+    // only. First, the overlap below is counted over the retained sets, which is all that is
+    // observable. Second — cosmetic but worth naming — a usage sitting on a line whose definition
+    // was clipped away survives the dedup and is displayed as a usage, on a line that is really a
+    // definition. Neither is reachable unless a walk hit its cap.
+    //
+    // When neither walk hit its cap, `usages_before_dedup == usage_offered` and these reduce to
+    // exactly the pre-bound values: `total == merged.len()`, `usage_count` unchanged. When a cap did
+    // bite,
+    // `total_found` can exceed the true post-dedup count by at most the number of clipped
+    // def/usage collisions — it over-reports rather than hiding matches, which is the safer
+    // direction for a header whose only job is to tell the reader more exists.
+    let overlap_in_retained = usages_before_dedup - usages_after_dedup;
+    let usage_count = usage_offered.saturating_sub(overlap_in_retained);
+    let total = def_offered + usage_count;
 
     rank::sort(&mut merged, query, scope, context);
 
@@ -229,7 +277,18 @@ fn assemble(
     // print `displayed/total` headings + per-facet hidden-count lines. Counted
     // by borrow — this used to clone the whole set, which was justified by the
     // early-quit bound holding it to ~80 entries. See `facets::facet_totals`.
-    let totals = super::facets::facet_totals(&merged, scope);
+    let mut totals = super::facets::facet_totals(&merged, scope);
+
+    // Three of the five facets are decided by the match alone, so the walk counted them exactly;
+    // take those from the tallies rather than from the retained set. Only the local/cross split of
+    // non-test usages needs a primary package derived from the whole match set, so only that split
+    // degrades under clipping — and `facets::unattributed_remainder` names what it could not place.
+    //
+    // Deriving all five from `merged` reported "2 tests" on a query that found 25. Every number
+    // here is now either exact or explicitly unplaced.
+    totals.definitions = def_tally.definitions;
+    totals.implementations = def_tally.implementations;
+    totals.tests = usage_tally.tests + def_tally.tests;
 
     merged.truncate(max_matches);
 
@@ -238,7 +297,7 @@ fn assemble(
         scope: scope.to_path_buf(),
         matches: merged,
         total_found: total,
-        definitions: def_count,
+        definitions: def_offered,
         usages: usage_count,
         facet_totals: totals,
     }
@@ -273,10 +332,11 @@ fn assemble(
 /// of five symbols matches 240k times, the same measurement is 126 MB -> 427 MB.
 ///
 /// Real code sits nearer the first number, and both are inside what `callers` already costs
-/// on the same tree. Bounding it properly means retaining less than everything during the
-/// walk — `rank::selection_score` exists for exactly that — but a *count*-based bound is the
-/// non-determinism #18 removed, so it needs to be a value-based one and that is its own
-/// change. Tracked with the rest of the memory work in #13.
+/// on the same tree. **Done since:** the walks retain less than everything, via a value-based
+/// bound (`search::retain`) rather than the count-based one that would have reintroduced the
+/// non-determinism #18 removed. `rank::selection_score` is what makes the choice value-based.
+/// The numbers above are the pre-bound behaviour and are kept because they are what sized the
+/// bound.
 ///
 /// Both walks are keyed on a single needle in the single-query path — `memmem` on the
 /// query, and a compiled `\bquery\b`. Batching means a multi-needle prefilter and
@@ -325,9 +385,11 @@ pub fn search_multi(
         })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions_multi(&unique, scope, glob),
-        || find_usages_multi(&unique, &matchers, scope, glob),
+        || find_definitions_multi(&unique, scope, context, glob),
+        || find_usages_multi(&unique, &matchers, scope, context, glob),
     );
+    // `finish` pairs each target's retained matches with its exact offered count, so the batched
+    // path reports the same totals a lone `search` would.
     let mut defs = defs?;
     let mut usages = usages?;
 
@@ -336,12 +398,16 @@ pub fn search_multi(
         .iter()
         .enumerate()
         .map(|(i, q)| {
+            let (d, d_offered) = std::mem::take(&mut defs[i]);
+            let (u, u_offered) = std::mem::take(&mut usages[i]);
             Some(assemble(
                 q,
                 scope,
                 context,
-                std::mem::take(&mut defs[i]),
-                std::mem::take(&mut usages[i]),
+                d,
+                d_offered,
+                u,
+                u_offered,
                 max_matches,
             ))
         })
@@ -393,15 +459,26 @@ fn clone_result(r: &SearchResult) -> SearchResult {
 fn find_definitions(
     query: &str,
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+) -> Result<(Vec<Match>, super::retain::ExactTallies), TilthError> {
+    // Bounded like the usage path. Definitions are rarely dense enough to reach the cap, but a
+    // query matching a common token in generated code can, and an unbounded sink here is the same
+    // defect however unlikely the input.
+    let matches = super::retain::BoundedRetain::new(super::retain::MAX_RETAINED);
     let needle = query.as_bytes();
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
+        // `context` is passed, not `None`. Retention decides what `assemble` will later rank *with*
+        // the context boost, so a scorer blind to context drops the very matches the boost exists to
+        // promote — `context_proximity` is worth up to 175 points, and a first version of this
+        // omitted it and kept none of the ranker's top ten context-directory matches. Recency stays
+        // omitted, because that one would make survival depend on when the search ran; `context` is
+        // a query input, so including it costs no determinism.
+        let mut scorer = super::rank::Scorer::new(query, scope, context);
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -500,22 +577,13 @@ fn find_definitions(
                 };
             }
 
-            if !file_defs.is_empty() {
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // One lock, one contiguous block per file — see the determinism note at the
-                // top of this file. Extending per match would break tie-ordering.
-                all.extend(file_defs);
-            }
+            matches.offer_file(file_defs, &mut scorer);
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    Ok(matches.finish())
 }
 
 /// `find_definitions` for several queries in one walk.
@@ -532,9 +600,10 @@ fn find_definitions(
 fn find_definitions_multi(
     queries: &[&str],
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-) -> Result<Vec<Vec<Match>>, TilthError> {
-    let matches: Mutex<Vec<Vec<Match>>> = Mutex::new(vec![Vec::new(); queries.len()]);
+) -> Result<Vec<(Vec<Match>, super::retain::ExactTallies)>, TilthError> {
+    let matches = super::retain::BoundedRetainSet::new(queries.len(), super::retain::MAX_RETAINED);
     let needles: Vec<&[u8]> = queries.iter().map(|q| q.as_bytes()).collect();
 
     let walker = super::walker(scope, glob)?;
@@ -542,6 +611,12 @@ fn find_definitions_multi(
     walker.run(|| {
         let matches = &matches;
         let needles = &needles;
+        // One `Scorer` per query per thread: score depends on the query, and `Scorer` is `&mut`
+        // and caches package roots, so this keeps scoring off every bucket's lock.
+        let mut scorers: Vec<super::rank::Scorer<'_>> = queries
+            .iter()
+            .map(|q| super::rank::Scorer::new(q, scope, context))
+            .collect();
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -647,14 +722,10 @@ fn find_definitions_multi(
             }
 
             if !per_query.is_empty() {
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // One lock for the whole file across every query — see the determinism
-                // note at the top of this file. Each bucket still receives this file's
-                // matches as one contiguous block.
+                // Per-bucket bound. Contiguity is no longer load-bearing — `rank::sort`'s key
+                // is a total order — so each target's sink can decide independently.
                 for (i, file_defs) in per_query {
-                    all[i].extend(file_defs);
+                    matches.offer_file(i, file_defs, &mut scorers[i]);
                 }
             }
 
@@ -662,9 +733,7 @@ fn find_definitions_multi(
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    Ok(matches.finish())
 }
 
 /// `find_usages` for several queries in one walk.
@@ -676,14 +745,20 @@ fn find_usages_multi(
     queries: &[&str],
     matchers: &[RegexMatcher],
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-) -> Result<Vec<Vec<Match>>, TilthError> {
-    let matches: Mutex<Vec<Vec<Match>>> = Mutex::new(vec![Vec::new(); queries.len()]);
+) -> Result<Vec<(Vec<Match>, super::retain::ExactTallies)>, TilthError> {
+    let matches = super::retain::BoundedRetainSet::new(queries.len(), super::retain::MAX_RETAINED);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
+        // One `Scorer` per query per thread — see `find_definitions_multi`.
+        let mut scorers: Vec<super::rank::Scorer<'_>> = queries
+            .iter()
+            .map(|q| super::rank::Scorer::new(q, scope, context))
+            .collect();
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -782,24 +857,18 @@ fn find_usages_multi(
                 );
             }
 
-            if file_matches.iter().any(|v| !v.is_empty()) {
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // One lock, one contiguous block per file per bucket — see the determinism
-                // note at the top of this file.
-                for (i, v) in file_matches.into_iter().enumerate() {
-                    all[i].extend(v);
-                }
+            // Per-bucket bound, each with its own lock. Contiguity is no longer load-bearing —
+            // `rank::sort`'s key is a total order — so a dense file no longer holds every target's
+            // lock while it merges.
+            for (i, v) in file_matches.into_iter().enumerate() {
+                matches.offer_file(i, v, &mut scorers[i]);
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    Ok(matches.finish())
 }
 
 /// Tree-sitter structural definition detection.
@@ -1121,14 +1190,27 @@ fn find_usages(
     query: &str,
     matcher: &RegexMatcher,
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+) -> Result<(Vec<Match>, super::retain::ExactTallies), TilthError> {
+    // Bounded, not a `Vec`: usages are the unbounded path. See `retain` for the measurement —
+    // 1154 MB against content's 92 MB on identical input, because content was bounded in #30 and
+    // this was not.
+    let matches = super::retain::BoundedRetain::new(super::retain::MAX_RETAINED);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
+        // One `Scorer` per walk thread. It is `&mut` and caches package roots, so this both keeps
+        // scoring off the shared lock and stops every thread re-walking the same ancestors.
+        // `context` is passed, not `None`. Retention decides what `assemble` will later rank *with*
+        // the context boost, so a scorer blind to context drops the very matches the boost exists to
+        // promote — `context_proximity` is worth up to 175 points, and a first version of this
+        // omitted it and kept none of the ranker's top ten context-directory matches. Recency stays
+        // omitted, because that one would make survival depend on when the search ran; `context` is
+        // a query input, so including it costs no determinism.
+        let mut scorer = super::rank::Scorer::new(query, scope, context);
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -1201,22 +1283,17 @@ fn find_usages(
                 }),
             );
 
-            if !file_matches.is_empty() {
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // One lock, one contiguous block per file — see the determinism note at the
-                // top of this file. Extending per match would break tie-ordering.
-                all.extend(file_matches);
-            }
+            // Bounded per file, then merged under one acquisition. Contiguity is no longer
+            // load-bearing here — `rank::sort`'s key is a total order, so the retained set and its
+            // final order are both independent of arrival. See the determinism note at the top of
+            // this file.
+            matches.offer_file(file_matches, &mut scorer);
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    Ok(matches.finish())
 }
 
 /// Markdown heading definition detector.
@@ -2468,11 +2545,12 @@ using MyAlias = float;
 
     /// Batching must not reintroduce the run-to-run variation #18 removed.
     ///
-    /// Each bucket now receives its per-file blocks from a walk that is doing more work per
-    /// file, so the *interleaving* of files differs from the single-query walk. That is
-    /// harmless only because ties in `rank::sort`'s key can occur solely between matches
-    /// from the same file, whose relative order is fixed — the invariant recorded at the top
-    /// of this file. If a future change appended per match rather than per file, this fails.
+    /// Each bucket receives matches from a walk doing more work per file, so the *interleaving*
+    /// differs from the single-query walk — and each bucket is now a bounded retention sink, which
+    /// can drop a match from the middle. Both are harmless because `rank::sort`'s key is a total
+    /// order, so no tie is left for arrival order to resolve. This used to depend on the
+    /// contiguous-per-file-block invariant at the top of the file; that requirement is gone, and
+    /// what guards it now is `rank`'s order-independence test plus `retain`'s per-level test.
     #[test]
     fn batched_multi_symbol_results_are_stable_across_repeated_runs() {
         let dir = tempfile::tempdir().unwrap();
