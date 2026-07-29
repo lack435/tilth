@@ -237,59 +237,65 @@ fn fingerprint_inner(root: &Path) -> String {
     }
 
     // Manifest — name, version, deps
-    if let Some(manifest) = find_manifest(root) {
-        if let Some(info) = parse_manifest(root, &manifest) {
-            // Deps line. Same disclosure as `dirs:` above — this line drops more than it
-            // shows on a real manifest (tilth: 10 of 40, alphabetical, so every
-            // `tree-sitter-*` grammar falls off the end), and saying nothing about that in
-            // an orientation payload is the defect this change exists to fix.
-            if !info.deps.is_empty() {
-                let dep_str = info.deps.join(", ");
-                let mut deps_line = format!("  deps: {dep_str}");
-                let hidden = info.dep_total.saturating_sub(info.deps.len());
-                if hidden > 0 {
-                    write!(deps_line, " +{hidden} more").unwrap();
+    //
+    // `hot`, `git` and `tests` used to be emitted twice: once inside the parse-success arm
+    // and again in the no-manifest arm, with nothing in between. So a manifest that was
+    // found but could not be parsed took all three down with it and left a one-line
+    // fingerprint — strictly worse than having no manifest at all, and the actual shape of
+    // the #43 report. None of the three depends on the manifest, so they are emitted once,
+    // unconditionally. Line order is unchanged for both cases that already worked.
+    let parsed = find_manifest(root).map(|manifest| (parse_manifest(root, &manifest), manifest));
+
+    // Deps line. Same disclosure as `dirs:` above — this line drops more than it shows on a
+    // real manifest (tilth: 10 of 40, alphabetical, so every `tree-sitter-*` grammar falls
+    // off the end), and saying nothing about that in an orientation payload is a defect.
+    if let Some((Ok(info), _)) = &parsed {
+        if !info.deps.is_empty() {
+            let dep_str = info.deps.join(", ");
+            let mut deps_line = format!("  deps: {dep_str}");
+            let hidden = info.dep_total.saturating_sub(info.deps.len());
+            if hidden > 0 {
+                write!(deps_line, " +{hidden} more").unwrap();
+            }
+            lines.push(deps_line);
+        }
+    }
+
+    // Hot files (only for projects with local imports)
+    if let Some(hot) = hot_files(root, &walk, primary_lang) {
+        lines.push(format!("  hot (× = importers): {hot}"));
+    }
+
+    // Git context
+    if let Some(git) = git_context(root) {
+        lines.push(format!("  git: {git}"));
+    }
+
+    // Test style
+    if let Some(tests) = test_style(root, &walk, primary_lang) {
+        lines.push(format!("  tests: {tests}"));
+    }
+
+    // Manifest line
+    if let Some((info, manifest)) = &parsed {
+        let mut manifest_line = format!("  manifest: {manifest}");
+        match info {
+            Ok(info) => {
+                if let Some(name) = &info.name {
+                    write!(manifest_line, " ({name}").unwrap();
+                    if let Some(version) = &info.version {
+                        write!(manifest_line, " v{version}").unwrap();
+                    }
+                    manifest_line.push(')');
                 }
-                lines.push(deps_line);
             }
-
-            // Hot files (only for projects with local imports)
-            if let Some(hot) = hot_files(root, &walk, primary_lang) {
-                lines.push(format!("  hot (× = importers): {hot}"));
-            }
-
-            // Git context
-            if let Some(git) = git_context(root) {
-                lines.push(format!("  git: {git}"));
-            }
-
-            // Test style
-            if let Some(tests) = test_style(root, &walk, primary_lang) {
-                lines.push(format!("  tests: {tests}"));
-            }
-
-            // Manifest line
-            let mut manifest_line = format!("  manifest: {manifest}");
-            if let Some(name) = &info.name {
-                write!(manifest_line, " ({name}").unwrap();
-                if let Some(version) = &info.version {
-                    write!(manifest_line, " v{version}").unwrap();
-                }
-                manifest_line.push(')');
-            }
-            lines.push(manifest_line);
+            // Say why, rather than dropping the line. The damage in #35, #39, #41 and #43
+            // was in every case the silence, not the parse failure — an agent that can see
+            // "not UTF-8" can fix its manifest or stop trusting the block, whereas an absent
+            // block reads as "this project has no name", which is a claim tilth cannot make.
+            Err(reason) => write!(manifest_line, " — unreadable: {reason}").unwrap(),
         }
-    } else {
-        // No manifest — still show hot, git, tests
-        if let Some(hot) = hot_files(root, &walk, primary_lang) {
-            lines.push(format!("  hot (× = importers): {hot}"));
-        }
-        if let Some(git) = git_context(root) {
-            lines.push(format!("  git: {git}"));
-        }
-        if let Some(tests) = test_style(root, &walk, primary_lang) {
-            lines.push(format!("  tests: {tests}"));
-        }
+        lines.push(manifest_line);
     }
 
     lines.join("\n")
@@ -581,17 +587,46 @@ fn cap_deps(mut deps: Vec<String>) -> (Vec<String>, usize) {
     (deps, total)
 }
 
-fn parse_manifest(root: &Path, manifest: &str) -> Option<ManifestInfo> {
+fn parse_manifest(root: &Path, manifest: &str) -> Result<ManifestInfo, String> {
     match manifest {
         "Cargo.toml" => parse_cargo_toml(root),
         "package.json" => parse_package_json(root),
         "go.mod" => parse_go_mod(root),
         "pyproject.toml" => parse_pyproject_toml(root),
-        _ => None,
+        // Unreachable: `find_manifest` only ever returns one of the four above. Stated as a
+        // reason rather than a silent `None` so that adding a name there and forgetting to
+        // add it here shows up in the output instead of deleting the manifest block.
+        other => Err(format!("no parser for {other}")),
     }
 }
 
-fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
+/// Read a manifest, or say why not.
+///
+/// `fs::read_to_string(..).ok()?` was the shape in all four parsers, and it turned every
+/// read failure into an absent manifest block — no error, no warning, no partial result
+/// (#43). A UTF-16 manifest is the case that motivated this: `read_to_string` requires
+/// valid UTF-8 and PowerShell 5.1 writes UTF-16 LE by default on several paths, so it is
+/// unusual but not exotic. `overview` exists to orient an agent *without* a tool call, so
+/// this is the one place a silent failure is both invisible and load-bearing.
+///
+/// The reasons are fixed strings rather than the OS error text on purpose. They land in the
+/// fingerprint, which #28 made deterministic and which the byte-lock tests compare
+/// literally, and `io::Error`'s `Display` is free to differ between platforms and locales.
+fn read_manifest(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| {
+        match e.kind() {
+            // What a UTF-16 (or otherwise non-UTF-8) file produces.
+            std::io::ErrorKind::InvalidData => "not UTF-8",
+            std::io::ErrorKind::PermissionDenied => "permission denied",
+            // `find_manifest` stat'd the file moments ago, so this is a genuine race.
+            std::io::ErrorKind::NotFound => "disappeared during the scan",
+            _ => "unreadable",
+        }
+        .to_string()
+    })
+}
+
+fn parse_cargo_toml(root: &Path) -> Result<ManifestInfo, String> {
     #[derive(Deserialize)]
     struct CargoToml {
         package: Option<Package>,
@@ -603,12 +638,13 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
         version: Option<String>,
     }
 
-    let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let content = read_manifest(&root.join("Cargo.toml"))?;
     // The `toml` crate strips exactly *one* BOM, so a doubled one still fails — and
-    // `.ok()?` turns that into the same silent loss of the whole manifest block as the
+    // `.ok()?` turned that into the same silent loss of the whole manifest block as the
     // `package.json` bug. Cheap to close, and leaving it would make the repeat-stripping
     // both BOM helpers already do inconsistent with the two parsers that skip them.
-    let parsed: CargoToml = toml::from_str(crate::lang::outline::strip_bom(&content)).ok()?;
+    let parsed: CargoToml = toml::from_str(crate::lang::outline::strip_bom(&content))
+        .map_err(|_| "malformed TOML".to_string())?;
     let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
     let (deps, dep_total) = cap_deps(
         parsed
@@ -616,7 +652,7 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
             .map(|d| d.into_iter().map(|(k, _)| k).collect())
             .unwrap_or_default(),
     );
-    Some(ManifestInfo {
+    Ok(ManifestInfo {
         name,
         version,
         deps,
@@ -624,7 +660,7 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
+fn parse_package_json(root: &Path) -> Result<ManifestInfo, String> {
     #[derive(Deserialize)]
     struct PackageJson {
         name: Option<String>,
@@ -632,20 +668,20 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<serde_json::Map<String, serde_json::Value>>,
     }
 
-    let content = fs::read_to_string(root.join("package.json")).ok()?;
+    let content = read_manifest(&root.join("package.json"))?;
     // `.ok()?` on a BOM'd file discarded the whole manifest block — name, version and the
     // dependency list — from the fingerprint injected at MCP initialize, with no error
     // anywhere. `overview` exists to orient an agent without a tool call, so failing this
     // way is failing silently at exactly the wrong moment.
-    let parsed: PackageJson =
-        serde_json::from_str(crate::lang::outline::strip_bom(&content)).ok()?;
+    let parsed: PackageJson = serde_json::from_str(crate::lang::outline::strip_bom(&content))
+        .map_err(|_| "malformed JSON".to_string())?;
     let (deps, dep_total) = cap_deps(
         parsed
             .dependencies
             .map(|d| d.into_iter().map(|(k, _)| k).collect())
             .unwrap_or_default(),
     );
-    Some(ManifestInfo {
+    Ok(ManifestInfo {
         name: parsed.name,
         version: parsed.version,
         deps,
@@ -653,8 +689,8 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
-    let content = fs::read_to_string(root.join("go.mod")).ok()?;
+fn parse_go_mod(root: &Path) -> Result<ManifestInfo, String> {
+    let content = read_manifest(&root.join("go.mod"))?;
     let mut name = None;
     let mut deps: Vec<String> = Vec::new();
     let mut in_require = false;
@@ -689,7 +725,7 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
 
     let (deps, dep_total) = cap_deps(deps);
 
-    Some(ManifestInfo {
+    Ok(ManifestInfo {
         name,
         version: None,
         deps,
@@ -697,7 +733,7 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
     })
 }
 
-fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
+fn parse_pyproject_toml(root: &Path) -> Result<ManifestInfo, String> {
     #[derive(Default, Deserialize)]
     struct PyProject {
         project: Option<Project>,
@@ -709,9 +745,10 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<Vec<String>>,
     }
 
-    let content = fs::read_to_string(root.join("pyproject.toml")).ok()?;
+    let content = read_manifest(&root.join("pyproject.toml"))?;
     // Doubled BOM — see `parse_cargo_toml`.
-    let parsed: PyProject = toml::from_str(crate::lang::outline::strip_bom(&content)).ok()?;
+    let parsed: PyProject = toml::from_str(crate::lang::outline::strip_bom(&content))
+        .map_err(|_| "malformed TOML".to_string())?;
     let project = parsed.project.unwrap_or_default();
     let (deps, dep_total) = cap_deps(
         project
@@ -727,7 +764,7 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
             })
             .collect(),
     );
-    Some(ManifestInfo {
+    Ok(ManifestInfo {
         name: project.name,
         version: project.version,
         deps,
@@ -1161,6 +1198,85 @@ mod tests {
             );
         }
         assert_eq!(outs[1], outs[0], "a BOM changed the fingerprint");
+    }
+
+    /// UTF-16 LE with BOM, written as bytes. Like `UTF8_BOM`, a `&str` literal cannot
+    /// express this — and it is the encoding PowerShell 5.1 produces by default on several
+    /// paths, which is where the reports come from.
+    fn utf16le_with_bom(body: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in body.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// A manifest that cannot be read must say so, not vanish.
+    ///
+    /// `fs::read_to_string` requires valid UTF-8, so a UTF-16 manifest returned
+    /// `Err(InvalidData)` and `.ok()?` discarded it — taking the entire manifest block out
+    /// of the fingerprint injected at MCP initialize with no error anywhere (#43). Worse
+    /// than the report captured: `hot`, `git` and `tests` were nested inside the
+    /// parse-success arm, so they went too and the whole fingerprint collapsed to its
+    /// header line.
+    ///
+    /// Both halves are asserted. That the reason is visible is the fix; that the unrelated
+    /// lines survive is what makes it better than "no manifest" rather than merely
+    /// different from it.
+    #[test]
+    fn an_unreadable_manifest_says_why_and_keeps_the_rest_of_the_block() {
+        let body = "{\"name\":\"utf16-app\",\"version\":\"9.9.9\"}";
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), utf16le_with_bom(body)).unwrap();
+        std::fs::write(dir.path().join("index.js"), "export const x = 1;\n").unwrap();
+        // A second file so `tests:` has something to find, proving the non-manifest lines
+        // are reached rather than merely absent for their own reasons.
+        std::fs::write(dir.path().join("index.test.js"), "test('x', () => {});\n").unwrap();
+
+        let out = fingerprint(dir.path());
+
+        assert!(
+            out.contains("manifest: package.json — unreadable: not UTF-8"),
+            "an unreadable manifest must name itself and say why:\n{out}"
+        );
+        assert!(
+            out.contains("tests:"),
+            "lines that do not depend on the manifest must survive it:\n{out}"
+        );
+
+        // The control: the identical content as UTF-8 reports name and version, so the
+        // assertions above are about the encoding and not about a broken fixture.
+        let ok_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ok_dir.path().join("package.json"), body).unwrap();
+        std::fs::write(ok_dir.path().join("index.js"), "export const x = 1;\n").unwrap();
+        let ok_out = fingerprint(ok_dir.path());
+        assert!(
+            ok_out.contains("utf16-app") && ok_out.contains("9.9.9"),
+            "fixture is broken: the UTF-8 spelling must parse:\n{ok_out}"
+        );
+        assert!(
+            !ok_out.contains("unreadable"),
+            "a readable manifest must not carry the note:\n{ok_out}"
+        );
+    }
+
+    /// The same visibility rule for a manifest that reads fine but does not parse.
+    ///
+    /// This shared the `.ok()?` shape and so shared the silence. Kept distinct from the
+    /// encoding case because the reasons differ and an agent acts on them differently —
+    /// "not UTF-8" is a re-save, "malformed JSON" is a syntax error to go and find.
+    #[test]
+    fn a_malformed_manifest_says_so_rather_than_vanishing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{\"name\": oops,,,}").unwrap();
+        std::fs::write(dir.path().join("index.js"), "export const x = 1;\n").unwrap();
+
+        let out = fingerprint(dir.path());
+        assert!(
+            out.contains("manifest: package.json — unreadable: malformed JSON"),
+            "a malformed manifest must say so:\n{out}"
+        );
     }
 
     /// The `toml` crate strips exactly *one* BOM, so a doubled one still fails to parse and
