@@ -289,7 +289,7 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+    let mut content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: None,
@@ -306,6 +306,18 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
         path: path.to_path_buf(),
         source: e,
     })?;
+    // `mode=stripped` is a *derived* view — it removes comments, debug logs and extra blanks
+    // — so it takes the same side of #42's rule as the outline funnel rather than the full
+    // view's: strip the BOM. It emits no hashline anchors (the numbered gutter below is
+    // `{line_num}  {line}`, not `{line}:{hash}|`), so there is no verification contract to
+    // desynchronise, which is the only thing that forced the full view to keep its BOM.
+    //
+    // Drained in place so a large file is not copied. A BOM carries no newline, so
+    // `total_lines` and every gutter number are unaffected.
+    let bom_len = content.len() - crate::lang::outline::strip_bom(&content).len();
+    if bom_len > 0 {
+        content.drain(..bom_len);
+    }
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     if !matches!(detect_file_type(path), FileType::Code(_)) {

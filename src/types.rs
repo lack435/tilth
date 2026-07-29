@@ -132,6 +132,9 @@ impl std::fmt::Display for ViewMode {
 pub struct Match {
     pub path: PathBuf,
     pub line: u32,
+    /// The matched line, as displayed *and* as ranked. Build it with [`match_text`] — never
+    /// from a raw line — so that a leading UTF-8 BOM cannot reach either use. See that
+    /// function for why the two cannot be separated.
     pub text: String,
     pub is_definition: bool,
     pub exact: bool,
@@ -147,6 +150,36 @@ pub struct Match {
     /// For impl/implements matches: the trait or interface being implemented.
     /// None for primary definitions and plain usages.
     pub impl_target: Option<String>,
+}
+
+/// Build a [`Match::text`] from a raw file line: BOM removed, trailing whitespace removed.
+///
+/// One helper for every search backend, because `Match.text` is read by two kinds of
+/// consumer and a BOM breaks both — which is what made #51 more than the cosmetic issue it
+/// was filed as:
+///
+///   * **Display.** The `-> [1]` preview and the fenced expanded block print it verbatim, so
+///     a BOM'd line 1 rendered a stray glyph and read as a defect in the file rather than in
+///     tilth.
+///   * **Ranking.** Four terms in `search::rank` test the start of this string —
+///     `definition_kind_boost` (`starts_with("pub fn ")` and friends), `exported_api_boost`
+///     (`"pub "` / `"export "`), `incidental_text_penalty` (`starts_with("//")`) and
+///     `multi_word_boost` (first whole word) — and each reaches it through `str::trim_start`
+///     or `str::trim`, neither of which removes U+FEFF. Measured: a line-1 `pub fn`
+///     definition scored 1630 against 1760 for the identical BOM-free line, losing the kind
+///     boost and the exported-API boost, so it sorted *below* the same code in a file without
+///     a BOM. A line-1 `//` comment escaped the incidental-text penalty and sorted above
+///     where it belonged.
+///
+/// So stripping here is not "perturbing the ranking inputs" — the concern #51 was filed
+/// with. Those comparisons were already wrong for a BOM'd line; this makes them right.
+/// Stripping at the render sites instead would have fixed the glyph and left the mis-ranking
+/// in place.
+///
+/// `trim_end` matches what every construction site already did, so it changes nothing on its
+/// own; it lives here only so the two operations cannot drift apart between backends.
+pub(crate) fn match_text(line: &str) -> String {
+    crate::lang::outline::strip_bom(line).trim_end().to_string()
 }
 
 /// Assembled search results before formatting.

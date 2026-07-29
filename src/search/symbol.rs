@@ -842,7 +842,7 @@ fn find_usages_multi(
                         bucket.push(Match {
                             path: path.to_path_buf(),
                             line: line_num as u32,
-                            text: line.trim_end().to_string(),
+                            text: crate::types::match_text(line),
                             is_definition: false,
                             exact: line.contains(query),
                             file_lines,
@@ -996,7 +996,7 @@ fn walk_for_definitions(
                 defs.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
-                    text: line_text.to_string(),
+                    text: crate::types::match_text(line_text),
                     is_definition: true,
                     exact: true,
                     file_lines,
@@ -1027,7 +1027,7 @@ fn walk_for_definitions(
                     defs.push(Match {
                         path: path.to_path_buf(),
                         line: line_num,
-                        text: line_text.to_string(),
+                        text: crate::types::match_text(line_text),
                         is_definition: true,
                         exact: true,
                         file_lines,
@@ -1055,7 +1055,7 @@ fn walk_for_definitions(
                 defs.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
-                    text: line_text.to_string(),
+                    text: crate::types::match_text(line_text),
                     is_definition: true,
                     exact: true,
                     file_lines,
@@ -1082,7 +1082,7 @@ fn walk_for_definitions(
                 defs.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
-                    text: line_text.to_string(),
+                    text: crate::types::match_text(line_text),
                     is_definition: true,
                     exact: true,
                     file_lines,
@@ -1166,7 +1166,7 @@ fn find_defs_heuristic_buf(
             defs.push(Match {
                 path: path.to_path_buf(),
                 line: (i + 1) as u32,
-                text: line.trim_end().to_string(),
+                text: crate::types::match_text(line),
                 is_definition: true,
                 exact: true,
                 file_lines,
@@ -1269,7 +1269,7 @@ fn find_usages(
                     file_matches.push(Match {
                         path: path.to_path_buf(),
                         line: line_num as u32,
-                        text: line.trim_end().to_string(),
+                        text: crate::types::match_text(line),
                         is_definition: false,
                         exact: line.contains(query),
                         file_lines,
@@ -1318,6 +1318,14 @@ fn find_defs_markdown_buf(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
+    // The read side strips a BOM before parsing markdown (`read::outline::generate`,
+    // `resolve_heading`, `suggest_headings`); this side did not, so the two disagreed about a
+    // doubled-BOM file's *first* heading — tree-sitter-md skips one BOM itself but parses the
+    // heading as a paragraph behind two. The outline advertised that heading and the section
+    // resolver accepted it while search reported it as a plain usage rather than a definition.
+    // Same strip here closes the last of that split (#51). A BOM carries no newline, so the
+    // rows tree-sitter reports and the `lines` indices below stay aligned.
+    let content = crate::lang::outline::strip_bom(content);
     let Some(tree) = parse_markdown(content) else {
         return Vec::new();
     };
@@ -1390,7 +1398,7 @@ fn emit_md_section_match(
     defs.push(Match {
         path: path.to_path_buf(),
         line: heading_line,
-        text: line_text.trim_end().to_string(),
+        text: crate::types::match_text(line_text),
         is_definition: true,
         exact: true,
         file_lines,
