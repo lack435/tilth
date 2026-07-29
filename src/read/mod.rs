@@ -152,20 +152,26 @@ pub fn read_file(
 
     // Canonical full-content view — shared by the small-file gate and OGATE below.
     //
-    // A leading BOM is deliberately NOT stripped here, unlike in the outline funnel (#42).
-    // Two reasons, and the second is the load-bearing one:
+    // A leading BOM is deliberately NOT stripped here, in *either* branch, unlike in the
+    // outline funnel (#42).
     //
-    //   * A full view is supposed to be the file's actual bytes. A stray glyph at the top of
-    //     one is arguably the honest rendering of a file that really does start with one.
-    //   * In edit mode this emits `hashlines(&content, 1)`, and `edit::apply_batch` verifies
-    //     an anchor by hashing the line as `fs::read_to_string` yields it — BOM included.
-    //     Stripping here would hand the caller a hash for `name,age` while verification
-    //     computes one for `\u{feff}name,age`, so every hash-mode edit touching line 1 of a
-    //     BOM'd file would be rejected with a stale-anchor error. That trades a cosmetic
-    //     defect for a correctness one.
+    // The edit-mode branch has no choice. It emits `hashlines(&content, 1)`, and
+    // `edit::apply_batch` verifies an anchor by hashing the line as `fs::read_to_string`
+    // yields it — BOM included. Stripping would hand the caller a hash for `name,age` while
+    // verification computes one for `\u{feff}name,age`, so every hash-mode edit touching
+    // line 1 of a BOM'd file would be rejected with a stale-anchor error: a cosmetic defect
+    // traded for a correctness one.
     //
-    // Pinned by `hash_mode_edits_line_one_of_a_bom_file`, so a future strip here fails a
-    // test rather than silently breaking editing.
+    // The plain branch *could* strip — nothing downstream of it hashes, and stripping only
+    // it was a live option. It does not, so that the two branches say the same thing about
+    // the same file. A full view that renders one way for a read and another way for an
+    // edit-mode read is a worse defect than the glyph: it makes "what does this file start
+    // with?" depend on which mode you asked in, and agents diff these outputs against each
+    // other. Consistency was the explicit call here, not a consequence of the hash
+    // constraint, which is why it gets its own test rather than riding on the edit one.
+    //
+    // Pinned by `hash_mode_edits_line_one_of_a_bom_file` (the hash contract) and
+    // `both_full_view_modes_agree_about_a_bom` (the consistency call).
     let full_view = || {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
@@ -781,6 +787,47 @@ mod tests {
 
         std::env::remove_var("TILTH_FULL_SIZE_CAP");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two full-view branches must render a BOM'd file the same way.
+    ///
+    /// Edit mode has no choice — stripping there desynchronises the anchors it hands out
+    /// from `edit::apply_edits`' verification. The plain branch could strip freely, since
+    /// nothing downstream of it hashes, and stripping only it was a live option (#42 offered
+    /// it). It is refused so that "what does this file start with?" does not depend on which
+    /// mode you asked in: agents diff these two outputs against each other, and a full view
+    /// that disagrees with itself is worse than the glyph it would have removed.
+    ///
+    /// Asserted as agreement between the two rather than against a literal, so it keeps
+    /// holding if the decision is ever reversed *for both* branches together. The BOM's
+    /// presence is asserted separately, or "neither has one" would satisfy the agreement.
+    #[test]
+    fn both_full_view_modes_agree_about_a_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.csv");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"name,age\nalice,30\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let cache = OutlineCache::new();
+        let plain = read_file(&path, None, false, &cache, false).unwrap();
+        let edit = read_file(&path, None, false, &cache, true).unwrap();
+
+        // Small file, so both take the full-content path rather than an outline.
+        assert!(
+            plain.contains("[full]") && edit.contains("[full]"),
+            "fixture must exercise the full view, got:\n{plain}\n---\n{edit}"
+        );
+        assert_eq!(
+            plain.contains('\u{feff}'),
+            edit.contains('\u{feff}'),
+            "the two full-view modes disagree about the BOM:\nplain:\n{plain}\nedit:\n{edit}"
+        );
+        assert!(
+            edit.contains('\u{feff}'),
+            "the full view keeps the BOM in both modes; if that is reversed, reverse it in \
+             both and update this test deliberately:\n{edit}"
+        );
     }
 
     /// A heading tilth suggests must be one tilth accepts, on a BOM'd file.
