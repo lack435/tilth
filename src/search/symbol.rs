@@ -96,6 +96,50 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
+/// Number of distinct values `stratum_for_display` can return.
+const STRATA: usize = 3;
+
+/// Stable-partition `matches` into the three display strata, preserving the relative
+/// order `rank::sort` established within each.
+///
+/// This was `merged.sort_by_key(stratum_for_display)`. The comparator is cheap, so it was
+/// never the time problem `rank::sort` was — but it is a full *stable sort* of
+/// `Vec<Match>`, and Rust's stable sort asks for `n/2 * size_of::<Match>()` of scratch:
+/// measured at 68 bytes per match, so 163 MB on a 2.4M-match search. Sorting on a key with
+/// three possible values does not need that. A counting pass computes each element's exact
+/// destination, and `apply_destination_permutation` moves them in place, so the only extra
+/// allocation is one `usize` per match.
+///
+/// Stability falls out of the construction: within a stratum, destinations are handed out
+/// in increasing input order.
+fn stratify_for_display(matches: &mut [Match]) {
+    if matches.len() < 2 {
+        return;
+    }
+
+    let mut counts = [0usize; STRATA];
+    for m in matches.iter() {
+        counts[stratum_for_display(m) as usize] += 1;
+    }
+
+    // Running start offset for each stratum.
+    let mut next = [0usize; STRATA];
+    let mut acc = 0;
+    for s in 0..STRATA {
+        next[s] = acc;
+        acc += counts[s];
+    }
+
+    let mut dest: Vec<usize> = vec![0; matches.len()];
+    for (i, m) in matches.iter().enumerate() {
+        let s = stratum_for_display(m) as usize;
+        dest[i] = next[s];
+        next[s] += 1;
+    }
+
+    rank::apply_destination_permutation(matches, &mut dest);
+}
+
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
 ///
@@ -157,7 +201,7 @@ pub fn search(
     // JS `lexical_declaration` and C++ data members, both 40 — then usages
     // last. Display-side only: pre-cap totals below and the underlying
     // ranking semantics for `--json` callers are unchanged.
-    merged.sort_by_key(stratum_for_display);
+    stratify_for_display(&mut merged);
 
     // Compute per-subfacet totals on the *pre-cap* set so the renderer can
     // print `displayed/total` headings + per-facet hidden-count lines. Counted
@@ -901,6 +945,81 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    /// `stratify_for_display` replaced `sort_by_key(stratum_for_display)` to avoid the
+    /// stable sort's `n/2 * size_of::<Match>()` scratch buffer on an unbounded match set.
+    /// It must be indistinguishable from what it replaced, including stability *within*
+    /// each stratum — that ordering is the one `rank::sort` just established, and losing it
+    /// would silently change which matches survive the display cap.
+    #[test]
+    fn stratify_for_display_matches_a_stable_sort_by_key() {
+        let strata_source = |i: usize| -> (bool, u16) {
+            match i % 3 {
+                0 => (true, 80), // stratum 0: primary code definition
+                1 => (true, 30), // stratum 1: doc-heading / variable definition
+                _ => (false, 0), // stratum 2: usage
+            }
+        };
+
+        let build = || -> Vec<Match> {
+            (0..97)
+                .map(|i| {
+                    let (is_definition, def_weight) = strata_source(i);
+                    Match {
+                        // Distinct path and line per element so the assertion can identify
+                        // each one and detect reordering within a stratum.
+                        path: PathBuf::from(format!("/repo/src/f{i}.rs")),
+                        line: u32::try_from(i).unwrap() + 1,
+                        text: format!("line {i}"),
+                        is_definition,
+                        exact: false,
+                        file_lines: 10,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        def_range: None,
+                        def_name: None,
+                        def_weight,
+                        impl_target: None,
+                    }
+                })
+                .collect()
+        };
+
+        let mut actual = build();
+        stratify_for_display(&mut actual);
+
+        let mut expected = build();
+        expected.sort_by_key(stratum_for_display);
+
+        let key = |v: &[Match]| {
+            v.iter()
+                .map(|m| (stratum_for_display(m), m.line))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            key(&actual),
+            key(&expected),
+            "counting-sort stratification disagreed with the stable sort_by_key it replaced"
+        );
+
+        // Independently: strata must be non-decreasing, and lines strictly increasing
+        // within each stratum (the input order, since every element has a distinct line).
+        let mut last = (0u8, 0u32);
+        for m in &actual {
+            let cur = (stratum_for_display(m), m.line);
+            assert!(
+                cur.0 > last.0 || (cur.0 == last.0 && cur.1 > last.1),
+                "stratification is not stable at {cur:?} after {last:?}"
+            );
+            last = cur;
+        }
+        // All three strata must actually be populated, or the above proves little.
+        for s in 0..3u8 {
+            assert!(
+                actual.iter().any(|m| stratum_for_display(m) == s),
+                "stratum {s} unpopulated — fixture no longer covers the partition"
+            );
+        }
+    }
 
     #[test]
     fn rust_definitions_detected() {

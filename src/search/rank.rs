@@ -18,25 +18,79 @@ const VENDOR_DIRS: &[&str] = &[
     "out",
 ];
 
+/// Reorder `slice` so the element at index `i` ends up at `dest[i]`.
+///
+/// `dest` must be a permutation of `0..slice.len()`. It is modified in place and left as
+/// the identity.
+///
+/// Applied with cycle swaps, so this allocates nothing and never holds a second buffer of
+/// `T`. That is the whole point: `T` here is `Match`, and the sets it runs on stopped
+/// being bounded when the search walks were made to complete. Rust's stable sort asks for
+/// `n/2 * size_of::<T>()` of scratch — measured at 68 bytes per match, 163 MB on a
+/// 2.4M-match search — and every caller below replaced a sort that paid it.
+///
+/// Correctness rests on `dest` staying a permutation: each iteration puts one element at
+/// its final index and creates one new fixed point, so the total work is O(n), the inner
+/// loop cannot spin, and no cycle can be left unresolved once `i` moves past it.
+pub(crate) fn apply_destination_permutation<T>(slice: &mut [T], dest: &mut [usize]) {
+    debug_assert_eq!(
+        slice.len(),
+        dest.len(),
+        "dest must be a permutation of the slice's indices"
+    );
+    // A `dest` that is not a permutation — a duplicate or out-of-range entry — makes the
+    // loop below spin forever instead of failing, because `dest[i] != i` can then never
+    // settle. Worth an O(n) debug-only check: a caller that miscomputes offsets hangs the
+    // process otherwise, which is exactly how it presented when a mutation test broke the
+    // counting-sort offsets in `stratify_for_display`.
+    debug_assert!(
+        {
+            let mut seen = vec![false; dest.len()];
+            dest.iter()
+                .all(|&d| d < seen.len() && !std::mem::replace(&mut seen[d], true))
+        },
+        "dest must be a permutation of 0..len (found a duplicate or out-of-range index)"
+    );
+    for i in 0..slice.len() {
+        while dest[i] != i {
+            let j = dest[i];
+            slice.swap(i, j);
+            dest.swap(i, j);
+        }
+    }
+}
+
 /// Sort matches by score (highest first). Deterministic: same inputs, same order.
 /// When `context` is provided, matches near the context file are boosted.
 ///
-/// `score` is evaluated exactly **once per match**, not inside the comparator.
+/// `score` is evaluated exactly **once per match**, not inside the comparator. It used to
+/// be called twice per comparison, and it is not a cheap function — `incidental_text_penalty`
+/// lowercases the whole matched line, so each call allocates. That was free while an
+/// early-quit threshold held `n` to ~80 entries; once the walks were made to complete (so
+/// results stop varying run to run) `n` became the true match count.
 ///
-/// It used to be called twice per comparison, i.e. ~2·n·log n times, and it is not a
-/// cheap function — `incidental_text_penalty` lowercases the whole matched line, so each
-/// call allocates. That was free while an early-quit threshold held `n` to ~80 entries.
-/// Once the search walks were made to complete (so that results stop varying run to run)
-/// `n` became the true match count, and on a dense 400-file fixture with ~2.4M matches
-/// this function was **99% of a search's wall time**: 32.3s out of 32.6s total, measured
-/// by comparing against a build with the sort stubbed out (0.35s).
+/// Measured on a dense 400-file fixture, ~2.4M matches, one session, by stubbing pieces out:
+///
+/// ```text
+/// walk + render, no sort at all      0.36s   380 MB
+/// + score once (2.4M calls)          1.92s   382 MB
+/// + index sort and permute (this)    3.93s   414 MB
+/// the sort this replaced             32.5s   462 MB
+/// ```
+///
+/// So `sort` was 98.9% of that search's wall time. Note what the rows do and do not
+/// attribute: scoring is 1.56s of the new 3.93s and the sort machinery is the other 2.0s,
+/// so it would be wrong to read the 32s as `score` alone — stubbing the sort also removed
+/// n log n moves of a 136-byte element and the stable sort's scratch buffer. `score` costs
+/// ~650ns per call here; the old sort made order-1e8 calls, this one makes 2.4e6.
 ///
 /// The ordering is unchanged — same key, same stability — so output is byte-identical.
 ///
 /// Sorting an index permutation rather than using `sort_by_cached_key` is deliberate: a
-/// cached key would have to own its `PathBuf` to break ties on path, which is ~100 bytes
-/// per match on a path that is already resident. Indices cost 8. `scores`/`order`/`dest`
-/// together add ~20 bytes per match against the ~380 a `Match` already occupies.
+/// cached key must *own* what it compares, so breaking ties on path means cloning a
+/// `PathBuf` per match on a path already resident, and `sort_by_cached_key` allocates its
+/// own `Vec<(K, usize)>` on top. `scores` + `order` + `dest` peak at 20 bytes per match,
+/// against `size_of::<Match>()` of 136 plus its heap.
 pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&Path>) {
     // Pre-compute context's package root once (same for entire batch)
     let ctx_parent = context.and_then(|c| c.parent());
@@ -76,24 +130,16 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
             .then_with(|| matches[i].line.cmp(&matches[j].line))
     });
 
-    // `order[k]` is the index of the element that belongs at position `k`. Invert that
-    // into "where does the element currently at p belong", then apply it with cycle
-    // swaps — in place, so no second buffer of `Match` is ever allocated.
+    // `order[k]` is the index of the element that belongs at position `k`; the helper
+    // wants the inverse — where does the element at `i` belong. Inverting is load-bearing,
+    // not bookkeeping: feeding `order` in directly applies the inverse permutation, which
+    // is a real and silent misordering.
     let mut dest: Vec<usize> = vec![0; order.len()];
     for (k, &from) in order.iter().enumerate() {
         dest[from] = k;
     }
-    drop(order);
 
-    for i in 0..matches.len() {
-        // Each swap puts one element at its final position, so this is O(n) overall.
-        // `dest` is swapped alongside so it keeps describing current positions.
-        while dest[i] != i {
-            let j = dest[i];
-            matches.swap(i, j);
-            dest.swap(i, j);
-        }
-    }
+    apply_destination_permutation(matches, &mut dest);
 }
 
 /// Ranking function. Each match gets a score — no floating point, no randomness.
@@ -511,7 +557,7 @@ fn recency(mtime: SystemTime, now: SystemTime) -> u32 {
 mod tests {
     use super::sort;
     use crate::types::Match;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
     fn make_match(path: &str, text: &str, is_definition: bool, def_name: Option<&str>) -> Match {
@@ -540,10 +586,6 @@ mod tests {
     /// results rather than fail loudly, and the ordering is what every caller reads.
     #[test]
     fn score_once_permutation_matches_a_reference_comparator_sort() {
-        use super::score;
-        use std::collections::HashMap;
-        use std::path::Path;
-
         let scope = PathBuf::from("/repo/src");
         let query = "handleAuth";
 
@@ -589,17 +631,69 @@ mod tests {
             v
         };
 
-        let mut actual = build();
-        sort(&mut actual, query, &scope, None);
+        // Run the comparison both without and *with* a context path. The context arm is
+        // what exercises `context_proximity`, which is the sole reader and writer of
+        // `pkg_cache` — and therefore the only part of `score` whose result could
+        // conceivably depend on evaluation order, which is exactly what changed here
+        // (lazy scoring inside a comparator became one eager pass). Without this arm the
+        // guard covers everything except the one thing worth being nervous about.
+        for context in [None, Some(Path::new("/repo/src/a/f0.rs"))] {
+            check_against_reference(&scope, query, context, &build());
+        }
+    }
+
+    /// Sort `input` with `sort`, sort a copy with a reference implementation of the old
+    /// comparator shape, and require the two to agree element for element.
+    fn check_against_reference(scope: &Path, query: &str, context: Option<&Path>, input: &[Match]) {
+        use super::score;
+        use std::collections::HashMap;
+
+        let clone_of = |v: &[Match]| -> Vec<Match> {
+            v.iter()
+                .map(|m| {
+                    let mut c = make_match(
+                        m.path.to_str().unwrap(),
+                        &m.text,
+                        m.is_definition,
+                        m.def_name.as_deref(),
+                    );
+                    c.line = m.line;
+                    c.mtime = m.mtime;
+                    c
+                })
+                .collect()
+        };
+
+        let mut actual = clone_of(input);
+        sort(&mut actual, query, scope, context);
 
         // Reference: the pre-refactor shape, scoring inside the comparator.
-        let mut expected = build();
+        let mut expected = clone_of(input);
         let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
         let now = SystemTime::now();
-        let ctx_parent: Option<&Path> = None;
+        let ctx_parent = context.and_then(Path::parent);
+        let ctx_pkg_root = context
+            .and_then(crate::lang::package_root)
+            .map(std::path::Path::to_path_buf);
         expected.sort_by(|a, b| {
-            let sa = score(a, query, &scope, ctx_parent, None, &mut pkg_cache, now);
-            let sb = score(b, query, &scope, ctx_parent, None, &mut pkg_cache, now);
+            let sa = score(
+                a,
+                query,
+                scope,
+                ctx_parent,
+                ctx_pkg_root.as_ref(),
+                &mut pkg_cache,
+                now,
+            );
+            let sb = score(
+                b,
+                query,
+                scope,
+                ctx_parent,
+                ctx_pkg_root.as_ref(),
+                &mut pkg_cache,
+                now,
+            );
             sb.cmp(&sa)
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| a.line.cmp(&b.line))
@@ -613,7 +707,7 @@ mod tests {
         assert_eq!(
             key(&actual),
             key(&expected),
-            "score-once permutation disagreed with the reference comparator sort"
+            "score-once permutation disagreed with the reference comparator sort (context: {context:?})"
         );
         assert_eq!(
             actual.len(),
@@ -622,8 +716,14 @@ mod tests {
         );
     }
 
-    /// The permutation must be a permutation: every input element present exactly once.
-    /// A cycle-swap bug can duplicate or drop elements as easily as it can misorder them.
+    /// Every input element present exactly once after sorting.
+    ///
+    /// Kept as a cheap tripwire, with an honest note on its strength: `slice::swap` is a
+    /// permutation primitive, so no bug expressible in `apply_destination_permutation` can
+    /// change the multiset — this cannot catch a misordering that the reference-comparator
+    /// test above misses. It guards against a future rewrite that stops using swaps
+    /// (indexed assignment, `copy_within`, an `unsafe` variant), where dropping or
+    /// duplicating an element becomes possible again.
     #[test]
     fn sort_preserves_the_multiset_of_matches() {
         let scope = PathBuf::from("/repo/src");
