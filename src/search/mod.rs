@@ -214,7 +214,7 @@ pub fn search_multi_symbol_expanded(
         let mut out = format::search_header(
             &result.query,
             &result.scope,
-            result.matches.len(),
+            result.total_found,
             result.definitions,
             result.usages,
         );
@@ -1027,7 +1027,7 @@ fn format_search_result(
     let header = format::search_header(
         &result.query,
         &result.scope,
-        result.matches.len(),
+        result.total_found,
         result.definitions,
         result.usages,
     );
@@ -1170,6 +1170,50 @@ fn format_search_result(
                 faceted.usages_cross.len(),
                 totals.usages_cross,
                 "usages",
+            );
+        }
+
+        // A facet can be allotted *zero* display slots when higher-ranked facets consume
+        // the whole `MAX_MATCHES` cap — which facet loses is decided by rank, and rank
+        // breaks ties on path, so a directory name can do it. The `!is_empty()` guards
+        // above then skip that facet entirely, taking its per-facet total and its
+        // hidden-count tail with it: no heading, no "... and N more".
+        //
+        // That was survivable while the header printed the display cap, because the whole
+        // count line was self-evidently nonsense ("10 matches (55 definitions, ...)").
+        // Now that the header states a true total, an unaccounted-for facet turns it into
+        // an arithmetic contradiction — "99 usages" over a body listing 92 — which is a
+        // worse failure than an obviously useless number. Name what was dropped so the
+        // header's arithmetic closes.
+        let omitted: Vec<String> = [
+            ("definitions", faceted.definitions.len(), totals.definitions),
+            (
+                "implementations",
+                faceted.implementations.len(),
+                totals.implementations,
+            ),
+            ("tests", faceted.tests.len(), totals.tests),
+            (
+                "same-package usages",
+                faceted.usages_local.len(),
+                totals.usages_local,
+            ),
+            (
+                "other usages",
+                faceted.usages_cross.len(),
+                totals.usages_cross,
+            ),
+        ]
+        .iter()
+        .filter(|(_, shown, total)| *shown == 0 && *total > 0)
+        .map(|(kind, _, total)| format!("{total} {kind}"))
+        .collect();
+
+        if !omitted.is_empty() {
+            let _ = write!(
+                out,
+                "\n\nNot shown: {}. Narrow with scope.",
+                omitted.join(", ")
             );
         }
     } else {
@@ -1536,6 +1580,212 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::Mutex;
+
+    /// Files in the search-determinism fixture below.
+    ///
+    /// A count-based cutoff quits a parallel walk *between* files, so what defeats it is
+    /// a fixture with far more files than the cutoff admits — not merely more matches.
+    /// `callers.rs` records the trap that cost a round of review there: a 12-file
+    /// fixture holding 60 matches was past the threshold on matches, but the walker's
+    /// threads consumed all 12 files before the shared counter was ever read, so the
+    /// exact-total assertion stayed green with the bug reintroduced, 12/12 runs.
+    ///
+    /// 400 files is comfortably past the point where that can happen for the highest
+    /// threshold these paths ever used (`FULL_EARLY_QUIT_* = 300`), and still writes in
+    /// well under a second.
+    const DETERMINISM_FIXTURE_FILES: usize = 400;
+    const DETERMINISM_FIXTURE_USES_PER_FILE: usize = 2;
+
+    /// Write `DETERMINISM_FIXTURE_FILES` Rust files, each defining `target_sym` once and
+    /// calling it `DETERMINISM_FIXTURE_USES_PER_FILE` times.
+    ///
+    /// Returns `(definitions, usages)`: one definition per file, and one usage per call
+    /// site. The definition's own line also matches the usage regex, but `symbol::search`
+    /// dedups a usage that sits on a definition's exact (path, line), so it does not count.
+    fn write_search_determinism_fixture(dir: &Path) -> (usize, usize) {
+        for f in 0..DETERMINISM_FIXTURE_FILES {
+            let mut src = String::from("fn target_sym() {}\n");
+            for i in 0..DETERMINISM_FIXTURE_USES_PER_FILE {
+                src.push_str(&format!("fn caller_{f}_{i}() {{ target_sym(); }}\n"));
+            }
+            std::fs::write(dir.join(format!("m{f}.rs")), src).unwrap();
+        }
+        (
+            DETERMINISM_FIXTURE_FILES,
+            DETERMINISM_FIXTURE_FILES * DETERMINISM_FIXTURE_USES_PER_FILE,
+        )
+    }
+
+    /// Symbol search must report *every* definition and usage, not however many a shared
+    /// counter happened to admit before a parallel walk noticed it had crossed a threshold.
+    ///
+    /// `EARLY_QUIT_THRESHOLD_DEFINITIONS = 50` and `EARLY_QUIT_THRESHOLD_USAGES = 30` made
+    /// this non-deterministic. Six identical runs against a 176k-file C++ tree produced six
+    /// distinct renderings, with the usage count moving over 30, 30, 30, 39, 28 and 30 while
+    /// the definition count sat at exactly 50 — the threshold, reported as a total.
+    ///
+    /// The assertions are on exact totals, so a reintroduced cutoff fails outright rather
+    /// than merely varying.
+    #[test]
+    fn symbol_search_reports_every_match_past_the_old_early_quit_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (expected_defs, expected_usages) = write_search_determinism_fixture(dir.path());
+
+        let result = search_symbol_raw("target_sym", dir.path(), None).unwrap();
+
+        assert_eq!(
+            result.definitions, expected_defs,
+            "expected every definition, got {}",
+            result.definitions
+        );
+        assert_eq!(
+            result.usages, expected_usages,
+            "expected every usage, got {}",
+            result.usages
+        );
+        assert_eq!(
+            result.total_found,
+            expected_defs + expected_usages,
+            "total_found must be the true pre-cap total"
+        );
+    }
+
+    /// Content search had the same cutoff (`EARLY_QUIT_THRESHOLD = 30`), and hid it better:
+    /// the header reported the display cap rather than a total, so the instability was only
+    /// visible by diffing full output — three distinct renderings in six identical runs.
+    #[test]
+    fn content_search_reports_every_match_past_the_old_early_quit_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (defs, usages) = write_search_determinism_fixture(dir.path());
+        // Every line mentioning `target_sym`: the definition line plus each call site.
+        let expected = defs + usages;
+
+        let result = search_content_raw("target_sym", dir.path(), None).unwrap();
+
+        assert_eq!(
+            result.total_found, expected,
+            "expected every matching line, got {}",
+            result.total_found
+        );
+    }
+
+    /// Repeated identical runs must agree byte for byte. Weaker than the exact-total
+    /// assertions above, but it fails for *any* source of instability, not just a count
+    /// cutoff — including an unranked truncation of an unordered vector, which is how the
+    /// second-hop block in `callers.rs` stayed unstable after its walk was fixed.
+    #[test]
+    fn symbol_and_content_output_is_byte_identical_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_search_determinism_fixture(dir.path());
+        let cache = OutlineCache::new();
+
+        let symbol_runs: Vec<String> = (0..6)
+            .map(|_| search_symbol("target_sym", dir.path(), &cache, None).unwrap())
+            .collect();
+        assert!(
+            symbol_runs.windows(2).all(|w| w[0] == w[1]),
+            "symbol search rendered {} distinct outputs in 6 identical runs",
+            symbol_runs.iter().collect::<HashSet<_>>().len()
+        );
+
+        let content_runs: Vec<String> = (0..6)
+            .map(|_| search_content("target_sym", dir.path(), &cache, None).unwrap())
+            .collect();
+        assert!(
+            content_runs.windows(2).all(|w| w[0] == w[1]),
+            "content search rendered {} distinct outputs in 6 identical runs",
+            content_runs.iter().collect::<HashSet<_>>().len()
+        );
+    }
+
+    /// The header must state the true total, not the number of matches it went on to
+    /// render. It used to be passed `result.matches.len()`, so every capped result headed
+    /// "10 matches" regardless of whether 10 or 34290 existed — a clamped number presented
+    /// as a total, which is the half of this bug an agent reads first.
+    #[test]
+    fn search_header_reports_the_true_total_not_the_display_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (defs, usages) = write_search_determinism_fixture(dir.path());
+        let total = defs + usages;
+        let cache = OutlineCache::new();
+
+        for (label, out) in [
+            (
+                "symbol",
+                search_symbol("target_sym", dir.path(), &cache, None).unwrap(),
+            ),
+            (
+                "content",
+                search_content("target_sym", dir.path(), &cache, None).unwrap(),
+            ),
+        ] {
+            let header = out.lines().next().unwrap_or_default();
+            assert!(
+                header.contains(&format!("{total} matches")),
+                "{label} header must report the true total {total}, got: {header}"
+            );
+            // The display cap must not be what the header reports. Asserted against the
+            // number of rendered entries rather than the literal "10", which would be a
+            // decimal-substring coincidence that breaks if the fixture size is retuned.
+            let shown = out.lines().filter(|l| l.starts_with("### ")).count();
+            assert!(
+                shown < total,
+                "{label} fixture must exceed the display cap for this to test anything \
+                 (shown {shown}, total {total})"
+            );
+            assert!(
+                !header.contains(&format!("{shown} matches")),
+                "{label} header must not report the {shown} rendered entries as the \
+                 total, got: {header}"
+            );
+        }
+    }
+
+    /// A facet that wins zero display slots must still be accounted for.
+    ///
+    /// The renderer guards each facet block on `!faceted.X.is_empty()`, which is decided
+    /// on the *post-cap* set. When higher-ranked facets consume the whole `MAX_MATCHES`
+    /// cap, a facet with a real non-zero total renders nothing at all — no heading, no
+    /// `shown/total` label, no hidden-count tail. That was tolerable while the header
+    /// printed the display cap, because the count line was self-evidently nonsense; once
+    /// the header states a true total, the body has to add up to it.
+    ///
+    /// Fixture: 1 definition, 80 same-package usages, 7 test usages. 10 display slots, so
+    /// the test facet is guaranteed to get none of them.
+    #[test]
+    fn a_facet_with_no_display_slots_is_still_accounted_for_in_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "fn target_sym() {}\n").unwrap();
+        for i in 0..40 {
+            std::fs::write(
+                src.join(format!("u{i}.rs")),
+                format!("fn a{i}() {{ target_sym(); }}\nfn b{i}() {{ target_sym(); }}\n"),
+            )
+            .unwrap();
+        }
+        for i in 0..7 {
+            std::fs::write(src.join(format!("t{i}_test.rs")), "let x = target_sym();\n").unwrap();
+        }
+
+        let cache = OutlineCache::new();
+        let out = search_symbol("target_sym", root, &cache, None).unwrap();
+
+        let shown_test_entries = out.contains("## Tests");
+        assert!(
+            !shown_test_entries,
+            "fixture assumption broken — the tests facet won display slots, so this test \
+             no longer covers the zero-slot case:\n{out}"
+        );
+        assert!(
+            out.contains("Not shown: 7 tests"),
+            "a facet with 7 matches and no display slots vanished from the body, leaving \
+             the header's total unaccounted for:\n{out}"
+        );
+    }
 
     /// Collect all file paths from a walker into a sorted Vec.
     fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {

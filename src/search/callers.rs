@@ -52,10 +52,9 @@ const FULL_MAX_MATCHES: usize = 100;
 // multiple of it. Peak RSS at that scale is dominated by `BloomFilterCache`, which
 // holds one filter per code file walked and is currently unbounded.
 //
-// Not fixed here: `search::symbol` and `search::content` still gate their parallel
-// walks on a shared count (`EARLY_QUIT_THRESHOLD_DEFINITIONS` and friends), so the
-// same class of instability remains on the most-used search paths. Removing it there
-// costs a full walk on every `tilth_search`, which needs its own measurement.
+// `search::symbol` and `search::content` carried the same count-gated walks and were
+// fixed the same way afterwards — see the notes at the top of those two files for the
+// measurements that justified paying a full walk on the most-used search paths.
 
 /// A single caller match — a call site of a target symbol.
 ///

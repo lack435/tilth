@@ -28,6 +28,13 @@ pub fn binary_header(path: &Path, byte_len: u64, mime: &str) -> String {
 }
 
 /// Build header for search results.
+///
+/// `total` must be the **true** pre-cap match count, not the number of matches
+/// rendered. It used to be passed `result.matches.len()`, i.e. the display cap, so a
+/// query with 34290 matches and one with 10 both headed "10 matches" — a clamped
+/// number presented as a total. The per-facet `shown/total` labels and the
+/// "... and N more" tails below already carry the display cap, so the header stating
+/// what actually exists is the non-redundant half.
 pub fn search_header(
     query: &str,
     scope: &Path,
