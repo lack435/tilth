@@ -154,6 +154,23 @@ pub struct BloomFilterCache {
     /// file, not one per target" is the whole point of `contains_any` and the only way to assert
     /// it deterministically. A timing assertion would be flaky; a build count is exact.
     builds: std::sync::atomic::AtomicUsize,
+    /// Probes answered from a cached filter with a matching mtime.
+    ///
+    /// With `builds`, this gives the hit rate. #40 needs it: the open question there is whether a
+    /// full cache still *earns* its 32 MB, and "hit rate over a realistic query sequence" is the
+    /// only way to answer that. Before this, the cache could be bounded, resident, and returning
+    /// nothing, with no way to tell from outside.
+    ///
+    /// Report-only, like `builds`. Both are `Relaxed`: they are read after the walks they describe
+    /// have joined, so no ordering is needed, and nothing branches on them.
+    hits: std::sync::atomic::AtomicUsize,
+    /// Admissions declined because the filter did not fit under `ceiling`.
+    ///
+    /// Distinguishes the two reasons a probe can miss — a cold entry, which the cache will serve
+    /// next time, from a refused one, which it never will. A cache whose misses are nearly all
+    /// refusals is full and useless, which is exactly the #40 regime; a cache whose misses are
+    /// cold is simply warming up. The hit rate alone cannot tell those apart.
+    refusals: std::sync::atomic::AtomicUsize,
 }
 
 struct CachedFilter {
@@ -184,6 +201,8 @@ impl BloomFilterCache {
             bytes: std::sync::atomic::AtomicUsize::new(0),
             ceiling,
             builds: std::sync::atomic::AtomicUsize::new(0),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            refusals: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -197,6 +216,35 @@ impl BloomFilterCache {
     #[must_use]
     pub fn filters_built(&self) -> usize {
         self.builds.load(Relaxed)
+    }
+
+    /// Probes served from a cached filter. Test/diagnostic accessor.
+    #[must_use]
+    pub fn cache_hits(&self) -> usize {
+        self.hits.load(Relaxed)
+    }
+
+    /// Admissions refused for want of budget. Test/diagnostic accessor.
+    #[must_use]
+    pub fn admissions_refused(&self) -> usize {
+        self.refusals.load(Relaxed)
+    }
+
+    /// Hit rate over all probes since construction, or `None` before the first probe.
+    ///
+    /// Denominator is `hits + builds`, i.e. probes that asked a question — the empty-target early
+    /// return in `contains_any` is not a probe and is not counted either way.
+    #[must_use]
+    pub fn hit_rate(&self) -> Option<f64> {
+        let (h, b) = (self.cache_hits(), self.filters_built());
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "diagnostic ratio; f64 is exact to 2^53 probes"
+        )]
+        match h + b {
+            0 => None,
+            total => Some(h as f64 / total as f64),
+        }
     }
 
     /// Check if `symbol` might appear in the file at `path`.
@@ -313,6 +361,7 @@ impl BloomFilterCache {
         // the filter we already hold.
         if let Some(entry) = self.filters.get(path) {
             if entry.mtime == mtime {
+                self.hits.fetch_add(1, Relaxed);
                 return targets.any(|t| entry.filter.contains(t.as_ref()));
             }
         }
@@ -357,6 +406,7 @@ impl BloomFilterCache {
                 } else {
                     // Its budget is already reclaimed and its mtime can never match again, so
                     // keeping it would be resident memory the counter no longer knows about.
+                    self.refusals.fetch_add(1, Relaxed);
                     occupied.remove();
                 }
             }
@@ -368,6 +418,8 @@ impl BloomFilterCache {
                         mtime,
                         bytes: cost,
                     });
+                } else {
+                    self.refusals.fetch_add(1, Relaxed);
                 }
             }
         }
@@ -616,6 +668,211 @@ fn is_ident_continue(b: u8) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Measurement harness for #40 — does a full cache still earn its ceiling?
+///
+/// `#[ignore]`d and driven by environment variables, because the question only has an answer on a
+/// tree large enough to fill 32 MB, and no such tree can live in this repository. Run it as:
+///
+/// ```text
+/// TILTH_ADAPTIVITY_ROOT=<large tree> TILTH_ADAPTIVITY_SUBTREE=<a subdir of it> \
+///   cargo test --release adaptivity -- --ignored --nocapture
+/// ```
+///
+/// It exists as a committed test rather than a throwaway script so the numbers in #40 can be
+/// reproduced, and so the *shape* of the measurement is reviewable. It asserts almost nothing —
+/// its output is the deliverable.
+#[cfg(test)]
+mod adaptivity {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Counter snapshot, so each phase can be reported as a delta rather than a running total.
+    #[derive(Clone, Copy)]
+    struct Snap {
+        hits: usize,
+        builds: usize,
+        refusals: usize,
+        bytes: usize,
+    }
+
+    impl Snap {
+        fn of(c: &BloomFilterCache) -> Self {
+            Self {
+                hits: c.cache_hits(),
+                builds: c.filters_built(),
+                refusals: c.admissions_refused(),
+                bytes: c.cached_bytes(),
+            }
+        }
+
+        fn since(self, before: Self) -> (usize, usize, usize) {
+            (
+                self.hits - before.hits,
+                self.builds - before.builds,
+                self.refusals - before.refusals,
+            )
+        }
+    }
+
+    /// Ratios here are printed for a human to read, never compared or asserted, so the precision
+    /// loss on the casts does not matter.
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn report(label: &str, before: Snap, after: Snap) {
+        let (hits, builds, refusals) = after.since(before);
+        let probes = hits + builds;
+        let rate = if probes == 0 {
+            f64::NAN
+        } else {
+            hits as f64 / probes as f64 * 100.0
+        };
+        let refused_share = if builds == 0 {
+            f64::NAN
+        } else {
+            refusals as f64 / builds as f64 * 100.0
+        };
+        let resident_mb = after.bytes as f64 / (1024.0 * 1024.0);
+        println!(
+            "{label:28} probes={probes:>8}  hits={hits:>8}  builds={builds:>8}  \
+             hit_rate={rate:>5.1}%  refused/build={refused_share:>5.1}%  resident={resident_mb:.1}MB"
+        );
+    }
+
+    fn targets() -> HashSet<String> {
+        ["IsValid", "Initialize", "Reset", "Update", "Serialize"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    fn env_tree() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let root = std::env::var_os("TILTH_ADAPTIVITY_ROOT")?;
+        let sub = std::env::var_os("TILTH_ADAPTIVITY_SUBTREE")?;
+        Some((
+            std::path::PathBuf::from(root),
+            std::path::PathBuf::from(sub),
+        ))
+    }
+
+    /// The #40 regime: one broad query fills the budget, then the agent narrows to one subtree for
+    /// the next N calls.
+    ///
+    /// The **control** is the point. A low hit rate in the narrow phase means nothing on its own —
+    /// it could just as easily mean the subtree has few files probed more than once. So the same
+    /// narrow sequence also runs against a *fresh* cache, which shows what hit rate the sequence
+    /// can reach when the budget has not already been spent on unrelated files. The gap between
+    /// them is the cost of the cache not adapting; if there is no gap, #40 is not a real problem
+    /// and the honest outcome is to document it and close.
+    #[test]
+    #[ignore = "needs a tree large enough to fill the 32 MB ceiling; see module docs"]
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn adaptivity_broad_then_narrow_versus_fresh() {
+        let Some((root, sub)) = env_tree() else {
+            println!("skipped: set TILTH_ADAPTIVITY_ROOT and TILTH_ADAPTIVITY_SUBTREE");
+            return;
+        };
+        let narrow_calls: usize = std::env::var("TILTH_ADAPTIVITY_CALLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let t = targets();
+
+        // --- Arm A: broad query first, then narrow (the adversarial agent shape) ---
+        let poisoned = BloomFilterCache::new();
+        let a0 = Snap::of(&poisoned);
+        let _ = crate::search::callers::find_callers_batch(&t, &root, &poisoned, None);
+        let a1 = Snap::of(&poisoned);
+        report("A broad (fills budget)", a0, a1);
+
+        for i in 0..narrow_calls {
+            let before = Snap::of(&poisoned);
+            let _ = crate::search::callers::find_callers_batch(&t, &sub, &poisoned, None);
+            let after = Snap::of(&poisoned);
+            report(&format!("A narrow #{i}"), before, after);
+        }
+        let a_end = Snap::of(&poisoned);
+        report("A narrow total", a1, a_end);
+
+        // --- Arm B: the same narrow sequence against a cache that was never poisoned ---
+        let fresh = BloomFilterCache::new();
+        let b0 = Snap::of(&fresh);
+        for i in 0..narrow_calls {
+            let before = Snap::of(&fresh);
+            let _ = crate::search::callers::find_callers_batch(&t, &sub, &fresh, None);
+            let after = Snap::of(&fresh);
+            report(&format!("B narrow #{i}"), before, after);
+        }
+        let b_end = Snap::of(&fresh);
+        report("B narrow total", b0, b_end);
+
+        let (ah, ab, _) = a_end.since(a1);
+        let (bh, bb, _) = b_end.since(b0);
+        let (ar, br) = (
+            ah as f64 / (ah + ab).max(1) as f64,
+            bh as f64 / (bh + bb).max(1) as f64,
+        );
+        println!(
+            "\nnarrow-phase hit rate: poisoned {:.1}% vs fresh {:.1}%  (gap {:.1} points)",
+            ar * 100.0,
+            br * 100.0,
+            (br - ar) * 100.0
+        );
+        println!(
+            "if the gap is ~0, a full cache costs nothing here and #40 should be documented, \
+             not fixed"
+        );
+    }
+
+    /// The case that constrains the fix: a working set genuinely larger than the ceiling.
+    ///
+    /// Refusal degrades gracefully here — whatever got in keeps hitting, so the hit rate lands
+    /// somewhere between 0% and the ceiling's share of the working set. A naive "clear when full"
+    /// reset does **not**: it throws away a cache that was working, and if the clear lands near the
+    /// end of each walk it can score worse than refusing ever did. So this number is the floor any
+    /// reset policy has to beat, and the reason #40 leans toward hysteresis rather than a bare
+    /// reset.
+    ///
+    /// Uses `with_ceiling` to make the working set exceed the budget cheaply, rather than needing a
+    /// tree big enough to overflow 32 MB several times over.
+    #[test]
+    #[ignore = "needs TILTH_ADAPTIVITY_SUBTREE; see module docs"]
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn adaptivity_thrash_working_set_larger_than_ceiling() {
+        let Some((_, sub)) = env_tree() else {
+            println!("skipped: set TILTH_ADAPTIVITY_ROOT and TILTH_ADAPTIVITY_SUBTREE");
+            return;
+        };
+        let t = targets();
+
+        // First find what this subtree actually needs, so the ceilings below are fractions of a
+        // measured number rather than guesses.
+        let sizing = BloomFilterCache::new();
+        let _ = crate::search::callers::find_callers_batch(&t, &sub, &sizing, None);
+        let needed = sizing.cached_bytes();
+        println!(
+            "subtree needs {:.2}MB to cache fully",
+            needed as f64 / (1024.0 * 1024.0)
+        );
+
+        // Ceiling as a fraction of the working set. 1.0 is the adequate case for reference.
+        for frac in [0.25_f64, 0.5, 0.75, 1.0] {
+            #[allow(clippy::cast_sign_loss, reason = "frac and needed are both positive")]
+            #[allow(clippy::cast_possible_truncation, reason = "byte count fits usize")]
+            let ceiling = (needed as f64 * frac) as usize;
+            let cache = BloomFilterCache::with_ceiling(ceiling);
+            let b0 = Snap::of(&cache);
+            for _ in 0..5 {
+                let _ = crate::search::callers::find_callers_batch(&t, &sub, &cache, None);
+            }
+            let b1 = Snap::of(&cache);
+            report(&format!("ceiling={frac:.2}x working set"), b0, b1);
+        }
+        println!(
+            "\nthese hit rates are what refusal already achieves; a reset policy that scores \
+             below them on this row is a regression, however well it does on the narrow case"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
