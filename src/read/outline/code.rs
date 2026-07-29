@@ -586,6 +586,19 @@ public:
                 "a call spelled like the class inside an inline method body",
                 "class API Widget : public Base\n{\npublic:\n    void Reset()\n    {\n        Cleanup();\n        Widget();\n    }\n};\n",
             ),
+            (
+                // An argument-taking macro. Blanking the name but not its arguments
+                // stranded `(16)` where the type name goes, and emptied the outline
+                // entirely — worse than the misparse it replaced.
+                "an argument-taking macro in the head",
+                "class ALIGNAS(16) Widget\n{\npublic:\n    Widget();\n    void Work();\n    int Value;\n};\n",
+            ),
+            (
+                // The shape that actually occurs: a deprecation macro carrying a
+                // string, alongside a real export macro.
+                "an argument-taking macro next to an export macro",
+                "class DEPRECATED(5.4, \"gone\") API Widget : public Base\n{\npublic:\n    Widget();\n    void Work();\n};\n",
+            ),
         ];
         for (name, src) in cases {
             let plain = src

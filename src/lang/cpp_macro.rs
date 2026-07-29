@@ -23,28 +23,49 @@
 //! # What is masked
 //!
 //! An identifier between a `class` / `struct` / `union` / `enum` keyword and the type
-//! name, subject to two gates that both have to pass.
+//! name — together with its `(…)` arguments, if it takes any, since blanking
+//! `ALIGNAS(16)`'s name alone would strand `(16)` exactly where the type name belongs.
+//!
+//! Four gates, all of which must pass. The first two are structural; the last two are
+//! here because structure alone is provably insufficient.
 //!
 //! **A brace before the semicolon.** `class Foo bar;` is an ordinary variable
 //! declaration of type `Foo` — the same token shape as a macro-prefixed head — and
 //! masking it would delete the type and leave `class bar;`. Only a definition has a
 //! body.
 //!
+//! **The type's own name takes no arguments.** `struct RECT GetBounds() { … }` is a
+//! function returning an elaborated type: a brace before the semicolon, two
+//! identifiers, and an upper-case first one. A type name is never followed by `(`,
+//! so that is what separates them.
+//!
+//! **The braces hold declarations, not an initialiser.** `struct RECT r{0,0,1,1};`
+//! declares a brace-initialised *variable*, and is otherwise identical to a definition
+//! — see `body_is_type_definition`.
+//!
 //! **Every masked identifier is macro-shaped**, meaning upper-case, digits and
-//! underscores only. This one is a naming convention rather than a structural fact,
-//! and it is here because structure alone is not sufficient:
-//! `struct FVector ALIGN16 P{0,0,0};` declares a brace-initialised *variable* and has
-//! a body, a type name, an attribute macro and a declarator — masking everything but
-//! the last name would rewrite it into a definition of `struct P`. Since `FVector` is
-//! not macro-shaped, the whole head is left alone. Every dllexport spelling in the
-//! wild is upper-case (`MYLIB_API`, `Q_DECL_EXPORT`, `DLLEXPORT`), and a C++ *type*
-//! named in upper-case is rare enough to be worth the trade — the failure mode
-//! without the gate is corrupting a declaration, which is far worse than declining to
-//! mask one.
+//! underscores only. A naming convention rather than a structural fact, and the one
+//! gate that catches `struct FVector ALIGN16 P{0,0,0};`, whose type name is
+//! mixed-case. Every dllexport spelling in the wild is upper-case (`MYLIB_API`,
+//! `Q_DECL_EXPORT`, `DLLEXPORT`); an upper-case C++ *type* name is common enough in
+//! Win32 (`RECT`, `POINT`, `MSG`) that this gate alone is not sufficient, which is why
+//! the two above exist.
 //!
 //! Masking is refused for the whole head unless every candidate passes, rather than
 //! per identifier: a head where only some names look like macros is one this scanner
 //! has misread, and guessing which half is right is how a declaration gets corrupted.
+//!
+//! # Known residuals
+//!
+//! `struct COLOR c{RED};` — a brace-initialised variable whose initialiser starts with
+//! an identifier — is indistinguishable from a definition by the rules above, and is
+//! masked. Narrower than what the gates reject, and the pre-masking recovery path
+//! mis-read the same shape.
+//!
+//! A raw string literal with an embedded `"` (`R"(he said "hi". class API X {)"`) can
+//! desynchronise the scanner into string content. Harmless: every masked span is an
+//! identifier, so no token boundary outside the literal can move, and all text is read
+//! from the original. Worth knowing before adding a rule that blanks anything wider.
 
 /// Rewrite `content` with C/C++ type-head export macros replaced by spaces.
 ///
@@ -57,16 +78,22 @@ pub fn mask_export_macros(content: &str) -> Option<String> {
 
     while let Some(start) = scan.next_type_keyword() {
         if let Some(idents) = scan.read_head() {
-            // The last identifier is the type's own name; the ones before it are the
-            // candidates. All of them must look like macros or none are masked.
-            let macros = idents.len().saturating_sub(1);
-            let candidates = &idents[..macros];
-            if !candidates.is_empty()
-                && candidates
-                    .iter()
-                    .all(|&(s, e)| is_macro_shaped(&bytes[s..e]))
-            {
-                spans.extend_from_slice(candidates);
+            if let Some((name, candidates)) = idents.split_last() {
+                // A name carrying an argument list is a function returning an
+                // elaborated type — `struct RECT GetBounds() { … }`. Valid C, and
+                // token-for-token a macro-prefixed head; masking it deletes the return
+                // type. A type's own name is never followed by `(`.
+                let name_is_a_type = name.span_end == name.name_end;
+                // All candidates must look like macros, or none are masked: a head
+                // where only some names do is one this scanner has misread, and
+                // guessing which half is right is how a declaration gets corrupted.
+                let all_macros = !candidates.is_empty()
+                    && candidates
+                        .iter()
+                        .all(|i| is_macro_shaped(&bytes[i.start..i.name_end]));
+                if name_is_a_type && all_macros {
+                    spans.extend(candidates.iter().map(|i| (i.start, i.span_end)));
+                }
             }
         }
         debug_assert!(scan.pos > start, "scanner must always advance");
@@ -90,6 +117,18 @@ pub fn mask_export_macros(content: &str) -> Option<String> {
 struct Scanner<'a> {
     bytes: &'a [u8],
     pos: usize,
+}
+
+/// One identifier in a type head.
+///
+/// `span_end` reaches past `name_end` only for an argument-taking macro, where the
+/// parenthesised arguments have to be blanked along with the name. The shape gate
+/// reads `start..name_end`; the mask covers `start..span_end`.
+#[derive(Clone, Copy)]
+struct HeadIdent {
+    start: usize,
+    name_end: usize,
+    span_end: usize,
 }
 
 /// Keywords that can introduce a type definition. `enum` is included for
@@ -128,8 +167,8 @@ impl Scanner<'_> {
     /// Read the identifiers between the keyword just consumed and the type's body.
     ///
     /// Returns `None` unless the head is a definition — a `{` reached before any `;`.
-    fn read_head(&mut self) -> Option<Vec<(usize, usize)>> {
-        let mut idents: Vec<(usize, usize)> = Vec::new();
+    fn read_head(&mut self) -> Option<Vec<HeadIdent>> {
+        let mut idents: Vec<HeadIdent> = Vec::new();
         loop {
             if self.pos >= self.bytes.len() {
                 return None;
@@ -139,22 +178,18 @@ impl Scanner<'_> {
             }
             let b = self.bytes[self.pos];
             match b {
-                // The body: this head defines a type.
-                b'{' => return Some(idents),
+                // The body: this head defines a type, if the braces hold declarations
+                // rather than an initialiser.
+                b'{' => return self.body_is_type_definition().then_some(idents),
                 // A declaration, not a definition — `class Foo bar;`, `class Fwd;`.
-                // Also `,`, which means a declarator list (`class Foo a, b;`).
-                b';' | b',' | b')' | b'=' => return None,
+                // `,` means a declarator list (`class Foo a, b;`); a `(` with no
+                // identifier before it is a shape this scanner does not understand.
+                b';' | b',' | b')' | b'=' | b'(' => return None,
                 // A base-class clause. Nothing after it can be the type's own name, so
                 // stop collecting, but keep scanning for the brace that proves this is
                 // a definition.
                 b':' => {
                     return self.skip_to_body().then_some(idents);
-                }
-                // `__declspec(dllexport)`, `alignas(16)` — a macro that takes
-                // arguments. It is not an identifier we can blank (the parens would be
-                // left behind), and tree-sitter reads it as an attribute; skip it.
-                b'(' => {
-                    self.skip_balanced(b'(', b')')?;
                 }
                 // `[[nodiscard]]` and friends parse natively; step over them.
                 b'[' => {
@@ -162,9 +197,9 @@ impl Scanner<'_> {
                 }
                 _ if is_ident_start(b) => {
                     let start = self.pos;
-                    let end = self.ident_end(start);
-                    let word = &self.bytes[start..end];
-                    self.pos = end;
+                    let name_end = self.ident_end(start);
+                    let word = &self.bytes[start..name_end];
+                    self.pos = name_end;
                     if HEAD_TERMINATORS.contains(&word) {
                         return self.skip_to_body().then_some(idents);
                     }
@@ -173,13 +208,66 @@ impl Scanner<'_> {
                     if TYPE_KEYWORDS.contains(&word) {
                         continue;
                     }
-                    idents.push((start, end));
+                    // An argument-taking macro — `ALIGNAS(16)`,
+                    // `UE_DEPRECATED(5.4, "gone")` — must be blanked *with* its
+                    // arguments. Blanking the name alone strands the argument list
+                    // exactly where a type name belongs, which is worse than not
+                    // masking: the head then resembles nothing the recovery fallback
+                    // recognises either, so it falls between the two paths.
+                    let span_end = self.span_end_after(name_end)?;
+                    idents.push(HeadIdent {
+                        start,
+                        name_end,
+                        span_end,
+                    });
                 }
                 // Anything else in a type head (`<`, `*`, `&`, …) means this is not the
                 // simple shape an export macro produces. Give up rather than guess.
                 _ => return None,
             }
         }
+    }
+
+    /// End of an identifier's span, extended over a following `(…)` argument list.
+    ///
+    /// Leaves `self.pos` just past whatever the span covers.
+    fn span_end_after(&mut self, name_end: usize) -> Option<usize> {
+        let before_trivia = self.pos;
+        self.skip_trivia();
+        if self.bytes.get(self.pos) == Some(&b'(') {
+            self.skip_balanced(b'(', b')')?;
+            return Some(self.pos);
+        }
+        self.pos = before_trivia;
+        Some(name_end)
+    }
+
+    /// True when the `{` at the cursor opens a type body rather than an initialiser.
+    ///
+    /// `struct RECT r{0,0,1,1};` is a brace-initialised *variable* whose head is
+    /// token-for-token a macro-prefixed definition, and Win32 spells every struct tag
+    /// in upper case (`RECT`, `POINT`, `MSG`) so the macro-shape gate does not catch
+    /// it. Masking it deletes the type and promotes the variable to one. A member
+    /// declaration always starts with a name or a keyword, so a literal or an
+    /// immediate `}` means an initialiser.
+    ///
+    /// Does not move the cursor.
+    fn body_is_type_definition(&mut self) -> bool {
+        let save = self.pos;
+        self.pos += 1; // step over `{`
+        self.skip_trivia();
+        let verdict = match self.bytes.get(self.pos) {
+            // `{}` is genuinely ambiguous — an empty definition and an empty
+            // initialiser are spelled identically. Declining leaves an empty exported
+            // type to the recovery fallback, which is where it was handled before.
+            None | Some(b'}') => false,
+            Some(&b) => {
+                !(b.is_ascii_digit()
+                    || matches!(b, b'"' | b'\'' | b'-' | b'+' | b'{' | b'&' | b'*'))
+            }
+        };
+        self.pos = save;
+        verdict
     }
 
     /// Scan forward for the `{` that opens a type body. False if a `;` comes first,
@@ -255,14 +343,29 @@ impl Scanner<'_> {
                         self.pos += 1;
                     }
                 }
-                b'"' | b'\'' => self.skip_literal(b),
+                b'"' => self.skip_literal(b),
+                // A `'` after an identifier byte is a digit separator (`1'000`), not a
+                // character literal. Reading it as one swallowed the rest of the line,
+                // so any head after it on that line was never seen.
+                b'\'' if !self.prev_is_ident_byte() => self.skip_literal(b),
                 // A preprocessor directive can hold anything, including a bare `class`
                 // in a macro definition. Skip the whole logical line.
                 b'#' => {
                     self.pos += 1;
                     while self.pos < self.bytes.len() {
                         match self.bytes[self.pos] {
-                            b'\\' => self.pos += 2,
+                            // A line continuation. `\r\n` has to be consumed whole, or
+                            // the `\n` ends the directive scan one line early — and
+                            // CRLF is the norm on the platform this feature targets.
+                            b'\\' => {
+                                self.pos += 1;
+                                if self.bytes.get(self.pos) == Some(&b'\r') {
+                                    self.pos += 1;
+                                }
+                                if self.bytes.get(self.pos) == Some(&b'\n') {
+                                    self.pos += 1;
+                                }
+                            }
                             b'\n' => break,
                             _ => self.pos += 1,
                         }
@@ -272,6 +375,14 @@ impl Scanner<'_> {
             }
         }
         self.pos > start
+    }
+
+    /// True when the byte before the cursor could end an identifier or number.
+    fn prev_is_ident_byte(&self) -> bool {
+        self.pos
+            .checked_sub(1)
+            .and_then(|i| self.bytes.get(i))
+            .is_some_and(|&b| is_ident_continue(b))
     }
 
     /// Step over a `"…"` or `'…'` literal, honouring backslash escapes.
@@ -338,10 +449,25 @@ mod tests {
         }
     }
 
+    /// Every byte the mask changed must have been part of an identifier or its
+    /// argument list — never a newline, which would move every line below it.
+    fn assert_only_head_bytes_blanked(src: &str, masked: &str) {
+        for (i, (a, b)) in src.bytes().zip(masked.bytes()).enumerate() {
+            if a != b {
+                assert_eq!(b, b' ', "byte {i} became {b:?}, not a space");
+                assert!(
+                    !a.is_ascii_control(),
+                    "byte {i} was control byte {a:?}; blanking it moves every line below"
+                );
+            }
+        }
+    }
+
     #[track_caller]
     fn masks_to(src: &str, expected: &str) {
         let masked = mask_export_macros(src).unwrap_or_else(|| panic!("nothing masked in {src:?}"));
         assert_positions_preserved(src, &masked);
+        assert_only_head_bytes_blanked(src, &masked);
         assert_eq!(masked, expected, "for {src:?}");
     }
 
@@ -435,6 +561,91 @@ mod tests {
             "struct ALIGN16 Position { int X; };",
             "struct         Position { int X; };",
         );
+    }
+
+    /// An argument-taking macro must be blanked *with* its arguments. Blanking the
+    /// name alone strands the argument list where a type name belongs — worse than not
+    /// masking, because the head no longer resembles anything the recovery fallback
+    /// recognises either, so it falls between the two paths.
+    #[test]
+    fn masks_argument_taking_macros_with_their_arguments() {
+        // `ALIGNAS(16)` is 11 bytes, plus the space either side of it.
+        masks_to(
+            "class ALIGNAS(16) Widget { int X; };",
+            &format!("class{}Widget {{ int X; }};", " ".repeat(13)),
+        );
+        // The real-world shape: a deprecation macro carrying a string, next to an
+        // export macro. A `)` inside the string must not end the argument list.
+        masks_to(
+            "class DEPRECATED(5.4, \"gone)\") MYLIB_API Widget : public Base { void W(); };",
+            &format!(
+                "class{}Widget : public Base {{ void W(); }};",
+                " ".repeat(36)
+            ),
+        );
+        // A lower-case one is not macro-shaped, so the whole head declines.
+        unchanged("class __declspec(dllexport) Widget { int X; };");
+    }
+
+    /// An all-caps identifier is not always a macro. Win32 spells every struct tag that
+    /// way (`RECT`, `POINT`, `MSG`), so an elaborated type specifier naming one has the
+    /// exact token shape of a macro-prefixed head — and masking it deletes the type.
+    #[test]
+    fn never_masks_an_upper_case_type_tag() {
+        // A function returning an elaborated type. `GetBounds` is followed by `(`,
+        // which no type name ever is.
+        unchanged("struct RECT GetBounds() { return r; }");
+        unchanged("struct POINT Origin() { return p; }");
+        // Brace-initialised variables of an upper-case tag type.
+        unchanged("struct RECT r{0,0,1,1};");
+        unchanged("struct RECT Bounds{};");
+        unchanged("void f() { struct RECT bounds{0,0,1,1}; }");
+    }
+
+    /// The `#define` guard has to hold on the line endings this platform actually uses.
+    #[test]
+    fn ignores_keywords_in_directives_with_crlf() {
+        unchanged("#define DECLARE(n) \\\r\n    class API n {\r\nint x;\r\n");
+        unchanged("#define DECLARE(n) class API n {\r\nint x;\r\n");
+    }
+
+    /// A digit separator is not a character literal. Treating it as one swallowed the
+    /// rest of the line, so a head after it on the same line was never seen.
+    #[test]
+    fn digit_separators_do_not_swallow_the_line() {
+        masks_to(
+            "constexpr int K = 1'000; class API Widget { int X; };",
+            "constexpr int K = 1'000; class     Widget { int X; };",
+        );
+    }
+
+    /// The invariant everything downstream rests on, asserted over adversarial input
+    /// rather than argued: the scan terminates, the length never changes, and no byte
+    /// that carries position information is ever blanked.
+    ///
+    /// Deterministic rather than randomised — a seeded LCG over a C++-flavoured
+    /// alphabet, so a failure is reproducible and CI cannot go intermittently red.
+    #[test]
+    fn masking_is_total_and_position_preserving() {
+        const ALPHABET: &[u8] = b"class struct union enum API_X ab(){};:,*&<>\"'\\\n\r\t/#=1";
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 120) as usize;
+            let src: String = (0..len)
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize] as char)
+                .collect();
+            // Only well-formed UTF-8 reaches this — the alphabet is ASCII.
+            if let Some(masked) = mask_export_macros(&src) {
+                assert_positions_preserved(&src, &masked);
+                assert_only_head_bytes_blanked(&src, &masked);
+            }
+        }
     }
 
     #[test]
