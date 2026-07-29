@@ -94,7 +94,13 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !syms.is_empty() {
             let mut sorted: Vec<_> = syms.iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(a.1));
+            // Count descending, then name — the name tie-break is required, not cosmetic.
+            // `syms` is a `HashMap`, `sort_by` is stable, and `take(5)` decides membership,
+            // so equal counts were ordered by hash iteration and `RandomState` reseeds per
+            // process. Ties are the *normal* case here: most queries are seen once. Same
+            // defect as the `dirs:` line in `overview.rs` and the truncations fixed in
+            // `callers`, `symbol`/`content` and `glob`.
+            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             let top: Vec<String> = sorted
                 .iter()
                 .take(5)
@@ -110,7 +116,8 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !dirs.is_empty() {
             let mut sorted: Vec<_> = dirs.iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(a.1));
+            // Count descending, then path. Same reasoning as `Top queries` above.
+            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             let top: Vec<String> = sorted
                 .iter()
                 .take(5)
@@ -171,6 +178,51 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `summary` feeds `tilth_session`, so it must not vary run to run.
+    ///
+    /// `Top queries` and `Hot paths` both sorted a `HashMap`'s entries by count only, with a
+    /// stable sort, then `take(5)`. Equal counts therefore kept hash-iteration order and
+    /// `take` chose membership from it. Ties are the normal case, not an edge case: most
+    /// queries in a session are seen exactly once, which is what this fixture reproduces —
+    /// twelve distinct queries all at count 1, against a cap of five.
+    ///
+    /// A fresh `Session` per iteration is deliberate: `RandomState` reseeds per `HashMap`
+    /// instantiation, so reusing one would test far less than it appears to.
+    #[test]
+    fn summary_is_byte_identical_across_sessions_with_tied_counts() {
+        let render = || {
+            let session = Session::new();
+            for q in [
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+                "juliett", "kilo", "lima",
+            ] {
+                session.record_search(q);
+            }
+            for d in 0..12 {
+                session.record_read(Path::new(&format!("d{d:02}/f.rs")));
+            }
+            session.summary()
+        };
+
+        let runs: Vec<String> = (0..8).map(|_| render()).collect();
+        assert!(
+            runs[0].contains("Top queries:"),
+            "fixture produced no Top queries line, so this proves nothing:\n{}",
+            runs[0]
+        );
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "summary varied across 8 sessions with identical input:\n{}",
+            runs.join("\n---\n")
+        );
+        // All counts tie at 1, so the five shown must be the alphabetically first five.
+        assert!(
+            runs[0].contains("alpha (1), bravo (1), charlie (1), delta (1), echo (1)"),
+            "tied counts must be broken by name:\n{}",
+            runs[0]
+        );
+    }
 
     #[test]
     fn record_savings_accumulates_across_calls() {
