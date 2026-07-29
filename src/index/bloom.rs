@@ -143,29 +143,43 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 ///   fixture, five walks per ceiling:
 ///
 ///   ```text
-///   ceiling / working set   walk 0   walks 1-4
-///   0.25x                     1993   810, 821, 510, 1016
-///   0.50x                     1993   24, 132, 34, 152
-///   0.75x                     1993   41, 184, 186, 56
-///   1.00x                     1993   0, 0, 0, 0
+///   ceiling / working set   walk 0   walks 1-4              (1-f)*W   ratio
+///   0.25x                     1993   1354, 1354, 1354, 1354    1495    0.91
+///   0.50x                     1993    856,  856,  856,  856     997    0.86
+///   0.75x                     1993    384,  384,  384,  384     498    0.77
+///   1.00x                     1993      0,    0,    0,    0       -       -
 ///   ```
+///
+///   `TILTH_THREADS=1`, three reps, every figure above bit-identical across all three — hit rates
+///   included. `W` is the 1993 probes one walk makes over this scope.
 ///
 ///   First, **walk 0 is the full probe count at every ceiling** — 1993 on a 1993-probe scope,
 ///   including at 1.00x where nothing is ever refused and the cache is perfect. A first walk has no
 ///   hits available to interrupt it, so this is structural, not a property of being overloaded. Any
-///   threshold below one walk's probe count fires on the first walk of every workload.
+///   threshold below one walk's probe count fires on the first walk of every workload. (Walk 0 reads
+///   1993 in every row for that reason; the 1.00x row is the clearest illustration, not extra
+///   evidence.)
 ///
-///   Second, and worse for a would-be tuner: the **steady-state run has no stable model**. A review
-///   of the rejected policy fitted `~(1 - ceiling/working_set) x probes_per_walk` across two other
-///   fixtures, which would predict 1495 / 997 / 498 for the fractional rows above; the measured
-///   maxima are 1016 / 152 / 186, low by 1.5x to 6x. The likely cause is that the walk is parallel,
-///   so admitted files interleave across the tree instead of forming a contiguous prefix, and how
-///   scattered the resident set ends up depends on tree shape and thread scheduling. Two fixtures
-///   fit the law and one does not, so it is a loose upper bound at best.
+///   Second, and this is the one that kills a fixed bound: **the steady-state run is a function of
+///   walker thread count**, because `miss_run` is one counter shared by the whole walk and any
+///   thread's hit ends the run for all of them. The table above is `TILTH_THREADS=1`, where the four
+///   steady walks are identical to the probe and reproduce bit-for-bit across reps. Raise the thread
+///   count and the same cache behaviour reports a different number — roughly halving at 2 threads,
+///   and landing anywhere in a wide band at the default, which is `available_parallelism() / 2`
+///   clamped to 2..6 and therefore machine-dependent.
 ///
-///   That is the real argument: a threshold cannot be set on a quantity that has no reliable model
-///   across trees. A trigger has to be normalised against something the cache knows about itself —
-///   resident entry count is the candidate.
+///   So the quantity is perfectly predictable per `(tree, ceiling fraction, thread count)` and
+///   useless as a trigger anyway: a policy thresholding on it fires according to how many threads
+///   the walker happened to start. An earlier reading of these rows claimed the run had "no stable
+///   model" and was low by up to 6x against `~(1 - ceiling/working_set) x probes_per_walk`. That was
+///   sampling noise, not a property of the run — under a fixed thread count the law holds at
+///   0.77-0.91x of prediction here, and at a constant 1.13x on a second fixture. The law is a
+///   serviceable upper bound with a tree-dependent constant; it is the thread dependence that rules
+///   the signal out.
+///
+///   Note this carries forward to any replacement: normalising against resident entry count does
+///   not help while the numerator is a thread-interleaved global count. A per-thread run, or a
+///   quantity that does not depend on interleaving at all, is what the next attempt needs.
 /// * Refused bytes measured against the ceiling also fails: at a ceiling of ~0.75x the working set
 ///   the refused portion is genuinely smaller than the ceiling even though the working set is not,
 ///   so it clears a cache that is earning well.
@@ -314,8 +328,14 @@ impl BloomFilterCache {
     /// available to interrupt it and therefore always runs the full probe count. That single number
     /// hides the steady-state run, and the two are what an adaptive trigger has to tell apart — so
     /// the harness samples per walk rather than reading a running maximum.
+    ///
+    /// Clears the in-flight run as well as the peak. Without that, a walk whose first probe misses
+    /// would report `previous_tail + 1` and the intervals would not be independent. On the fixtures
+    /// measured so far it makes no difference — each walk happens to hit before it misses, so the
+    /// tail is already 0 — but that is luck, not isolation.
     #[cfg(test)]
     pub(crate) fn take_peak_miss_run(&self) -> usize {
+        self.miss_run.store(0, Relaxed);
         self.peak_miss_run.swap(0, Relaxed)
     }
 
@@ -327,24 +347,6 @@ impl BloomFilterCache {
     fn note_miss(&self) {
         let run = self.miss_run.fetch_add(1, Relaxed) + 1;
         self.peak_miss_run.fetch_max(run, Relaxed);
-    }
-
-    /// Hit rate over all probes since construction, or `None` before the first probe.
-    ///
-    /// Denominator is `hits + builds`, i.e. probes that asked a question — the empty-target early
-    /// return in `contains_any` is not a probe and is not counted either way.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn hit_rate(&self) -> Option<f64> {
-        let (h, b) = (self.cache_hits(), self.filters_built());
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "diagnostic ratio; f64 is exact to 2^53 probes"
-        )]
-        match h + b {
-            0 => None,
-            total => Some(h as f64 / total as f64),
-        }
     }
 
     /// Check if `symbol` might appear in the file at `path`.
@@ -791,20 +793,34 @@ fn is_ident_continue(b: u8) -> bool {
 ///
 /// ```text
 /// ceiling / working set   observed hit rate   spread
-/// 0.25x                       22.8 - 25.5%     2.7 pts
-/// 0.50x                       36.2 - 47.3%    11.1 pts
-/// 0.75x                       58.3 - 64.2%     5.9 pts
+/// 0.25x                       14.1 - 26.1%    12.0 pts
+/// 0.50x                       33.7 - 49.6%    15.9 pts
+/// 0.75x                       58.3 - 64.7%     6.4 pts
 /// 1.00x                       80.0 - 80.0%     0
 /// ```
 ///
-/// The mechanism is the parallel walk: once the ceiling is reached, *which* files won the race into
-/// the cache decides what hits afterwards, and thread scheduling decides that. 1.00x is exactly
-/// deterministic because nothing is ever refused, so there is no race to lose.
+/// **This is a lower bound on the noise, from one fixture on one machine at its default thread
+/// count — not a floor to compare against.** An earlier version of this table quoted 0.25x as the
+/// quiet row at 2.7 points, from six samples. Nineteen samples put it at 12.0 points, with values
+/// nine points below that entire range. The spread did not converge as samples were added; it kept
+/// widening. Treat every row as "at least this noisy", and re-measure per fixture rather than
+/// reusing these numbers.
+///
+/// The mechanism is the parallel walk, and that is demonstrated rather than assumed: `TILTH_THREADS=1`
+/// makes every row reproduce bit-for-bit across reps, hit rates and per-walk miss runs alike. Once
+/// the ceiling is reached, *which* files won the race into the cache decides what hits afterwards,
+/// and thread scheduling decides that. **Set `TILTH_THREADS=1` for anything compared across builds.**
+///
+/// The 1.00x row's zero spread is arithmetic, not evidence: when the ceiling fits the working set,
+/// walk 0 is all misses and walks 1-4 are all hits, so the rate is exactly 4/5 by construction. It
+/// is a useful control precisely because it cannot vary, but it demonstrates nothing about the
+/// mechanism — the deterministic-thread result above is what does.
 ///
 /// This is why the first attempt at #40 reported a "worst regression of 4.0 points" that did not
 /// survive contact with a second fixture: every delta it quoted was a single run of one build
-/// against a single run of another, and all of them were inside the band above. A difference under
-/// ~10 points at 0.50x, or ~6 at 0.75x, is not evidence of anything.
+/// against a single run of another, and all of them were inside the band above. No numeric
+/// "is it evidence" rule is offered here, because an earlier version of this comment gave one and it
+/// was derived from the same too-narrow sample it was meant to protect against.
 #[cfg(test)]
 mod adaptivity {
     use super::*;
@@ -869,6 +885,23 @@ mod adaptivity {
         );
     }
 
+    /// The walker thread count these numbers were produced under.
+    ///
+    /// Printed with every run because miss-run length is a function of it — `miss_run` is one
+    /// counter for the whole walk, so any thread's hit ends the run for all of them. Two people
+    /// measuring the same cache behaviour on different machines get different miss runs, and the
+    /// default is machine-dependent. An unlabelled miss-run number is not a measurement.
+    ///
+    /// Mirrors the resolution in `search::walker`; set `TILTH_THREADS=1` for reproducible runs.
+    fn walk_threads() -> usize {
+        std::env::var("TILTH_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+            })
+    }
+
     fn targets() -> HashSet<String> {
         ["IsValid", "Initialize", "Reset", "Update", "Serialize"]
             .into_iter()
@@ -900,10 +933,11 @@ mod adaptivity {
     fn adaptivity_broad_then_narrow_versus_fresh() {
         let Some((root, sub)) = env_tree() else {
             println!(
-                "SKIPPED (no TILTH_ADAPTIVITY_ROOT / TILTH_ADAPTIVITY_SUBTREE) — this run                  measured nothing"
+                "SKIPPED (no TILTH_ADAPTIVITY_ROOT / TILTH_ADAPTIVITY_SUBTREE) — measured nothing"
             );
             return;
         };
+        println!("walk threads: {}", walk_threads());
         let narrow_calls: usize = std::env::var("TILTH_ADAPTIVITY_CALLS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -982,12 +1016,25 @@ mod adaptivity {
 
         // First find what this subtree actually needs, so the ceilings below are fractions of a
         // measured number rather than guesses.
-        let sizing = BloomFilterCache::new();
+        //
+        // Effectively unbounded, not `new()`. With the default 32 MB ceiling this run would refuse
+        // admissions on any subtree needing more than that, `needed` would come back clamped to
+        // 32 MB, and every row below would silently be a fraction of the ceiling rather than of the
+        // working set — including the "1.00x" row, which the type doc leans on as the case where
+        // nothing is ever refused. The assertion makes the clamp impossible to miss if this is ever
+        // pointed at a subtree that overflows `usize`-worth of filters.
+        let sizing = BloomFilterCache::with_ceiling(usize::MAX / 2);
         let _ = crate::search::callers::find_callers_batch(&t, &sub, &sizing, None);
         let needed = sizing.cached_bytes();
+        assert_eq!(
+            sizing.admissions_refused(),
+            0,
+            "sizing run hit its ceiling, so `needed` is clamped and every row below is mislabelled"
+        );
         println!(
-            "subtree needs {:.2}MB to cache fully",
-            needed as f64 / (1024.0 * 1024.0)
+            "subtree needs {:.2}MB to cache fully  (walk threads: {})",
+            needed as f64 / (1024.0 * 1024.0),
+            walk_threads()
         );
 
         // Ceiling as a fraction of the working set. 1.0 is the adequate case for reference.
