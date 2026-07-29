@@ -89,7 +89,10 @@ pub(crate) fn canonical_boundary(boundary: Option<&Path>) -> Option<PathBuf> {
 }
 
 pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
-    let trimmed = line.trim_start();
+    // BOM-aware: `trim_start` alone leaves U+FEFF in place, which made a leading BOM drop
+    // line 1's import for every language at once. Shared with `extract_import_source` so
+    // the two cannot disagree about a BOM'd line — see `trim_start_bom_aware`.
+    let trimmed = crate::lang::outline::trim_start_bom_aware(line);
     match lang {
         Lang::Rust => trimmed.starts_with("use "),
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
@@ -930,6 +933,152 @@ mod tests {
                 is_external(&source, Lang::Cpp),
                 header.starts_with('<'),
                 "bucketed wrongly: {line}"
+            );
+        }
+    }
+
+    /// A UTF-8 BOM. Written as bytes on purpose: this bug is invisible to any fixture
+    /// built from a plain `&str` literal, which is how it survived several passes over
+    /// this code. `fs::read_to_string` does not strip it, so it reaches `is_import_line`
+    /// as the first character of line 1.
+    const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+    /// U+FEFF is not Unicode `White_Space`, so `trim_start` leaves it in place and every
+    /// line-prefix test against line 1 of a BOM'd file fails. The import then lands in
+    /// neither `uses_local` nor `uses_external` and vanishes with no warning — the same
+    /// failure mode as the trailing-comment and spaced-`#` include bugs, reached from a
+    /// third direction.
+    ///
+    /// Asserted as "same answer with and without the BOM" rather than against a literal,
+    /// so the test states the actual invariant and cannot drift from the resolver.
+    #[test]
+    fn bom_does_not_drop_the_first_import() {
+        // (subdirectory, entry file, entry body, sibling files to create)
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "cpp",
+                "main.cpp",
+                "#include \"Local.h\"\n#include <vector>\nvoid F() {}\n",
+                &["Local.h"],
+            ),
+            (
+                // `crate::` resolution needs a `src` ancestor to anchor on.
+                "rust/src",
+                "main.rs",
+                "use crate::helper;\nuse crate::other;\nfn f() { helper(); }\n",
+                &["helper.rs", "other.rs"],
+            ),
+            (
+                "py",
+                "app.py",
+                "from .mod_a import X\nfrom .mod_b import Y\n",
+                &["mod_a.py", "mod_b.py"],
+            ),
+        ];
+
+        let tmp = tempfile::tempdir().unwrap();
+        for (subdir, entry, body, siblings) in cases {
+            let mut resolved_both_ways = Vec::new();
+            for (variant, prefix) in [("plain", &[][..]), ("bom", UTF8_BOM)] {
+                let dir = tmp.path().join(variant).join(subdir);
+                fs::create_dir_all(&dir).unwrap();
+                for sibling in *siblings {
+                    fs::write(dir.join(sibling), "").unwrap();
+                }
+                let entry_path = dir.join(entry);
+                let mut bytes = prefix.to_vec();
+                bytes.extend_from_slice(body.as_bytes());
+                fs::write(&entry_path, &bytes).unwrap();
+
+                // Read it back rather than reusing `body`, so the BOM travels the same
+                // route it does in production.
+                let content = fs::read_to_string(&entry_path).unwrap();
+                let local = resolve_local_imports(&entry_path, &content, None);
+                resolved_both_ways.push(
+                    local
+                        .iter()
+                        .map(|p| p.file_name().unwrap().to_owned())
+                        .collect::<Vec<_>>(),
+                );
+            }
+
+            let (plain, bom) = (&resolved_both_ways[0], &resolved_both_ways[1]);
+            // Guard against the fixture itself resolving nothing, which would let the
+            // comparison below pass vacuously.
+            assert_eq!(
+                plain.len(),
+                siblings.len(),
+                "fixture is broken: {entry} without a BOM resolved {plain:?}"
+            );
+            assert_eq!(bom, plain, "a BOM changed the local imports of {entry}");
+        }
+    }
+
+    /// Detection and extraction have to agree about a BOM'd line, in the sense the
+    /// C/C++ table test establishes. Fixing only `is_import_line` would leave the line
+    /// passing detection and then missing every per-language `strip_prefix` inside
+    /// `extract_import_source`, falling through to the generic last-token fallback — which
+    /// yields `X` for the Python row below and `'./mod';` for the TypeScript one. (It
+    /// happens to yield the right answer for Rust, so the damage is language-dependent.)
+    ///
+    /// The expected source is pinned against a literal rather than only compared with the
+    /// unmarked line's, because agreement alone is satisfiable by both sides returning
+    /// `""` — a regression in one language arm would then pass unnoticed.
+    #[test]
+    fn bom_line_detects_and_extracts_as_if_unmarked() {
+        use crate::lang::outline::extract_import_source;
+
+        let cases: &[(Lang, &str, &str)] = &[
+            (Lang::Cpp, "#include \"Local.h\"", "\"Local.h\""),
+            (Lang::C, "# include <stdio.h>", "<stdio.h>"),
+            (Lang::Rust, "use crate::helper;", "crate::helper"),
+            (Lang::Python, "from .mod_a import X", ".mod_a"),
+            (Lang::Python, "import os", "os"),
+            (Lang::TypeScript, "import { X } from './mod';", "./mod"),
+            (Lang::Go, "import \"net/http\"", "net/http"),
+            (Lang::Elixir, "alias Foo.Bar", "Foo.Bar"),
+            (Lang::Bash, "source ./lib/utils.sh", "./lib/utils.sh"),
+        ];
+
+        for (lang, line, want) in cases {
+            let bom_line = format!("\u{feff}{line}");
+            assert!(
+                is_import_line(&bom_line, *lang),
+                "detection lost a BOM'd {lang:?} import: {line}"
+            );
+            // The unmarked line first, so a broken expectation is reported as a broken
+            // fixture rather than as a BOM regression.
+            assert_eq!(
+                extract_import_source(line, Some(*lang)),
+                *want,
+                "fixture is broken: unmarked {lang:?} extraction changed for {line}"
+            );
+            assert_eq!(
+                extract_import_source(&bom_line, Some(*lang)),
+                *want,
+                "extraction disagrees with the unmarked line for {lang:?}: {line}"
+            );
+        }
+    }
+
+    /// A BOM is a byte-order marker, not a syntactic element, so it can sit on either side
+    /// of the leading indentation — and a tool that prepends one without checking for an
+    /// existing BOM leaves two. All of those orderings have to reach the same place; a
+    /// helper that stopped after one BOM would drop the doubled case exactly as before.
+    #[test]
+    fn bom_is_stripped_however_it_is_layered_with_indentation() {
+        for line in [
+            "\u{feff}use crate::helper;",
+            "\u{feff}    use crate::helper;",
+            "    \u{feff}use crate::helper;",
+            "\u{feff}\u{feff}use crate::helper;",
+            "\u{feff} \u{feff} use crate::helper;",
+        ] {
+            assert!(is_import_line(line, Lang::Rust), "{line:?}");
+            assert_eq!(
+                crate::lang::outline::extract_import_source(line, Some(Lang::Rust)),
+                "crate::helper",
+                "{line:?}"
             );
         }
     }
