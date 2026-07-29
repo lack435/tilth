@@ -12,10 +12,23 @@
 //! kind: "content"       92 MB    4.2s
 //! ```
 //!
-//! Content was bounded in #30 and symbol was not, on identical input — 12.6x the memory and 3.2x
-//! the wall time, and that is what this module exists to close. The amplifier is worse than the
-//! headline: `timeout.rs` detaches a worker on expiry and it keeps allocating, with
-//! `MAX_ABANDONED_THREADS = 8` permitting eight of those at once.
+//! Content was bounded in #30 and symbol was not, on identical input — 12.6x the memory, and that
+//! is what this module exists to close. The amplifier is worse than the headline: `timeout.rs`
+//! detaches a worker on expiry and it keeps allocating, with `MAX_ABANDONED_THREADS = 8` permitting
+//! eight of those at once.
+//!
+//! **The memory win is unconditional; the wall-time win is not.** Same fixture, after:
+//!
+//! ```text
+//!                      peak RSS        wall
+//! default threads      85-90 MB     2.4-3.0s   (before: 1161-1164 MB, 10.3-10.7s)
+//! TILTH_THREADS=1      22-23 MB    24.4-24.8s  (before: 1110 MB,      19.0-20.2s)
+//! ```
+//!
+//! At default parallelism it is both smaller and faster. Single-threaded it trades ~25% more wall
+//! for ~50x less memory, because the per-match scoring the bound needs is no longer hidden behind
+//! other threads' I/O. That regime is worth stating rather than burying: the abandoned-worker
+//! amplifier above is precisely the case where effective parallelism is low.
 //!
 //! Two properties every caller needs, and the reason this is shared code rather than copied:
 //!
@@ -48,6 +61,12 @@ use crate::types::Match;
 /// the page from *within* it. Recency is worth up to 100 points, so a match is at risk only when
 /// its selection score is within 100 of the score at the cut. An earlier 500 was far too small and
 /// deleted a freshly-edited subdirectory from results entirely.
+///
+/// That 100-point window is only the whole story because **recency is the only term selection
+/// omits**. A first version of the symbol path also passed `None` for `context`, which put
+/// `context_proximity` — up to 175 points — outside the window too and widened the residual to 275
+/// without saying so. Every caller now passes the real `context`. If another scoring term is ever
+/// excluded from `selection_score`, this bound has to be re-argued, not just re-read.
 ///
 /// At ~280 bytes per candidate this is ~5.6 MB, against the ~1.1 GB it replaces on the symbol
 /// path, so the memory argument tolerates a bound two orders of magnitude above any display cap.
@@ -109,6 +128,31 @@ impl PartialOrd for Candidate {
     }
 }
 
+/// Exact per-facet tallies over everything a sink was offered.
+///
+/// Three of the five facets `facets::facet_of` assigns are decided by the match alone —
+/// `Implementation` (`is_definition && impl_target.is_some()`), `Definition` (`is_definition`) and
+/// `Test` (`is_test_match`). Only the local/cross usage split consults a primary package derived
+/// from the whole match set, so only that split is unrecoverable once retention clips.
+///
+/// Counting the other three here keeps them true. An earlier version derived all five from the
+/// retained set and reported "2 tests" on a query that found 25 — the confidently wrong number the
+/// renderer's own comment warns is worse than a useless one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactTallies {
+    pub(crate) definitions: usize,
+    pub(crate) implementations: usize,
+    pub(crate) tests: usize,
+    /// Non-test usages. Their local/cross split is the only part retention can lose.
+    pub(crate) usages: usize,
+}
+
+impl ExactTallies {
+    pub(crate) fn total(self) -> usize {
+        self.definitions + self.implementations + self.tests + self.usages
+    }
+}
+
 /// Shared bounded sink for a parallel walk.
 pub(crate) struct BoundedRetain {
     heap: Mutex<BinaryHeap<Candidate>>,
@@ -124,6 +168,11 @@ pub(crate) struct BoundedRetain {
     /// Report-only and `Relaxed`: nothing reads it to decide what to retain, and it is read after
     /// the walk has joined.
     offered: AtomicUsize,
+    /// Exact per-facet tallies, same discipline as `offered`. See `ExactTallies`.
+    t_defs: AtomicUsize,
+    t_impls: AtomicUsize,
+    t_tests: AtomicUsize,
+    t_usages: AtomicUsize,
 }
 
 impl BoundedRetain {
@@ -132,6 +181,10 @@ impl BoundedRetain {
             heap: Mutex::new(BinaryHeap::new()),
             cap,
             offered: AtomicUsize::new(0),
+            t_defs: AtomicUsize::new(0),
+            t_impls: AtomicUsize::new(0),
+            t_tests: AtomicUsize::new(0),
+            t_usages: AtomicUsize::new(0),
         }
     }
 
@@ -143,25 +196,59 @@ impl BoundedRetain {
         if file_matches.is_empty() {
             return;
         }
-        // Counted before reduction, so this is the true total and not what survived.
+        // Counted before reduction, so these are true totals and not what survived.
         self.offered
             .fetch_add(file_matches.len(), AtomicOrdering::Relaxed);
-
-        // Reduce to this file's own best `cap` with no lock held.
-        let mut local: BinaryHeap<Candidate> = BinaryHeap::with_capacity(64);
-        for m in file_matches {
-            let cand = Candidate {
-                score: scorer.selection_score(&m),
-                m,
-            };
-            if local.len() < self.cap {
-                local.push(cand);
-            } else if local.peek().is_some_and(|worst| cand < *worst) {
-                // Peek before pushing so a doomed candidate is never sifted in and back out.
-                local.pop();
-                local.push(cand);
+        let (mut d, mut i, mut t, mut u) = (0, 0, 0, 0);
+        for m in &file_matches {
+            if m.is_definition && m.impl_target.is_some() {
+                i += 1;
+            } else if m.is_definition {
+                d += 1;
+            } else if crate::search::facets::is_test_match_for_totals(m) {
+                t += 1;
+            } else {
+                u += 1;
             }
         }
+        // One `fetch_add` per facet per file, not per match: the tally is folded locally first.
+        self.t_defs.fetch_add(d, AtomicOrdering::Relaxed);
+        self.t_impls.fetch_add(i, AtomicOrdering::Relaxed);
+        self.t_tests.fetch_add(t, AtomicOrdering::Relaxed);
+        self.t_usages.fetch_add(u, AtomicOrdering::Relaxed);
+
+        // Score off-lock, and reduce off-lock only when there is something to reduce.
+        //
+        // The local heap uses the same `cap` as the shared one, so for any file with `cap` matches
+        // or fewer it reduces *nothing* — it heapifies the file's matches and hands all of them
+        // straight to the merge loop. Since `cap` is 20_000 and real files hold a handful of
+        // matches, that was the case essentially always: pure overhead on every file. Skipping it
+        // there is ~17% of single-threaded wall on a dense fixture, with byte-identical output.
+        //
+        // The heap still earns its place above the cap: without it one pathological file would hand
+        // its entire match count to the merge loop and hold the mutex for all of it.
+        let scored: Vec<Candidate> = file_matches
+            .into_iter()
+            .map(|m| Candidate {
+                score: scorer.selection_score(&m),
+                m,
+            })
+            .collect();
+        let local: Vec<Candidate> = if scored.len() <= self.cap {
+            scored
+        } else {
+            let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(self.cap + 1);
+            for cand in scored {
+                if heap.len() < self.cap {
+                    heap.push(cand);
+                } else if heap.peek().is_some_and(|worst| cand < *worst) {
+                    // Peek before pushing so a doomed candidate is never sifted in and back out.
+                    heap.pop();
+                    heap.push(cand);
+                }
+            }
+            heap.into_vec()
+        };
 
         // One acquisition, bounded by `cap` rather than by the file's match count.
         let mut evicted: Vec<Candidate> = Vec::new();
@@ -170,7 +257,7 @@ impl BoundedRetain {
                 .heap
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for cand in local.into_vec() {
+            for cand in local {
                 if heap.len() < self.cap {
                     heap.push(cand);
                 } else if heap.peek().is_some_and(|worst| cand < *worst) {
@@ -192,6 +279,16 @@ impl BoundedRetain {
     /// Order is unspecified — `rank::sort` is a total order over these, so the caller's output
     /// does not depend on it. That independence is what the bound buys and is asserted in
     /// `rank`'s `sort_is_order_independent_for_matches_tied_on_path_and_line`.
+    /// Exact per-facet tallies over everything offered.
+    pub(crate) fn tallies(&self) -> ExactTallies {
+        ExactTallies {
+            definitions: self.t_defs.load(AtomicOrdering::Relaxed),
+            implementations: self.t_impls.load(AtomicOrdering::Relaxed),
+            tests: self.t_tests.load(AtomicOrdering::Relaxed),
+            usages: self.t_usages.load(AtomicOrdering::Relaxed),
+        }
+    }
+
     /// Exact number of matches offered, independent of the cap.
     pub(crate) fn offered(&self) -> usize {
         self.offered.load(AtomicOrdering::Relaxed)
@@ -199,11 +296,21 @@ impl BoundedRetain {
 
     /// The retained matches plus the exact offered count, so a caller cannot accidentally report
     /// `len()` as the total.
-    pub(crate) fn finish(self) -> (Vec<Match>, usize) {
-        let offered = self.offered();
-        (self.into_matches(), offered)
+    pub(crate) fn finish(self) -> (Vec<Match>, ExactTallies) {
+        let tallies = self.tallies();
+        debug_assert_eq!(
+            tallies.total(),
+            self.offered(),
+            "facet tallies must account for every offered match"
+        );
+        (self.into_matches(), tallies)
     }
 
+    /// Consume the sink and return the retained matches.
+    ///
+    /// Order is unspecified — `rank::sort` is a total order over these, so the caller's output does
+    /// not depend on it. That independence is what the bound buys, and it is asserted in `rank`'s
+    /// `sort_is_order_independent_for_matches_tied_on_path_and_line`.
     pub(crate) fn into_matches(self) -> Vec<Match> {
         self.heap
             .into_inner()
@@ -246,7 +353,7 @@ impl BoundedRetainSet {
     }
 
     /// Per-target retained matches paired with each target's exact offered count.
-    pub(crate) fn finish(self) -> Vec<(Vec<Match>, usize)> {
+    pub(crate) fn finish(self) -> Vec<(Vec<Match>, ExactTallies)> {
         self.buckets
             .into_iter()
             .map(BoundedRetain::finish)
@@ -274,6 +381,16 @@ mod tests {
             def_weight: 0,
             impl_target: None,
         }
+    }
+
+    /// Identity of a retained set, order-insensitive and covering every tie-break level.
+    fn key_of(v: Vec<Match>) -> Vec<(PathBuf, u32, Option<(u32, u32)>, String)> {
+        let mut k: Vec<_> = v
+            .into_iter()
+            .map(|x| (x.path, x.line, x.def_range, x.text))
+            .collect();
+        k.sort();
+        k
     }
 
     fn scorer<'a>(scope: &'a Path) -> Scorer<'a> {
@@ -364,49 +481,81 @@ mod tests {
         );
     }
 
-    /// When every candidate scores the same, the **tie-break direction** decides everything — and it
-    /// has to agree with `rank::sort`, which orders path and line ascending.
+    /// When candidates score the same, the **tie-break direction** decides everything, and it has to
+    /// agree with `rank::sort` at *every* level.
     ///
-    /// This is the test the first version of `Candidate::cmp` lacked. It inverted the tie-breaks
-    /// along with the score, so it evicted the *best* ties and kept the worst. Every other test here
-    /// passed, because they discriminate on score, where inverting is correct. The defect only
-    /// appeared as a changed response digest on a dense fixture where all scores are equal.
+    /// One mixed fixture does not establish this. The first version of `Candidate::cmp` inverted the
+    /// tie-breaks along with the score, keeping the worst ties instead of the best; the first version
+    /// of this test then pinned only `line`, and a mixed fixture pinned only `path` and `line` —
+    /// because a level is exercised only when the retention cut falls *between two candidates that
+    /// tie on every level above it*. Inverting `def_range` or `text` broke nothing.
     ///
-    /// Asserting against `rank::sort` on the same input rather than against hardcoded lines: the
-    /// property is "retention keeps what an unbounded search would have shown", so the reference
-    /// has to be the real ranker.
+    /// So each level gets its own fixture in which only that level varies, with a cap that cuts
+    /// through the middle of the tied run. Asserted against `rank::sort` on the same input, because
+    /// the property is "retention keeps what an unbounded search would have shown" — the reference has
+    /// to be the real ranker, not a hardcoded list.
     #[test]
-    fn among_equal_scores_retention_keeps_what_the_ranker_would_rank_first() {
+    fn among_equal_scores_every_tie_break_level_agrees_with_the_ranker() {
         let scope = Path::new(".");
-        // One file, many lines: identical everything except `line`, so scores are equal and only
-        // the tie-break separates them.
-        let all: Vec<Match> = (0..200).map(|i| m("src/same.rs", i)).collect();
 
-        let mut sc = scorer(scope);
-        let mut scores: Vec<i32> = all.iter().map(|x| sc.selection_score(x)).collect();
-        scores.dedup();
-        assert_eq!(
-            scores.len(),
-            1,
-            "fixture must have a single score for ties to be what is under test"
-        );
+        // Each entry varies exactly one level and holds the others fixed.
+        let fixtures: Vec<(&str, Vec<Match>)> = vec![
+            (
+                "path",
+                (0..12).map(|f| m(&format!("src/f{f:02}.rs"), 1)).collect(),
+            ),
+            ("line", (0..12).map(|l| m("src/one.rs", l)).collect()),
+            (
+                "def_range",
+                (0..12)
+                    .map(|i| {
+                        let mut x = m("src/one.rs", 1);
+                        x.def_range = Some((1, i));
+                        x
+                    })
+                    .collect(),
+            ),
+            (
+                "text",
+                (0..12)
+                    .map(|i| {
+                        let mut x = m("src/one.rs", 1);
+                        x.def_range = Some((1, 9));
+                        x.text = format!("variant {i:02}");
+                        x
+                    })
+                    .collect(),
+            ),
+        ];
 
-        let sink = BoundedRetain::new(5);
-        let mut sc = scorer(scope);
-        sink.offer_file(all.clone(), &mut sc);
-        let mut kept: Vec<u32> = sink.into_matches().into_iter().map(|k| k.line).collect();
-        kept.sort_unstable();
+        for (level, all) in fixtures {
+            let mut sc = scorer(scope);
+            let mut distinct: Vec<i32> = all.iter().map(|x| sc.selection_score(x)).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                1,
+                "{level} fixture does not hold score constant, so it cannot test a tie-break"
+            );
 
-        let mut reference = all;
-        crate::search::rank::sort(&mut reference, "hit", scope, None);
-        let mut want: Vec<u32> = reference.into_iter().take(5).map(|k| k.line).collect();
-        want.sort_unstable();
+            // Cuts through the middle of the tied run, so this level decides the boundary.
+            let cap = 5;
+            let sink = BoundedRetain::new(cap);
+            let mut sc = scorer(scope);
+            sink.offer_file(all.clone(), &mut sc);
+            let kept = key_of(sink.into_matches());
 
-        assert_eq!(
-            kept, want,
-            "retention kept different matches than the ranker would put first — the tie-break \
-             direction disagrees with `rank::sort`"
-        );
+            let mut reference = all;
+            crate::search::rank::sort(&mut reference, "hit", scope, None);
+            reference.truncate(cap);
+            let want = key_of(reference);
+
+            assert_eq!(
+                kept, want,
+                "retention disagrees with `rank::sort` when the `{level}` tie-break decides"
+            );
+        }
     }
 
     #[test]

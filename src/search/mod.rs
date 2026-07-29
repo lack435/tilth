@@ -1883,18 +1883,6 @@ mod tests {
         );
     }
 
-    /// When symbol retention clips, the header's arithmetic must still close — and it can only do
-    /// that by naming the clipped remainder.
-    ///
-    /// The facet totals are computed over the *retained* set, so once retention bites they cannot
-    /// sum to `total_found`. Reporting facets alone then produces a confidently wrong number: on a
-    /// 2.4M-match fixture the line read "Not shown: 19600 other usages", understating by two orders
-    /// of magnitude. The local/cross split of the clipped portion is unrecoverable — `facet_of`
-    /// needs a primary package derived from the full set — so the remainder is reported as its own
-    /// term instead of being folded into a facet it cannot be attributed to.
-    ///
-    /// Asserted on the sum rather than the exact string: the property is that every match is
-    /// accounted for somewhere in the line, not that a particular phrase appears.
     /// Matches in the retention fixture below, chosen to exceed `content::MAX_RETAINED` (500)
     /// by a wide margin — the bound is invisible below it.
     const RETENTION_SHALLOW_FILES: usize = 10;
@@ -1930,6 +1918,114 @@ mod tests {
             std::fs::write(deep_dir.join(format!("deep{f:03}.rs")), &body).unwrap();
         }
         (RETENTION_SHALLOW_FILES + RETENTION_DEEP_FILES + 1) * RETENTION_MATCHES_PER_FILE
+    }
+
+    /// Files needed to push symbol retention past `retain::MAX_RETAINED` (20_000).
+    const SYM_RETENTION_FILES: usize = 40;
+    const SYM_RETENTION_USAGES_PER_FILE: usize = 600;
+
+    /// One definition plus many usages per file, enough usages in total to clip.
+    ///
+    /// Returns `(definitions, usages)` as ground truth. Every usage is on its own line and none
+    /// shares a line with the definition, so the def/usage dedup removes nothing and the true
+    /// post-dedup total is simply the sum.
+    fn write_symbol_retention_fixture(root: &Path) -> (usize, usize) {
+        for f in 0..SYM_RETENTION_FILES {
+            let mut body = String::from(
+                "pub fn sym_target() -> u32 { 0 }
+",
+            );
+            for i in 0..SYM_RETENTION_USAGES_PER_FILE {
+                let _ = writeln!(body, "    let v{i} = sym_target();");
+            }
+            std::fs::write(root.join(format!("s{f:03}.rs")), &body).unwrap();
+        }
+        (
+            SYM_RETENTION_FILES,
+            SYM_RETENTION_FILES * SYM_RETENTION_USAGES_PER_FILE,
+        )
+    }
+
+    /// The symbol half of #19: bounding retention must not make the reported counts approximate,
+    /// and the header's arithmetic must still close once it clips.
+    ///
+    /// This test exists because its absence was invisible. Reverting `assemble` to derive totals
+    /// from the retained set — the exact defect the bound introduced — broke **no test**, and so
+    /// did forcing the renderer's remainder term to zero. The `unattributed_remainder` unit tests
+    /// cannot catch either: they hand-build `FacetTotals` and only exercise six lines of
+    /// arithmetic. Nothing drove `symbol::search` past the cap. `content.rs`'s half of the same
+    /// work has had this test since #30.
+    #[test]
+    fn symbol_counts_stay_exact_totals_past_the_retention_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (defs, usages) = write_symbol_retention_fixture(dir.path());
+        assert!(
+            usages > crate::search::retain::MAX_RETAINED,
+            "fixture must exceed MAX_RETAINED or the bound is untested ({usages})"
+        );
+
+        let cache = OutlineCache::new();
+        let result = symbol::search("sym_target", dir.path(), None, None, false).unwrap();
+
+        assert_eq!(
+            result.definitions, defs,
+            "definitions must be the true count, not what retention kept"
+        );
+        assert_eq!(
+            result.total_found,
+            defs + usages,
+            "total_found must be the true post-dedup total, not the retained count"
+        );
+        assert_eq!(result.usages, usages, "usages must be the true count");
+
+        // The retained set really is bounded — otherwise the assertions above would pass for the
+        // trivial reason that nothing was dropped.
+        assert!(
+            result.matches.len() <= crate::search::retain::MAX_RETAINED,
+            "retention did not bound the set ({})",
+            result.matches.len()
+        );
+
+        // Facets plus the unattributed remainder must account for every match. This is what keeps
+        // the rendered header from contradicting its own body.
+        let remainder =
+            crate::search::facets::unattributed_remainder(result.total_found, &result.facet_totals);
+        let facet_sum = result.facet_totals.definitions
+            + result.facet_totals.implementations
+            + result.facet_totals.tests
+            + result.facet_totals.usages_local
+            + result.facet_totals.usages_cross;
+        assert_eq!(
+            facet_sum + remainder,
+            result.total_found,
+            "facets ({facet_sum}) + remainder ({remainder}) != total_found ({})",
+            result.total_found
+        );
+        assert!(
+            remainder > 0,
+            "fixture did not clip, so the remainder path is untested"
+        );
+
+        // And the renderer must actually report the remainder. Two separate assertions, because they
+        // fail to different mutations: the arithmetic above catches totals derived from the retained
+        // set, and this catches the renderer dropping the remainder term — a one-line change that
+        // `unattributed_remainder`'s own unit tests cannot see, since they call it directly.
+        //
+        // Not summing every number in the output: a partially-shown facet reports its hidden count
+        // in its section heading (`Definitions (10/40)`), not in the "Not shown" line, so a naive
+        // sum under-counts. The remainder term is the specific thing this change added.
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let out = format_search_result(&result, &cache, None, &bloom, 0, None).unwrap();
+        assert!(
+            out.contains(&format!("{remainder} beyond the retention limit")),
+            "renderer did not report the {remainder} matches no facet accounts for,              so the header total is contradicted by its body:
+{out}"
+        );
+        assert!(
+            out.contains(&format!("{} matches", result.total_found)),
+            "rendered header lost the true total:
+{out}"
+        );
     }
 
     /// Bounding retention must not make the reported counts approximate.

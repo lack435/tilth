@@ -696,13 +696,28 @@ mod tests {
         };
         let (scope, query) = (Path::new("."), "overload");
 
-        let mut forward = vec![mk((1, 4)), mk((1, 9))];
-        let mut reverse = vec![mk((1, 9)), mk((1, 4))];
+        // `text` is the last level, so it needs a pair of its own: identical in every other field,
+        // differing only in the matched line. Without such a pair, deleting `text` from the key
+        // breaks no test and the order silently stops being total again.
+        let mk_text = |t: &str| {
+            let mut m = make_match("src/a.rs", t, true, Some("overload"));
+            m.def_range = Some((2, 6));
+            m
+        };
+
+        let mut forward = vec![
+            mk((1, 4)),
+            mk((1, 9)),
+            mk_text("fn overload(a: i32);"),
+            mk_text("fn overload(b: i32);"),
+        ];
+        let mut reverse: Vec<Match> = forward.iter().rev().cloned().collect();
         sort(&mut forward, query, scope, None);
         sort(&mut reverse, query, scope, None);
 
-        let key =
-            |v: &[Match]| -> Vec<Option<(u32, u32)>> { v.iter().map(|m| m.def_range).collect() };
+        let key = |v: &[Match]| -> Vec<(Option<(u32, u32)>, String)> {
+            v.iter().map(|m| (m.def_range, m.text.clone())).collect()
+        };
         assert_eq!(
             key(&forward),
             key(&reverse),
