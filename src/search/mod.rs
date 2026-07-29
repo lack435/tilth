@@ -1544,11 +1544,16 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 
 /// Format glob search results (file list with previews).
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
+    // The true total, not `files.len()`. That was the display cap, so a directory with
+    // 3000 matches and one with 20 both headed "20 files" — the same defect fixed on the
+    // search header. Milder here because a "... and N more files" tail follows, so the
+    // total was at least recoverable; the header line itself was still a clamped number
+    // presented as a count.
     let header = format!(
         "# Glob: \"{}\" in {} — {} files",
         result.pattern,
         scope.display(),
-        result.files.len()
+        result.total_found
     );
 
     let mut out = header;
@@ -1784,6 +1789,122 @@ mod tests {
             out.contains("Not shown: 7 tests"),
             "a facet with 7 matches and no display slots vanished from the body, leaving \
              the header's total unaccounted for:\n{out}"
+        );
+    }
+
+    /// Files in the glob fixture below: 10 directories of 40 files, all matching.
+    ///
+    /// `MAX_FILES` is 20, so a fixture of 25 files would be "past the cap" — and would
+    /// still pass with the racy `if locked.len() < MAX_FILES` reintroduced, because the
+    /// walk's threads can consume 25 entries before the race is observable. Same trap as
+    /// `DETERMINISM_FIXTURE_FILES` in `callers.rs`. 400 files across 10 directories also
+    /// makes walk order differ sharply from sorted order: the correct answer is entirely
+    /// inside `d0`, so any thread-order dependence shows up as files from other
+    /// directories rather than as a subtle reshuffle.
+    const GLOB_FIXTURE_DIRS: usize = 10;
+    const GLOB_FIXTURE_FILES_PER_DIR: usize = 40;
+
+    /// Write the glob fixture and return the relative paths of the `MAX_FILES` entries a
+    /// correct implementation must return, in the order it must return them.
+    fn write_glob_fixture(dir: &Path) -> Vec<String> {
+        for d in 0..GLOB_FIXTURE_DIRS {
+            let sub = dir.join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..GLOB_FIXTURE_FILES_PER_DIR {
+                // Zero-padded so lexicographic order matches numeric order.
+                std::fs::write(sub.join(format!("f{f:03}.txt")), "x\n").unwrap();
+            }
+        }
+        // Sorted by path, the first 20 are all in `d0`.
+        (0..20).map(|f| format!("d0/f{f:03}.txt")).collect()
+    }
+
+    /// `tilth_files` must return the same files, in the same order, every time.
+    ///
+    /// It used to keep whichever entries won a race inside the parallel walk and render
+    /// them unsorted, so it was non-deterministic in both membership *and* order: five
+    /// identical runs of `*.h` over one module of a 176k-file C++ tree gave five distinct
+    /// outputs. There is no ranking step on this path, so nothing recovered either.
+    #[test]
+    fn glob_output_is_byte_identical_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_glob_fixture(dir.path());
+
+        let runs: Vec<String> = (0..6)
+            .map(|_| search_glob("*.txt", dir.path()).unwrap())
+            .collect();
+
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "glob rendered {} distinct outputs in 6 identical runs",
+            runs.iter().collect::<HashSet<_>>().len()
+        );
+    }
+
+    /// Stronger than "stable": the surviving subset must be the alphabetically first
+    /// `MAX_FILES`, in order. Stability alone could be satisfied by a consistently wrong
+    /// selection; this pins *which* files, so a racy cap fails outright rather than
+    /// occasionally.
+    #[test]
+    fn glob_returns_the_alphabetically_first_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = write_glob_fixture(dir.path());
+
+        let result = glob::search("*.txt", dir.path()).unwrap();
+
+        let got: Vec<String> = result
+            .files
+            .iter()
+            // Normalise separators so the expectation is one string on every platform.
+            .map(|f| rel(&f.path, dir.path()).replace('\\', "/"))
+            .collect();
+
+        assert_eq!(
+            got, expected,
+            "glob must return the sorted-first MAX_FILES entries in order"
+        );
+        assert_eq!(
+            result.total_found,
+            GLOB_FIXTURE_DIRS * GLOB_FIXTURE_FILES_PER_DIR,
+            "total_found must be the true match count, not the display cap"
+        );
+    }
+
+    /// The header must state how many files matched, not how many were rendered.
+    #[test]
+    fn glob_header_reports_the_true_total_not_the_display_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        write_glob_fixture(dir.path());
+        let total = GLOB_FIXTURE_DIRS * GLOB_FIXTURE_FILES_PER_DIR;
+
+        let out = search_glob("*.txt", dir.path()).unwrap();
+        let header = out.lines().next().unwrap_or_default();
+
+        // Parse the count rather than substring-matching it. `contains("20 files")` would
+        // also be satisfied by "420 files", and `!contains("0 files")` is satisfied by
+        // nothing at all once the total ends in a zero — both traps hit while writing this.
+        let reported: usize = header
+            .rsplit_once("— ")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse a count from header: {header}"));
+
+        // Entries are indented two spaces; separators are platform-dependent, so don't
+        // match on them.
+        let shown = out.lines().filter(|l| l.starts_with("  ")).count();
+
+        assert_eq!(
+            reported, total,
+            "header must report the true total, got: {header}"
+        );
+        assert!(
+            shown < total,
+            "fixture must exceed the display cap for this to test anything \
+             (shown {shown}, total {total})"
+        );
+        assert_ne!(
+            reported, shown,
+            "header must not report the rendered entry count as the total: {header}"
         );
     }
 
