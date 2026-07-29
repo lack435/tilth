@@ -105,9 +105,11 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
 
 ## Version bumps
 
-Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main.
+Update version in **three** places: `Cargo.toml`, `npm/package.json`, and `Cargo.lock` (via `cargo update --workspace`, which relocks only `tilth` itself). Then tag `v<version>` on main. The release workflow builds with `--locked`, which refuses a lockfile whose recorded version disagrees with the manifest — forget `Cargo.lock` and all five build jobs fail. Verify with `cargo build --release --locked` before tagging.
 
 Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both names have an OIDC trusted publisher on npmjs.com (`jahala/tilth` + `release.yml`), so releases need no token. `@plotplot/tilth` was bootstrapped with a one-time manual publish — npm cannot configure trusted publishing for a package that does not exist yet.
+
+**In a fork, nothing is published.** `publish-npm` and `publish-crate` are both gated on `if: github.repository == 'jahala/tilth'`, because neither the npm names nor the crate belong to a fork. Tagging in a fork runs `version-check` and the five `build` jobs, attaches the platform archives to a GitHub release, and skips both publish jobs — the run still reports success, so read the job list rather than the overall conclusion if you need to know whether a publish happened.
 
 ## Benchmarks
 
