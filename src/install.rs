@@ -116,7 +116,13 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let mut config: Value = if host_info.path.exists() {
         let raw = fs::read_to_string(&host_info.path)
             .map_err(|e| format!("failed to read {}: {e}", host_info.path.display()))?;
-        serde_json::from_str(&raw)
+        // A BOM'd host config is valid JSON that `serde_json` refuses, so without this the
+        // install aborted with "invalid JSON in <path>" — a wrong claim about the user's
+        // file, and a hard failure rather than a degraded one. These configs are hand-edited
+        // and most live under `%APPDATA%`, which is where BOMs come from in the first place.
+        // The file is fully reserialized by `to_string_pretty` below either way, so dropping
+        // the BOM on write is consistent with what already happens to its formatting.
+        serde_json::from_str(crate::lang::outline::strip_bom(&raw))
             .map_err(|e| format!("invalid JSON in {}: {e}", host_info.path.display()))?
     } else {
         json!({})
@@ -156,7 +162,19 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         String::new()
     };
 
-    let output = upsert_toml_section(&existing, "[mcp_servers.tilth]", &section);
+    // The BOM has to come off *before* the splice, and this path gets no help from the
+    // `toml` crate — it never parses, it string-matches. `find_section_start` anchors on
+    // `text.starts_with(header)`, which a leading BOM defeats, so an existing
+    // `[mcp_servers.tilth]` at the top of the file was invisible and the upsert fell
+    // through to its append branch: a second copy of the table, and a config that `toml`
+    // then rejects with "duplicate key". Worse than the JSON bug next door, which at
+    // least aborted and left the file alone. It also never self-heals — the next run
+    // finds `\n[mcp_servers.tilth]` and stops at two.
+    let output = upsert_toml_section(
+        crate::lang::outline::strip_bom(&existing),
+        "[mcp_servers.tilth]",
+        &section,
+    );
 
     atomic_write(&host_info.path, &output)?;
     Ok(())
@@ -588,6 +606,92 @@ mod tests {
     use super::*;
 
     const TILTH_HEADER: &str = "[mcp_servers.tilth]";
+
+    /// The TOML sibling of the JSON bug, and strictly worse: it corrupts instead of
+    /// aborting. This path never calls the `toml` crate — so "the `toml` crate strips a BOM
+    /// itself" buys it nothing — it string-matches. `find_section_start` anchors on
+    /// `text.starts_with(header)`, a leading BOM defeats that, and the upsert falls through
+    /// to its append branch and writes a *second* `[mcp_servers.tilth]`.
+    ///
+    /// Scenario: `tilth install codex` writes the table at the top of `~/.codex/config.toml`;
+    /// the user re-saves that file from an editor configured for UTF-8-with-BOM; the next
+    /// install duplicates the table and leaves the config permanently unparseable. It never
+    /// self-heals either — the next run matches `\n[mcp_servers.tilth]` and stops at two.
+    #[test]
+    fn bom_toml_config_is_updated_in_place_not_duplicated() {
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        // The tilth table first in the file, which is the only position a BOM can affect —
+        // and the position `tilth install` itself produces on a fresh config.
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = []\n\n[other]\nk = 1\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(existing.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let host = HostInfo {
+            path: path.clone(),
+            format: ConfigFormat::Toml,
+            note: None,
+        };
+        write_toml_config(&host, false).expect("writing a BOM'd TOML config must succeed");
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            out.matches("[mcp_servers.tilth]").count(),
+            1,
+            "the table was duplicated instead of replaced: {out}"
+        );
+        // The duplicate is only visible as breakage once something parses the result, which
+        // is what the *host* does and this code never did. Assert on that directly.
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("install produced an unparseable config ({e}): {out}"));
+        assert!(!out.contains("\"old\""), "stale command survived: {out}");
+        assert!(out.contains("[other]"), "unrelated table was lost: {out}");
+    }
+
+    /// A BOM'd host config is *valid JSON* that `serde_json` refuses, so the install used
+    /// to abort with `invalid JSON in <path>` — a wrong claim about the user's file, and a
+    /// hard failure rather than a degraded one. These configs are hand-edited and most sit
+    /// under `%APPDATA%`, which is where BOMs come from in the first place.
+    ///
+    /// Driven through `write_json_config` rather than the parse in isolation, because the
+    /// failure was the install aborting; asserting only that a BOM'd string deserializes
+    /// would pass with the fix reverted from that call site.
+    #[test]
+    fn bom_host_config_is_not_rejected_as_invalid_json() {
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        let existing = "{\"mcpServers\":{\"other\":{\"command\":\"keepme\"}}}";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let mut bytes = UTF8_BOM.to_vec();
+        bytes.extend_from_slice(existing.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let host = HostInfo {
+            path: path.clone(),
+            format: ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+            note: None,
+        };
+        write_json_config(&host, false).expect("a BOM'd host config must not abort the install");
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !out.starts_with('\u{feff}'),
+            "the BOM survived the rewrite, so the next run would fail again: {out:?}"
+        );
+        // The pre-existing server has to survive: a fix that discarded the unparsed file
+        // and started from `{}` would also "succeed" here.
+        assert!(
+            out.contains("keepme"),
+            "the existing server entry was dropped: {out}"
+        );
+        assert!(out.contains("tilth"), "tilth was not added: {out}");
+    }
 
     #[test]
     fn toml_section_appended_when_absent() {
