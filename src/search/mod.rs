@@ -1804,9 +1804,19 @@ mod tests {
     const GLOB_FIXTURE_DIRS: usize = 10;
     const GLOB_FIXTURE_FILES_PER_DIR: usize = 40;
 
-    /// Write the glob fixture and return the relative paths of the `MAX_FILES` entries a
-    /// correct implementation must return, in the order it must return them.
+    /// `glob::MAX_FILES`, duplicated because it is private to that module. If it changes,
+    /// the tests below fail on a length mismatch — this comment is the hint as to why.
+    /// Above `GLOB_FIXTURE_FILES_PER_DIR` the expectation would have to span `d1` too, so
+    /// `write_glob_fixture` would need widening rather than just retuning.
+    const GLOB_EXPECTED_SHOWN: usize = 20;
+
+    /// Write the glob fixture and return the relative paths a correct implementation must
+    /// return, in the order it must return them.
     fn write_glob_fixture(dir: &Path) -> Vec<String> {
+        assert!(
+            GLOB_EXPECTED_SHOWN <= GLOB_FIXTURE_FILES_PER_DIR,
+            "expectation assumes the whole displayed page fits in d0"
+        );
         for d in 0..GLOB_FIXTURE_DIRS {
             let sub = dir.join(format!("d{d}"));
             std::fs::create_dir_all(&sub).unwrap();
@@ -1815,8 +1825,10 @@ mod tests {
                 std::fs::write(sub.join(format!("f{f:03}.txt")), "x\n").unwrap();
             }
         }
-        // Sorted by path, the first 20 are all in `d0`.
-        (0..20).map(|f| format!("d0/f{f:03}.txt")).collect()
+        // Sorted by path, the whole displayed page is inside `d0`.
+        (0..GLOB_EXPECTED_SHOWN)
+            .map(|f| format!("d0/f{f:03}.txt"))
+            .collect()
     }
 
     /// `tilth_files` must return the same files, in the same order, every time.
