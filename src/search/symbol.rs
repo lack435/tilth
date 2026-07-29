@@ -83,10 +83,10 @@ const FULL_MAX_MATCHES: usize = 100;
 //
 // Two costs this shifts onto neighbouring code, both measured:
 //
-//  * Multi-symbol (comma) queries run one `search` per target, so they multiply the
-//    above. A 5-target query on that tree went 22.1s -> 38.2s. It fits in the timeout,
-//    but it is the symbol-path twin of the 1+N second-hop walks in `callers.rs` and
-//    wants the same fix — one walk over the union of targets, partitioned afterwards.
+//  * Multi-symbol (comma) queries ran one `search` per target, so they multiplied the
+//    above: a 5-target query on that tree went 22.1s -> 38.2s. Fixed since — `search_multi`
+//    now walks once for every target and partitions afterwards. See its own note for the
+//    measurement.
 //  * Peak RSS at this scale is dominated by `BloomFilterCache`, which holds one filter
 //    per code file walked and is unbounded. Tracked separately.
 
@@ -174,9 +174,23 @@ pub fn search(
         || find_usages(query, &matcher, scope, glob),
     );
 
-    let defs = defs?;
-    let mut usages = usages?;
+    Ok(assemble(query, scope, context, defs?, usages?, max_matches))
+}
 
+/// Turn one query's raw definition and usage matches into its `SearchResult`.
+///
+/// Everything `search` does after its two walks, and the *only* place it is done —
+/// `search_multi` runs one pair of walks for several queries and then calls this per
+/// query, so a batched query's result is identical to a lone `search`'s by construction
+/// rather than by two implementations agreeing.
+fn assemble(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    defs: Vec<Match>,
+    mut usages: Vec<Match>,
+    max_matches: usize,
+) -> SearchResult {
     // Deduplicate: remove usage matches that overlap with definition matches.
     //
     // This was a nested scan, quadratic in (definitions × usages). That was free while
@@ -216,7 +230,7 @@ pub fn search(
 
     merged.truncate(max_matches);
 
-    Ok(SearchResult {
+    SearchResult {
         query: query.to_string(),
         scope: scope.to_path_buf(),
         matches: merged,
@@ -224,7 +238,125 @@ pub fn search(
         definitions: def_count,
         usages: usage_count,
         facet_totals: totals,
-    })
+    }
+}
+
+/// Multi-symbol search: **one pair of walks for every query**, not one pair each.
+///
+/// `search_multi_symbol_expanded` used to call `search` once per comma-separated target.
+/// Each of those is two full traversals joined by `rayon::join`, so a 5-target query was
+/// ten. That was cheap while both walks quit on a shared match counter; #18 removed those
+/// cutoffs — for correctness, since they made results vary run to run — and the per-target
+/// cost then multiplied.
+///
+/// Measured over MCP `tilth_search`, `expand: 0`, five hot symbols on a large C++ tree
+/// (~444k files), three reps each, warm:
+///
+///   ten walks (one `search` per target)   69.8-70.4s
+///   two walks (this)                      29.2-29.8s
+///
+/// Rendered output is byte-identical across the two, verified on that tree for this query
+/// and for the `callers` equivalent — the walk count changed, nothing else.
+///
+/// Both walks are keyed on a single needle in the single-query path — `memmem` on the
+/// query, and a compiled `\bquery\b`. Batching means a multi-needle prefilter and
+/// attributing every hit back to the query that produced it, which is what
+/// `find_definitions_multi` and `find_usages_multi` do. `assemble` then produces each
+/// query's `SearchResult` from its own bucket, so per-query totals, facets and ranking are
+/// computed over that query's matches alone — computing them once over the union would
+/// make every `shown/total` label wrong.
+///
+/// Results are returned one per *input* query, in order, duplicates included: `"foo,foo"`
+/// renders two identical sections today and this is not the change that alters that.
+pub fn search_multi(
+    queries: &[&str],
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<Vec<SearchResult>, TilthError> {
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+
+    // Walk for distinct needles only. Two identical queries would otherwise have their
+    // matches counted twice into one bucket.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let unique: Vec<&str> = queries
+        .iter()
+        .copied()
+        .filter(|q| seen.insert(*q))
+        .collect();
+
+    // One matcher per query — the same `\bquery\b` the single-query path compiles, not an
+    // alternation over all of them.
+    //
+    // An alternation would scan each file once instead of once per query, but it then needs
+    // to attribute each matched line back to a query, and `\b` here is a *Unicode* word
+    // boundary. Re-deriving that by hand is where a batched path silently stops agreeing
+    // with the single-query one. What actually costs is the walk — the directory traversal
+    // and the file reads — so this shares those and repeats only the in-memory regex scan,
+    // which makes each bucket identical to `find_usages`' output by construction.
+    let matchers: Vec<RegexMatcher> = unique
+        .iter()
+        .map(|q| RegexMatcher::new(&format!(r"\b{}\b", regex_syntax::escape(q))))
+        .collect::<Result<_, _>>()
+        .map_err(|e| TilthError::InvalidQuery {
+            query: queries.join(","),
+            reason: e.to_string(),
+        })?;
+
+    let (defs, usages) = rayon::join(
+        || find_definitions_multi(&unique, scope, glob),
+        || find_usages_multi(&unique, &matchers, scope, glob),
+    );
+    let mut defs = defs?;
+    let mut usages = usages?;
+
+    // Assemble per unique query, then hand results back in input order.
+    let mut by_query: Vec<Option<SearchResult>> = unique
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            Some(assemble(
+                q,
+                scope,
+                context,
+                std::mem::take(&mut defs[i]),
+                std::mem::take(&mut usages[i]),
+                max_matches,
+            ))
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(queries.len());
+    for (pos, q) in queries.iter().enumerate() {
+        let i = unique
+            .iter()
+            .position(|u| u == q)
+            .expect("unique covers every query");
+        // Move on the last occurrence, clone before it. Only a repeated query pays a clone.
+        if queries[pos + 1..].contains(q) {
+            out.push(clone_result(
+                by_query[i].as_ref().expect("present before its last use"),
+            ));
+        } else {
+            out.push(by_query[i].take().expect("moved exactly once"));
+        }
+    }
+    Ok(out)
+}
+
+/// `SearchResult` is not `Clone` — it is a large owned bundle and nothing else needs to
+/// copy one. A repeated query in a comma list does, and only that.
+fn clone_result(r: &SearchResult) -> SearchResult {
+    SearchResult {
+        query: r.query.clone(),
+        scope: r.scope.clone(),
+        matches: r.matches.clone(),
+        total_found: r.total_found,
+        definitions: r.definitions,
+        usages: r.usages,
+        facet_totals: r.facet_totals,
+    }
 }
 
 /// Find definitions using tree-sitter structural detection.
@@ -366,6 +498,279 @@ fn find_definitions(
         .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
+/// `find_definitions` for several queries in one walk.
+///
+/// Returns one bucket per query, positionally. Each bucket holds exactly the matches the
+/// single-query walk would have produced for that query, because every per-query step is
+/// the same code applied per query: the `memmem` needle check, `defs_from_tree`, and the
+/// fallbacks. What is shared is the per-*file* work — the read, the size and minified
+/// gates, the metadata, and the tree-sitter parse — which is where the cost is.
+///
+/// The determinism invariant at the top of this file still holds per bucket: one lock
+/// acquisition per file appends every query's block for that file, so each bucket receives
+/// contiguous per-file blocks and threads can still only interleave whole files.
+fn find_definitions_multi(
+    queries: &[&str],
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<Vec<Vec<Match>>, TilthError> {
+    let matches: Mutex<Vec<Vec<Match>>> = Mutex::new(vec![Vec::new(); queries.len()]);
+    let needles: Vec<&[u8]> = queries.iter().map(|q| q.as_bytes()).collect();
+
+    let walker = super::walker(scope, glob)?;
+
+    walker.run(|| {
+        let matches = &matches;
+        let needles = &needles;
+
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+
+            let path = entry.path();
+
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
+            }
+
+            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
+
+            let Ok(content) = fs::read_to_string(path) else {
+                return ignore::WalkState::Continue;
+            };
+
+            // Which queries this file could define. A file none of them mention is skipped
+            // exactly as the single-query walk skips it for each of them individually.
+            let present: Vec<usize> = (0..queries.len())
+                .filter(|&i| memchr::memmem::find(content.as_bytes(), needles[i]).is_some())
+                .collect();
+            if present.is_empty() {
+                return ignore::WalkState::Continue;
+            }
+
+            // Catch unmarked minified bundles that slipped past the filename check.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(content.as_bytes())
+            {
+                return ignore::WalkState::Continue;
+            }
+
+            let (file_lines, mtime) = file_metadata(path);
+
+            let file_type = detect_file_type(path);
+            let lang = match file_type {
+                FileType::Code(l) => Some(l),
+                _ => None,
+            };
+            let ts_language = lang.and_then(outline_language);
+
+            // Parse once for the whole file, then walk it once per present query. The
+            // parse is the expensive half and does not depend on the query, which is the
+            // entire saving over calling `search` per target.
+            let tree = ts_language
+                .as_ref()
+                .and_then(|ts_lang| parse_tree(ts_lang, &content));
+            let lines: Vec<&str> = content.lines().collect();
+
+            let mut per_query: Vec<(usize, Vec<Match>)> = Vec::new();
+            for &i in &present {
+                let mut file_defs = match &tree {
+                    Some(tree) => {
+                        defs_from_tree(path, queries[i], tree, lang, &lines, file_lines, mtime)
+                    }
+                    None => Vec::new(),
+                };
+
+                // Same per-file-type fallback dispatch as the single-query walk; see the
+                // long comment there for why each file kind is handled the way it is.
+                if file_defs.is_empty() && ts_language.is_none() {
+                    file_defs = match file_type {
+                        FileType::Code(_) => {
+                            find_defs_heuristic_buf(path, queries[i], &content, file_lines, mtime)
+                        }
+                        FileType::Markdown => {
+                            find_defs_markdown_buf(path, queries[i], &content, file_lines, mtime)
+                        }
+                        _ => Vec::new(),
+                    };
+                }
+
+                if !file_defs.is_empty() {
+                    per_query.push((i, file_defs));
+                }
+            }
+
+            if !per_query.is_empty() {
+                let mut all = matches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // One lock for the whole file across every query — see the determinism
+                // note at the top of this file. Each bucket still receives this file's
+                // matches as one contiguous block.
+                for (i, file_defs) in per_query {
+                    all[i].extend(file_defs);
+                }
+            }
+
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(matches
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// `find_usages` for several queries in one walk.
+///
+/// Shares the walk, the size and minified gates, and the file read; runs each query's own
+/// matcher over the shared bytes. That is the same `search_slice` call on the same input
+/// the single-query walk makes, so bucket `i` is exactly `find_usages(queries[i], ...)`.
+fn find_usages_multi(
+    queries: &[&str],
+    matchers: &[RegexMatcher],
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<Vec<Vec<Match>>, TilthError> {
+    let matches: Mutex<Vec<Vec<Match>>> = Mutex::new(vec![Vec::new(); queries.len()]);
+
+    let walker = super::walker(scope, glob)?;
+
+    walker.run(|| {
+        let matches = &matches;
+
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+
+            let path = entry.path();
+
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
+            }
+
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
+
+            let Ok(bytes) = std::fs::read(path) else {
+                return ignore::WalkState::Continue;
+            };
+
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(&bytes)
+            {
+                return ignore::WalkState::Continue;
+            }
+
+            // No needle prefilter here, deliberately.
+            //
+            // The obvious optimisation — skip query `i` unless `memmem` finds the literal
+            // in `bytes` — is **wrong on this path**. `Searcher` BOM-sniffs and transcodes,
+            // so a UTF-16 file matches `\balpha\b` while its raw bytes contain no ASCII
+            // `alpha` at all. The gate silently dropped every match in every encoded file;
+            // `an_encoded_file_contributes_to_every_batched_query` is that bug.
+            //
+            // `find_definitions_multi` *can* gate, and does: it reads through
+            // `fs::read_to_string`, which fails outright on UTF-16, so the file never
+            // reaches the needle check there and the gate tests the same UTF-8 content the
+            // single-query walk tests.
+            let (file_lines, mtime) = file_metadata(path);
+
+            let mut file_matches: Vec<Vec<Match>> = vec![Vec::new(); queries.len()];
+
+            for i in 0..queries.len() {
+                let query = queries[i];
+                let bucket = &mut file_matches[i];
+                // A fresh `Searcher` per query, not one reused across them.
+                //
+                // `Searcher` owns a decoder for BOM-sniffed transcoding, and that decoder
+                // carries state between `search_slice` calls. Reusing one searcher made the
+                // second and later queries under-report on encoded files: measured on a
+                // large C++ tree, a two-target query returned 20077 usages for a symbol that
+                // a lone search reported 20095 of — 18 lines, from the handful of UTF-16
+                // files in the tree, silently missing.
+                //
+                // The single-query walk builds one searcher per file, so building one per
+                // (file, query) is what makes the batched buckets identical to it. It is
+                // also the cheap half: the walk and the read are shared, which is the point.
+                let mut searcher = Searcher::new();
+                let _ = searcher.search_slice(
+                    &matchers[i],
+                    &bytes,
+                    UTF8(|line_num, line| {
+                        bucket.push(Match {
+                            path: path.to_path_buf(),
+                            line: line_num as u32,
+                            text: line.trim_end().to_string(),
+                            is_definition: false,
+                            exact: line.contains(query),
+                            file_lines,
+                            mtime,
+                            def_range: None,
+                            def_name: None,
+                            def_weight: 0,
+                            impl_target: None,
+                        });
+                        Ok(true)
+                    }),
+                );
+            }
+
+            if file_matches.iter().any(|v| !v.is_empty()) {
+                let mut all = matches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // One lock, one contiguous block per file per bucket — see the determinism
+                // note at the top of this file.
+                for (i, v) in file_matches.into_iter().enumerate() {
+                    all[i].extend(v);
+                }
+            }
+
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(matches
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
 /// Tree-sitter structural definition detection.
 /// Accepts pre-read content — no redundant file read.
 fn find_defs_treesitter(
@@ -377,25 +782,52 @@ fn find_defs_treesitter(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = parse_tree(ts_lang, content) else {
         return Vec::new();
     };
-
     let lines: Vec<&str> = content.lines().collect();
-    let root = tree.root_node();
+    defs_from_tree(path, query, &tree, lang, &lines, file_lines, mtime)
+}
+
+/// Parse `content`, or `None` if the grammar or the parse fails.
+///
+/// Split out so `find_definitions_multi` can parse a file once and walk the resulting
+/// tree per query — parsing is the expensive half, and it does not depend on the query.
+fn parse_tree(ts_lang: &tree_sitter::Language, content: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(ts_lang).is_err() {
+        return None;
+    }
+    parser.parse(content, None)
+}
+
+/// One query's definitions from an already-parsed tree.
+///
+/// The per-query half of definition detection, unchanged from what it always did. Both the
+/// single-query and batched paths call this, so a batched query's definitions are the same
+/// matches in the same within-file order.
+fn defs_from_tree(
+    path: &Path,
+    query: &str,
+    tree: &tree_sitter::Tree,
+    lang: Option<crate::types::Lang>,
+    lines: &[&str],
+    file_lines: u32,
+    mtime: SystemTime,
+) -> Vec<Match> {
     let mut defs = Vec::new();
-
     walk_for_definitions(
-        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
+        tree.root_node(),
+        query,
+        path,
+        lines,
+        file_lines,
+        mtime,
+        &mut defs,
+        lang,
+        0,
     );
-
     dedupe_same_span_definitions(&mut defs);
-
     defs
 }
 
@@ -1855,5 +2287,237 @@ using MyAlias = float;
             result_default.total_found, result_full.total_found,
             "total_found must be the same regardless of full flag"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-symbol batching (#21)
+    // -----------------------------------------------------------------------
+
+    /// A tree that exercises every branch `find_definitions_multi` shares per file:
+    /// tree-sitter definitions, the markdown heading fallback, the keyword heuristic for a
+    /// code file with no grammar, a file naming two targets at once, and usages spread
+    /// across files so ranking has something to order.
+    fn write_multi_symbol_fixture(root: &Path) -> Vec<&'static str> {
+        std::fs::write(
+            root.join("core.rs"),
+            "pub struct Alpha;\npub fn beta() {}\npub fn gamma() { beta(); }\n",
+        )
+        .unwrap();
+        // One file naming two targets, so the shared parse serves more than one query.
+        std::fs::write(
+            root.join("both.rs"),
+            "use crate::core::Alpha;\npub fn uses_both() {\n    let _a = Alpha;\n    beta();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("more.rs"),
+            "pub fn delta() { gamma(); beta(); }\npub struct Epsilon;\n",
+        )
+        .unwrap();
+        // Markdown heading definition + prose usages.
+        std::fs::write(
+            root.join("README.md"),
+            "# Alpha\n\nAlpha is a thing. beta too.\n\n## beta\n\nAbout beta.\n",
+        )
+        .unwrap();
+        // A code file with no tree-sitter grammar, so the keyword heuristic runs.
+        std::fs::write(
+            root.join("Makefile"),
+            "delta:\n\techo beta\n\nEpsilon = 1\n",
+        )
+        .unwrap();
+        vec!["Alpha", "beta", "gamma", "delta", "Epsilon"]
+    }
+
+    /// Everything about a `SearchResult` that reaches the renderer, as a comparable string.
+    fn render_result(r: &SearchResult) -> String {
+        format!(
+            "query={} total={} defs={} usages={} facets={:?}\nmatches={:#?}",
+            r.query, r.total_found, r.definitions, r.usages, r.facet_totals, r.matches
+        )
+    }
+
+    /// A batched 5-symbol result must equal five separate searches, field for field.
+    ///
+    /// This is the acceptance criterion for #21 and the one thing the batching can quietly
+    /// break: the sections must not change, only how many walks produce them. Comparing
+    /// against `search` rather than a golden string means it keeps checking the real
+    /// invariant when ranking or formatting changes.
+    ///
+    /// `total_found`, `definitions`, `usages` and `facet_totals` are compared too, not just
+    /// the matches — those are per-target numbers derived from that target's own result, and
+    /// computing any of them once over the union of targets would leave the `shown/total`
+    /// labels wrong while the match list still looked right.
+    #[test]
+    fn batched_multi_symbol_results_match_separate_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let queries = write_multi_symbol_fixture(dir.path());
+
+        let batched = search_multi(&queries, dir.path(), None, None, false).unwrap();
+        assert_eq!(batched.len(), queries.len());
+
+        for (i, q) in queries.iter().enumerate() {
+            let separate = search(q, dir.path(), None, None, false).unwrap();
+            assert!(
+                separate.total_found > 0,
+                "{q} must match something, or the comparison proves nothing"
+            );
+            assert_eq!(
+                render_result(&batched[i]),
+                render_result(&separate),
+                "batched result for {q} differs from a lone search"
+            );
+        }
+    }
+
+    /// The same, with `full` set — a different cap, and the branch `--full` callers take.
+    #[test]
+    fn batched_multi_symbol_results_match_separate_searches_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let queries = write_multi_symbol_fixture(dir.path());
+
+        let batched = search_multi(&queries, dir.path(), None, None, true).unwrap();
+        for (i, q) in queries.iter().enumerate() {
+            let separate = search(q, dir.path(), None, None, true).unwrap();
+            assert_eq!(
+                render_result(&batched[i]),
+                render_result(&separate),
+                "batched --full result for {q} differs from a lone search"
+            );
+        }
+    }
+
+    /// Five targets must be two walks, not ten.
+    ///
+    /// `search_multi_symbol_expanded` called `search` once per target, and each of those is
+    /// two full traversals joined by `rayon::join`. Counted at `search::walker`, the single
+    /// place a traversal is built, so this covers both walks rather than the one the test
+    /// remembered to look for.
+    ///
+    /// Driven through `search_multi_symbol_expanded` rather than `search_multi` directly,
+    /// so it pins the entry point actually using the batched path — testing `search_multi`
+    /// alone would still pass with the per-target loop restored one level up.
+    #[test]
+    fn multi_symbol_search_walks_the_tree_a_bounded_number_of_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let queries = write_multi_symbol_fixture(dir.path());
+
+        let cache = crate::cache::OutlineCache::new();
+        let session = crate::session::Session::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        crate::search::reset_walk_count(dir.path());
+        let out = crate::search::search_multi_symbol_expanded(
+            &queries,
+            dir.path(),
+            &cache,
+            &session,
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let walks = crate::search::walk_count(dir.path());
+
+        for q in &queries {
+            assert!(
+                out.contains(q),
+                "every target must appear in the output, or a skipped walk would look \
+                 like a saving:\n{out}"
+            );
+        }
+        assert_eq!(
+            walks, 2,
+            "5 targets must be one definitions walk and one usages walk"
+        );
+    }
+
+    /// Batching must not reintroduce the run-to-run variation #18 removed.
+    ///
+    /// Each bucket now receives its per-file blocks from a walk that is doing more work per
+    /// file, so the *interleaving* of files differs from the single-query walk. That is
+    /// harmless only because ties in `rank::sort`'s key can occur solely between matches
+    /// from the same file, whose relative order is fixed — the invariant recorded at the top
+    /// of this file. If a future change appended per match rather than per file, this fails.
+    #[test]
+    fn batched_multi_symbol_results_are_stable_across_repeated_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let queries = write_multi_symbol_fixture(dir.path());
+
+        let runs: Vec<String> = (0..6)
+            .map(|_| {
+                search_multi(&queries, dir.path(), None, None, false)
+                    .unwrap()
+                    .iter()
+                    .map(render_result)
+                    .collect::<Vec<_>>()
+                    .join("\n===\n")
+            })
+            .collect();
+
+        assert!(
+            runs.windows(2).all(|w| w[0] == w[1]),
+            "batched multi-symbol results varied across 6 identical runs"
+        );
+    }
+
+    /// A BOM-marked UTF-16 file must contribute to every query, not just the first.
+    ///
+    /// `Searcher` owns a decoder for BOM-sniffed transcoding and that decoder carries state
+    /// across `search_slice` calls, so a batched walk that reused one searcher per file
+    /// under-reported for the second and later queries. Found on a large C++ tree, where a
+    /// two-target query returned 18 fewer usages of a symbol than a lone search of it — a
+    /// silent undercount in the totals an agent reads, not a crash.
+    ///
+    /// UTF-16 rather than plain UTF-8 because the plain case never engaged the decoder and
+    /// so never reproduced it: every ASCII fixture passed with the bug present.
+    #[test]
+    fn an_encoded_file_contributes_to_every_batched_query() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plain.rs"),
+            "pub fn alpha() {}\npub fn bravo() {}\n",
+        )
+        .unwrap();
+
+        // UTF-16LE with a BOM, naming both targets.
+        let text = "// alpha and bravo\nlet x = alpha();\nlet y = bravo();\n";
+        let mut utf16: Vec<u8> = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(dir.path().join("wide.rs"), &utf16).unwrap();
+
+        let queries = ["alpha", "bravo"];
+        let batched = search_multi(&queries, dir.path(), None, None, true).unwrap();
+        for (i, q) in queries.iter().enumerate() {
+            let separate = search(q, dir.path(), None, None, true).unwrap();
+            assert!(
+                separate.usages > 0,
+                "{q} must have usages in the fixture, or this proves nothing"
+            );
+            assert_eq!(
+                batched[i].usages, separate.usages,
+                "batched usage count for {q} (position {i}) must match a lone search"
+            );
+            assert_eq!(render_result(&batched[i]), render_result(&separate));
+        }
+    }
+
+    /// A repeated target renders twice today. Batching walks distinct needles only, so this
+    /// pins that the duplicate still gets its own identical result rather than an empty one.
+    #[test]
+    fn a_repeated_query_still_gets_its_own_result() {
+        let dir = tempfile::tempdir().unwrap();
+        write_multi_symbol_fixture(dir.path());
+
+        let batched =
+            search_multi(&["beta", "Alpha", "beta"], dir.path(), None, None, false).unwrap();
+        assert_eq!(batched.len(), 3);
+        assert_eq!(render_result(&batched[0]), render_result(&batched[2]));
+        assert!(batched[0].total_found > 0, "the repeated target must match");
     }
 }

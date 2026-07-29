@@ -47,10 +47,14 @@ const FULL_MAX_MATCHES: usize = 100;
 // The cost is real and worth knowing. On the 175k-file tree above, that query went
 // from ~0.1s to ~9.5s, and now returns 9581 every time. That is inside the 90s
 // request timeout, and the walk is what makes the answer true, but a hot symbol on a
-// very large tree is now a multi-second call — and `search_callers_multi_expanded`
-// runs one such walk per target plus a second hop each, so a 5-target query is a
-// multiple of it. Peak RSS at that scale is dominated by `BloomFilterCache`, which
-// holds one filter per code file walked and is currently unbounded.
+// very large tree is now a multi-second call.
+//
+// That per-walk cost is why `search_callers_multi_expanded` no longer runs a walk per
+// target. It used to: the second hop ran inside the render loop and the existence scan
+// behind the no-callers message ran once per empty target, so five targets could be six
+// or more full traversals. It is a fixed two now — see that function. Peak RSS at this
+// scale is dominated by `BloomFilterCache`, which holds one filter per code file walked
+// and is currently unbounded.
 //
 // `search::symbol` and `search::content` carried the same count-gated walks and were
 // fixed the same way afterwards — see the notes at the top of those two files for the
@@ -81,16 +85,39 @@ pub struct CallerMatch {
 /// returned zero matches. mmap is lazy, so the scan only pages in regions
 /// that contain the needle prefix.
 fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool {
+    let one: Vec<&str> = vec![target];
+    !targets_seen_in_scope(&one, scope, glob).is_empty()
+}
+
+/// The same existence scan for several names at once, returning the subset that appears.
+///
+/// The multi-target path calls this once for every target that had no call sites, instead
+/// of one walk each. That matters for the same reason the second hop did: a query of five
+/// misspelled targets used to be five full traversals, and a name that appears nowhere is
+/// precisely the case where the early quit never fires and the walk runs to completion.
+///
+/// Quits as soon as every name has been seen, so the common case — names that do exist —
+/// still stops early, and now stops early once for the whole set rather than once per name.
+fn targets_seen_in_scope(targets: &[&str], scope: &Path, glob: Option<&str>) -> HashSet<String> {
+    if targets.is_empty() {
+        return HashSet::new();
+    }
     let Ok(walker) = super::walker(scope, glob) else {
-        return false;
+        return HashSet::new();
     };
-    let needle = target.as_bytes();
-    let seen = AtomicBool::new(false);
+
+    // Count distinct names, not slice length: the early quit compares against this, and a
+    // repeated name would otherwise make it unreachable.
+    let want = targets.iter().copied().collect::<HashSet<_>>().len();
+
+    let seen: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    let all_seen = AtomicBool::new(false);
 
     walker.run(|| {
         let seen = &seen;
+        let all_seen = &all_seen;
         Box::new(move |entry| {
-            if seen.load(Ordering::Relaxed) {
+            if all_seen.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
             }
             let Ok(entry) = entry else {
@@ -106,15 +133,42 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
             let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
                 return ignore::WalkState::Continue;
             };
-            if memchr::memmem::find(&mmap, needle).is_some() {
-                seen.store(true, Ordering::Relaxed);
-                return ignore::WalkState::Quit;
+
+            // Probe only the names not yet found. The lock is taken once per file that
+            // finds something new, not once per name.
+            let outstanding: Vec<&str> = {
+                let found = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                targets
+                    .iter()
+                    .copied()
+                    .filter(|t| !found.contains(*t))
+                    .collect()
+            };
+            let hits: Vec<&str> = outstanding
+                .into_iter()
+                .filter(|t| memchr::memmem::find(&mmap, t.as_bytes()).is_some())
+                .collect();
+
+            if !hits.is_empty() {
+                let mut found = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for t in hits {
+                    found.insert(t.to_string());
+                }
+                if found.len() == want {
+                    all_seen.store(true, Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
+                }
             }
             ignore::WalkState::Continue
         })
     });
 
-    seen.load(Ordering::Relaxed)
+    seen.into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Find all call sites of any symbol in `targets` across the codebase using a single walk.
@@ -338,15 +392,23 @@ pub fn search_callers_expanded(
 
     sorted_callers.truncate(max_matches);
 
+    // One walk, and only when the block will actually render — the threshold test used to
+    // live inside `write_second_hop_impact`, which is the same condition in a different
+    // place. Single-target cost is unchanged at two walks.
+    let hop2 = if second_hop_applies(&all_caller_names) {
+        find_callers_batch(&all_caller_names, scope, bloom, glob).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let mut output = String::new();
     write_caller_bucket(&mut output, target, scope, total, &sorted_callers, expand);
     write_second_hop_impact(
         &mut output,
         &all_caller_names,
         &sorted_callers,
+        &hop2,
         scope,
-        bloom,
-        glob,
     );
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
@@ -440,6 +502,16 @@ fn write_caller_bucket(
     }
 }
 
+/// Whether a target's hop-1 caller set is worth a second hop at all.
+///
+/// Split out from `write_second_hop_impact` so the *decision* can be made before the walk
+/// rather than inside it — that is what lets the multi-target path collect every
+/// qualifying target's names up front and run one walk for all of them. Above the
+/// threshold the fan-out is too wide for the block to say anything useful.
+fn second_hop_applies(all_caller_names: &HashSet<String>) -> bool {
+    !all_caller_names.is_empty() && all_caller_names.len() <= IMPACT_FANOUT_THRESHOLD
+}
+
 /// Adaptive 2nd-hop impact analysis, shared by single- and multi-target
 /// callers search (extracted so multi-target reuses this exact block per
 /// target bucket instead of re-implementing it — PR #138 review HIGH
@@ -448,30 +520,36 @@ fn write_caller_bucket(
 /// `all_caller_names` must be the target's unique direct-caller names
 /// collected BEFORE `sorted_callers` truncation, so the fan-out threshold
 /// check reflects the true hop-1 breadth rather than the display-capped one.
+///
+/// `hop2` is the walk's output, passed in rather than fetched here. It may cover **more**
+/// names than this target's — the multi-target path walks the union of every target's
+/// caller names once — so this filters to `via ∈ all_caller_names`. That partition is
+/// lossless: `find_callers_treesitter_batch` attributes each call site to the captured
+/// callee text and tests `targets.contains(text)`, a pure membership test, so whether an
+/// entry is produced never depends on what else was in the set. A union walk therefore
+/// returns exactly the union of the per-name walks.
 fn write_second_hop_impact(
     output: &mut String,
     all_caller_names: &HashSet<String>,
     sorted_callers: &[CallerMatch],
+    hop2: &[(String, CallerMatch)],
     scope: &Path,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    glob: Option<&str>,
 ) {
-    if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
+    if !second_hop_applies(all_caller_names) {
         return;
     }
-    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob) else {
-        return;
-    };
 
     // Filter out hop-1 matches (same file+line = same call site)
-    let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
+    let hop1_locations: HashSet<(&Path, u32)> = sorted_callers
         .iter()
-        .map(|c| (c.path.clone(), c.line))
+        .map(|c| (c.path.as_path(), c.line))
         .collect();
 
-    let mut hop2_filtered: Vec<_> = hop2
-        .into_iter()
-        .filter(|(_, m)| !hop1_locations.contains(&(m.path.clone(), m.line)))
+    let mut hop2_filtered: Vec<&(String, CallerMatch)> = hop2
+        .iter()
+        .filter(|(via, m)| {
+            all_caller_names.contains(via) && !hop1_locations.contains(&(m.path.as_path(), m.line))
+        })
         .collect();
 
     if hop2_filtered.is_empty() {
@@ -484,8 +562,11 @@ fn write_second_hop_impact(
     // kept a different representative per (function, file). Removing the walk's early
     // quit made the *total* stable; it did nothing for this rendering, and an unranked
     // truncation of an unordered vector is the same class of bug.
-    hop2_filtered
-        .sort_by(|(via_a, a), (via_b, b)| (&a.path, a.line, via_a).cmp(&(&b.path, b.line, via_b)));
+    //
+    // It is also what makes the shared union walk safe: the rendered order is a function
+    // of the filtered set alone, not of the order the walk happened to return it in, so
+    // widening the walk to cover every target cannot move a bucket's output.
+    hop2_filtered.sort_by(|x, y| (&x.1.path, x.1.line, &x.0).cmp(&(&y.1.path, y.1.line, &y.0)));
 
     output.push_str("\n-- impact (2nd hop) --\n");
 
@@ -549,10 +630,22 @@ fn write_second_hop_impact(
 /// and starvation of a later target by a hit-rich earlier one is not possible once
 /// every candidate file is visited.
 ///
-/// Cost note: `write_second_hop_impact` runs inside the per-target loop, so a 5-target
-/// query is one primary walk plus up to five second-hop walks, each now a full
-/// traversal. On a very large tree that is the multiple of the single-walk cost quoted
-/// above — bounded by the request timeout, not by a match count.
+/// Cost: **two walks, whatever the target count.** The second hop used to run inside the
+/// render loop, so a 5-target query was one primary walk plus up to five second-hop walks.
+/// Ranking every bucket first, walking the union of their caller names once, and
+/// partitioning by `via` makes that 1+1 and leaves the rendering untouched; see
+/// `write_second_hop_impact` for why the partition is lossless.
+///
+/// Measured over MCP `tilth_search`, `kind: "callers"`, `expand: 0`, on a large C++ tree
+/// (~444k files), three reps each, warm:
+///
+///   five targets, 4 second hops fire   28.7-28.8s -> 10.6-10.8s
+///   five hot targets, no hop fires     18.3s      -> 18.3s
+///
+/// The second row is the honest half: above `IMPACT_FANOUT_THRESHOLD` no second hop ran
+/// before this change either, so there was nothing to hoist and the cost is the one
+/// primary walk. The saving is real precisely where the block renders. Rendered output is
+/// byte-identical across the two for both queries.
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -586,14 +679,22 @@ pub fn search_callers_multi_expanded(
         by_target.entry(name).or_default().push(m);
     }
 
-    let mut output = String::new();
+    // Rank and cap every bucket first, collecting the union of the caller names whose
+    // second hop will render. Rendering cannot start until that union is known, which is
+    // the whole reason this is two passes rather than one: the second hop used to walk
+    // inside the render loop, once per target.
+    //
+    // `total == 0` marks a target with no call sites at all — `callers` is empty and
+    // `total` is its length, so the two cannot disagree.
+    let mut buckets: Vec<(&str, usize, Vec<CallerMatch>, HashSet<String>)> =
+        Vec::with_capacity(ordered.len());
+    let mut hop2_names: HashSet<String> = HashSet::new();
+
     for target in &ordered {
         let mut callers = by_target.remove(*target).unwrap_or_default();
 
         if callers.is_empty() {
-            let target_seen = target_seen_in_scope(target, scope, glob);
-            output.push_str(&no_callers_message(target, scope, target_seen, glob));
-            output.push_str("\n\n");
+            buckets.push((target, 0, Vec::new(), HashSet::new()));
             continue;
         }
 
@@ -611,8 +712,50 @@ pub fn search_callers_multi_expanded(
 
         callers.truncate(max_matches);
 
-        write_caller_bucket(&mut output, target, scope, total, &callers, expand);
-        write_second_hop_impact(&mut output, &all_caller_names, &callers, scope, bloom, glob);
+        if second_hop_applies(&all_caller_names) {
+            hop2_names.extend(all_caller_names.iter().cloned());
+        }
+        buckets.push((target, total, callers, all_caller_names));
+    }
+
+    // The second walk. One, not one per target.
+    //
+    // `IMPACT_FANOUT_THRESHOLD` bounds each target's contribution, so the union is at
+    // most `targets × threshold` names — the walk cost is per *file visited*, not per
+    // needle, so a wider set costs essentially the same traversal.
+    //
+    // A failure here drops the second hop for every bucket rather than one, which matches
+    // the old per-target `let Ok(..) else { return }`. In practice unreachable: the only
+    // error `find_callers_batch` returns comes from building the walker, which the
+    // primary walk above already did successfully with the same scope and glob.
+    let hop2 = if hop2_names.is_empty() {
+        Vec::new()
+    } else {
+        find_callers_batch(&hop2_names, scope, bloom, glob).unwrap_or_default()
+    };
+
+    // The existence scan for every target that found nothing, also once rather than once
+    // each. Same 1-per-target shape as the second hop, and the case it fires on — a name
+    // that appears nowhere — is exactly the one where its early quit never triggers and
+    // the walk runs to completion.
+    let missing: Vec<&str> = buckets
+        .iter()
+        .filter(|(_, total, _, _)| *total == 0)
+        .map(|(target, _, _, _)| *target)
+        .collect();
+    let seen_names = targets_seen_in_scope(&missing, scope, glob);
+
+    let mut output = String::new();
+    for (target, total, callers, all_caller_names) in &buckets {
+        if *total == 0 {
+            let target_seen = seen_names.contains(*target);
+            output.push_str(&no_callers_message(target, scope, target_seen, glob));
+            output.push_str("\n\n");
+            continue;
+        }
+
+        write_caller_bucket(&mut output, target, scope, *total, callers, expand);
+        write_second_hop_impact(&mut output, all_caller_names, callers, &hop2, scope);
         output.push('\n');
     }
 
@@ -1006,6 +1149,112 @@ mod tests {
             renders.windows(2).all(|w| w[0] == w[1]),
             "2nd-hop block must not vary run to run:\n{renders:#?}"
         );
+    }
+
+    /// A fixture of `n` targets, each with two hop-1 callers and a handful of hop-2 callers,
+    /// so every target qualifies for a second-hop block (2 <= `IMPACT_FANOUT_THRESHOLD`).
+    fn write_multi_target_fixture(root: &Path, n: usize) -> Vec<String> {
+        let names: Vec<String> = (0..n).map(|i| format!("target_{i}")).collect();
+        for (i, name) in names.iter().enumerate() {
+            let mut src = format!("fn {name}() {{}}\n");
+            src.push_str(&format!("fn h1_{i}_a() {{ {name}(); }}\n"));
+            src.push_str(&format!("fn h1_{i}_b() {{ {name}(); }}\n"));
+            for j in 0..3 {
+                src.push_str(&format!("fn h2_{i}_{j}() {{ h1_{i}_a(); }}\n"));
+            }
+            std::fs::write(root.join(format!("t{i}.rs")), src).unwrap();
+        }
+        names
+    }
+
+    /// A 5-target callers query must not walk the tree once per target.
+    ///
+    /// `write_second_hop_impact` used to run inside the render loop, each call a full
+    /// `find_callers_batch` traversal — one primary walk plus up to five second hops, on the
+    /// order of 57s on a ~175k-file C++ tree against a 90s request timeout. The existence
+    /// scan behind the no-callers message had the same 1-per-target shape.
+    ///
+    /// Counted at `search::walker`, the single place a traversal is built, so this covers
+    /// every walk the query performs rather than the ones the test remembered to look for.
+    #[test]
+    fn multi_target_callers_walks_the_tree_a_bounded_number_of_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let names = write_multi_target_fixture(dir.path(), 5);
+        let targets: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        // Every target has callers: primary walk + one shared second hop.
+        crate::search::reset_walk_count(dir.path());
+        let out = search_callers_multi_expanded(&targets, dir.path(), &bloom, 0, None, None, false)
+            .unwrap();
+        let walks = crate::search::walk_count(dir.path());
+        assert!(
+            out.contains("-- impact (2nd hop) --"),
+            "fixture must produce second-hop blocks, or this proves nothing:\n{out}"
+        );
+        assert_eq!(
+            walks, 2,
+            "5 targets with callers must be one primary walk plus one shared second hop"
+        );
+
+        // Every target missing: primary walk + one shared existence scan. This is the case
+        // where the scan's early quit never fires, so each used to be a full traversal.
+        let absent = ["nope_a", "nope_b", "nope_c", "nope_d", "nope_e"];
+        crate::search::reset_walk_count(dir.path());
+        let out = search_callers_multi_expanded(&absent, dir.path(), &bloom, 0, None, None, false)
+            .unwrap();
+        let walks = crate::search::walk_count(dir.path());
+        assert!(
+            out.contains("does not appear anywhere in scope"),
+            "absent targets must render the typo message:\n{out}"
+        );
+        assert_eq!(
+            walks, 2,
+            "5 absent targets must be one primary walk plus one shared existence scan"
+        );
+    }
+
+    /// Every bucket of a multi-target query must be byte-identical to the single-target
+    /// render of the same symbol.
+    ///
+    /// This is the property the hoist has to preserve and the one that is easy to lose: the
+    /// shared second hop walks the *union* of every target's caller names, so each bucket
+    /// now filters a wider result set than it used to receive. If that partition were lossy
+    /// — or if the rendered order depended on the walk's arrival order rather than on the
+    /// filtered set — buckets would drift from the single-target output while every count
+    /// in the header stayed right.
+    ///
+    /// Compared against the single-target path rather than a golden string, so it keeps
+    /// checking the real invariant if the format changes.
+    #[test]
+    fn each_multi_target_bucket_matches_its_single_target_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let names = write_multi_target_fixture(dir.path(), 5);
+        let targets: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let multi =
+            search_callers_multi_expanded(&targets, dir.path(), &bloom, 0, None, None, false)
+                .unwrap();
+
+        for name in &names {
+            let single =
+                search_callers_expanded(name, dir.path(), &bloom, 0, None, None, false).unwrap();
+            // Both paths append their own token footer; the bucket is everything before it.
+            let bucket = single
+                .rsplit_once("\n\n(")
+                .map_or(single.as_str(), |(body, _)| body);
+            assert!(
+                bucket.contains("-- impact (2nd hop) --"),
+                "{name}'s single-target render must include a second hop, or the \
+                 comparison misses the interesting half:\n{bucket}"
+            );
+            assert!(
+                multi.contains(bucket),
+                "{name}'s bucket is not byte-identical to its single-target render.\n\
+                 --- single ---\n{bucket}\n--- multi ---\n{multi}"
+            );
+        }
     }
 
     /// `caller_range` is computed from the content read during the walk; expansion re-reads

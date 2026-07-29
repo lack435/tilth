@@ -105,10 +105,63 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     builder
 }
 
+/// Tree walks constructed, per scope, for tests that assert how many a query performs.
+///
+/// `walker` is the single place every traversal is built, so counting here counts all of
+/// them — the primary walk, second hops, existence scans, definition and usage walks — with
+/// no per-call-site instrumentation to fall out of date. Counting construction rather than
+/// completion is deliberate: a walk that is built is a walk that runs, and construction is
+/// where the count is unambiguous.
+///
+/// **Keyed by scope, not a bare counter**, for two reasons that between them rule out the
+/// simpler options. Tests run in parallel in one process, so a global counter is inflated by
+/// whatever else is running — and a `thread_local` does not fix that, because
+/// `symbol::search` builds its two walkers inside `rayon::join`, which may run either
+/// closure on a stolen thread. Every test uses its own `tempfile::tempdir`, so keying on the
+/// scope isolates measurements without any coordination between tests.
+#[cfg(test)]
+pub(crate) static WALKS_BUILT: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Start counting walks under `scope`, discarding any previous count for it.
+#[cfg(test)]
+pub(crate) fn reset_walk_count(scope: &Path) {
+    let mut counts = WALKS_BUILT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    counts
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(scope.to_path_buf(), 0);
+}
+
+/// Walks built under `scope` since the last [`reset_walk_count`].
+#[cfg(test)]
+pub(crate) fn walk_count(scope: &Path) -> usize {
+    let counts = WALKS_BUILT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    counts
+        .as_ref()
+        .and_then(|c| c.get(scope).copied())
+        .unwrap_or(0)
+}
+
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
+    #[cfg(test)]
+    {
+        let mut counts = WALKS_BUILT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only scopes a test opted in to are tracked, so this stays a no-op for the rest of
+        // the suite rather than accumulating an entry per tempdir it ever searched.
+        if let Some(n) = counts.as_mut().and_then(|c| c.get_mut(scope)) {
+            *n += 1;
+        }
+    }
+
     let threads = std::env::var("TILTH_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -209,8 +262,12 @@ pub fn search_multi_symbol_expanded(
     let mut expanded_files = HashSet::new();
     let mut sections = Vec::with_capacity(queries.len());
 
-    for query in queries {
-        let result = symbol::search(query, scope, context, glob, full)?;
+    // One pair of walks for every target, rather than a pair per target. Rendering below
+    // is unchanged and still per target — see `symbol::search_multi` for why a batched
+    // result is identical to a lone `symbol::search`'s.
+    let results = symbol::search_multi(queries, scope, context, glob, full)?;
+
+    for result in &results {
         let mut out = format::search_header(
             &result.query,
             &result.scope,
