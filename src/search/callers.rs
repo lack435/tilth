@@ -667,32 +667,130 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
 }
 
 /// Simple ranking: context file first, then by path length (proximity heuristic).
+///
+/// The sort key is computed **once per caller**, not inside the comparator. It used to
+/// walk `strip_prefix(scope).components().count()` for both sides of every comparison,
+/// which is ~2·n·log n path traversals. That was bounded while this walk quit at ~50
+/// matches; it is not bounded now, and `rank_callers` runs *before* the display caps, so
+/// `n` is the full caller count — 9581 for one hot symbol on a 176k-file tree.
+///
+/// Cheaper per call than `rank::score` (no allocation), so this is a smaller win than the
+/// equivalent fix in `rank.rs` — but it is the same defect, on the same unbounded set.
+/// Key and tie-break order are unchanged, so the ranking is identical.
 fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path>) {
-    callers.sort_by(|a, b| {
-        // Context file wins
-        if let Some(ctx) = context {
-            match (a.path == ctx, b.path == ctx) {
-                (true, false) => return std::cmp::Ordering::Less,
-                (false, true) => return std::cmp::Ordering::Greater,
-                _ => {}
-            }
-        }
+    // (is_not_context, depth) — both ascending, matching the old comparator's semantics:
+    // the context file sorted Less, and shorter relative paths sorted Less.
+    let keys: Vec<(u8, usize)> = callers
+        .iter()
+        .map(|c| {
+            let is_not_context = u8::from(context != Some(c.path.as_path()));
+            let depth = c
+                .path
+                .strip_prefix(scope)
+                .unwrap_or(&c.path)
+                .components()
+                .count();
+            (is_not_context, depth)
+        })
+        .collect();
 
-        // Shorter paths (more similar to scope) rank higher
-        let a_rel = a.path.strip_prefix(scope).unwrap_or(&a.path);
-        let b_rel = b.path.strip_prefix(scope).unwrap_or(&b.path);
-        a_rel
-            .components()
-            .count()
-            .cmp(&b_rel.components().count())
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.line.cmp(&b.line))
+    let mut order: Vec<usize> = (0..callers.len()).collect();
+    order.sort_by(|&i, &j| {
+        keys[i]
+            .cmp(&keys[j])
+            .then_with(|| callers[i].path.cmp(&callers[j].path))
+            .then_with(|| callers[i].line.cmp(&callers[j].line))
     });
+
+    let mut dest: Vec<usize> = vec![0; order.len()];
+    for (k, &from) in order.iter().enumerate() {
+        dest[from] = k;
+    }
+    crate::search::rank::apply_destination_permutation(callers, &mut dest);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rank_callers` computes its key once per caller instead of inside the comparator,
+    /// where it walked `strip_prefix(scope).components().count()` for both sides of every
+    /// comparison. It runs before the display caps, so `n` is the full caller count —
+    /// unbounded since the walk was made to complete.
+    ///
+    /// Pinned against a reference implementation of the old comparator, with and without a
+    /// `context` path, since the context branch used to `return` early and now folds into a
+    /// lexicographic key. Both orderings must be identical.
+    #[test]
+    fn rank_callers_matches_the_reference_comparator() {
+        let scope = Path::new("/repo");
+
+        let build = || -> Vec<CallerMatch> {
+            // Lines are explicit, and the three entries sharing `/repo/a.rs` are pushed
+            // with their lines *descending* (9, 4, 1). That matters: with ascending lines
+            // the index-order stability of the sort coincides with the line ordering, so
+            // deleting the line tie-break changes nothing and the mutation survives —
+            // verified, it did.
+            let rows: [(&str, u32); 9] = [
+                ("/repo/a.rs", 9),
+                ("/repo/deep/nested/inner/z.rs", 2),
+                ("/repo/b.rs", 5),
+                ("/repo/deep/m.rs", 7),
+                ("/repo/a.rs", 4),
+                ("/outside/o.rs", 3),
+                ("/repo/deep/nested/c.rs", 6),
+                ("/repo/a.rs", 1),
+                ("/repo/deep/m.rs", 2),
+            ];
+            rows.iter()
+                .enumerate()
+                .map(|(i, (p, line))| CallerMatch {
+                    path: PathBuf::from(p),
+                    line: *line,
+                    calling_function: format!("caller_{i}"),
+                    call_text: "target()".to_string(),
+                    caller_range: None,
+                })
+                .collect()
+        };
+
+        for context in [None, Some(Path::new("/repo/deep/m.rs"))] {
+            let mut actual = build();
+            rank_callers(&mut actual, scope, context);
+
+            // Reference: the pre-refactor comparator, verbatim in shape.
+            let mut expected = build();
+            expected.sort_by(|a, b| {
+                if let Some(ctx) = context {
+                    match (a.path == ctx, b.path == ctx) {
+                        (true, false) => return std::cmp::Ordering::Less,
+                        (false, true) => return std::cmp::Ordering::Greater,
+                        _ => {}
+                    }
+                }
+                let a_rel = a.path.strip_prefix(scope).unwrap_or(&a.path);
+                let b_rel = b.path.strip_prefix(scope).unwrap_or(&b.path);
+                a_rel
+                    .components()
+                    .count()
+                    .cmp(&b_rel.components().count())
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then_with(|| a.line.cmp(&b.line))
+            });
+
+            let key = |v: &[CallerMatch]| {
+                v.iter()
+                    .map(|c| format!("{}:{}:{}", c.path.display(), c.line, c.calling_function))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                key(&actual),
+                key(&expected),
+                "rank_callers disagreed with the reference comparator (context: {context:?})"
+            );
+            assert_eq!(actual.len(), 9, "fixture size changed — retune");
+        }
+    }
 
     #[test]
     fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {
