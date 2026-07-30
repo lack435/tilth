@@ -272,7 +272,10 @@ const SURFACES: &[Surface] = &[
         tool: "tilth_diff",
         edit_mode: false,
         view: None,
-        expect: Bom::NoFileText("needs a git repo; outside one it reports that and reads nothing"),
+        expect: Bom::NoFileText(
+            "diffs the process repo (cwd), never the fixture tree, so a fixture BOM cannot reach it; \
+             the working tree holds no BOMs of its own",
+        ),
     },
     Surface {
         label: "diff:source=staged",
@@ -415,6 +418,11 @@ const SITES_CAUGHT: &[(&str, &str)] = &[
         "src/diff/overlay.rs",
         "diff:files, via the symbol names it parses from both sides",
     ),
+    (
+        "src/mcp/tools/write.rs (render_text_diff)",
+        "write:overwrite/diff — the human-facing diff block, found the moment the diff-source fix let \
+         the guard reach the write rows",
+    ),
 ];
 
 /// Sites this module still does not reach, named so they are not mistaken for covered.
@@ -476,10 +484,25 @@ fn args_for(label: &str, root: &Path) -> Value {
         "files" => json!({"pattern": "*.rs", "scope": scope}),
         "diff:files" => json!({"a": p("before.rs"), "b": p("after.rs")}),
         "diff:patch" => json!({"patch": p("change.patch")}),
-        "diff:log" => json!({"log": "HEAD~1", "scope": scope}),
-        "diff:source=uncommitted" => json!({"source": "uncommitted", "scope": scope}),
-        "diff:source=staged" => json!({"source": "staged", "scope": scope}),
-        "diff:source=ref" => json!({"source": "HEAD~1", "scope": scope}),
+        // `HEAD~1..HEAD` is exactly one commit. `HEAD~1` alone is not a range — git reads it as
+        // "every ancestor of HEAD~1", i.e. the whole repo history, and `diff_log` then shells a
+        // `git diff` and builds a tree-sitter overlay per commit: ~135s and climbing with history.
+        // The bounded range renders one commit's metadata (BOM-free) in milliseconds. No `scope`:
+        // it is a suffix filter against the ambient repo's paths, so the fixture path only ever
+        // filters every commit out — the same misuse the `diff:source=*` rows carried.
+        "diff:log" => json!({"log": "HEAD~1..HEAD"}),
+        // No `scope`: for a git source, `scope` is a post-hoc file *filter*, not a sandbox — it never
+        // redirects git away from the process cwd. Passing the fixture path as scope is wrong on every
+        // platform: the git diff is taken against the tilth repo (cwd), so no overlay ever matches the
+        // fixture path and the format step returns `file '<path>' not found in diff` — as `C` on
+        // Windows, where the drive-letter colon also makes it read as a `file:function` scope. Dropped
+        // entirely; these rows only need each source to render its BOM-free ambient diff.
+        "diff:source=uncommitted" => json!({"source": "uncommitted"}),
+        "diff:source=staged" => json!({"source": "staged"}),
+        // `HEAD`, not `HEAD~1`: against a clean tree this is empty, so the row is `No changes.` and does
+        // not depend on the content of any particular commit. A dirty tree renders the real diff, which
+        // is still BOM-free — either way the `NoFileText` claim holds.
+        "diff:source=ref" => json!({"source": "HEAD"}),
         // `scope` is mandatory: without it the scope guard resolves to the process cwd and refuses
         // every write to a tempdir — which is how the first version's round-trip test passed while
         // never writing anything at all, even with a deliberately wrong hash.
@@ -494,10 +517,19 @@ fn args_for(label: &str, root: &Path) -> Value {
                        "content": "pub fn replaced() {}\n"}]
         }),
         // The anchor has to be read back per tree, since the two fixtures hash differently.
+        //
+        // The replacement **keeps** the leading BOM (`{BOM}pub fn ...`), which is what an agent
+        // editing line 1 of a BOM'd file does — and it is what makes this a `KeepsForAnchors` row.
+        // Without it the edit would replace the file's only BOM'd line with BOM-free content, leaving
+        // the post-edit echo carrying no BOM to keep: the row would then be testing a stripped file
+        // and pass its `contains(BOM)` check only by luck of a wrong fixture. With the BOM preserved,
+        // the hashlined echo over the post-edit bytes must reproduce it — so a regression where
+        // `format::hashlines` (the anchor path) began stripping is caught here.
         "write:hash" => json!({
             "scope": scope,
             "files": [{"path": p("hashee.rs"), "mode": "hash", "edits": [
-                {"start": hash_anchor_for(&p("hashee.rs")), "content": "pub fn hashee() -> u32 { 2 }"}
+                {"start": hash_anchor_for(&p("hashee.rs")),
+                 "content": format!("{BOM}pub fn hashee() -> u32 {{ 2 }}")}
             ]}]
         }),
         "savings" => json!({}),
@@ -570,30 +602,35 @@ fn write_fixture(root: &Path, bom: bool) {
     )
     .unwrap();
 
-    // A structured file, for the JSON/YAML/TOML keys outline. Padded, because the OGATE prefers full
-    // content whenever the outline is not meaningfully smaller — a two-line JSON resolves to `[full]`
-    // and would silently test the wrong surface, the same trap `read:auto` sprang.
-    // *Few* keys with *large* values, not many keys — a keys outline lists every key, so 400 keys
-    // outlines to nearly the whole file and the OGATE returns `[full]`. Measured: 400 keys still
-    // resolved to full. This is the third time the same trap has been sprung in this module.
-    let mut data = format!("{b}{{\n  \"bom_target\": [");
-    for i in 0..2000 {
-        let _ = write!(data, "{}{i}", if i == 0 { "" } else { ", " });
-    }
-    data.push_str("],\n  \"second\": [");
-    for i in 0..2000 {
-        let _ = write!(data, "{}{i}", if i == 0 { "" } else { ", " });
-    }
-    data.push_str("]\n}\n");
-    std::fs::write(root.join("data.json"), &data).unwrap();
+    // A structured file with the BOM on line 1. No row reads it: the `[keys]` view could never be
+    // made to select — a keys outline lists every key, so it never compresses past the OGATE, no
+    // matter how the file is padded (400 keys and two 2000-element arrays both resolved to `[full]`).
+    // That gap is recorded in SITES_NOT_CAUGHT, and the row was dropped rather than shipped asserting
+    // full content while claiming the outline. So nothing here depends on this file's size — it is
+    // only ambient tree content: a BOM'd structured file that whole-tree scans (search, files) must
+    // still handle. Kept minimal; the old 4000 elements were bulk grown while fighting that same gate.
+    std::fs::write(
+        root.join("data.json"),
+        format!("{b}{{\n  \"bom_target\": [1, 2, 3],\n  \"second\": [4, 5, 6]\n}}\n"),
+    )
+    .unwrap();
 
-    // Bodies, not one-liners: the OGATE needs compression, not size, to select an outline.
+    // Bodies, not one-liners: the OGATE needs *compression*, not size, to select an outline (a
+    // signature list for one-line functions is nearly the file itself, so it resolves to `[full]`).
+    //
+    // Two floors set the minimum, no more. (1) The file must clear the small-file gate to reach the
+    // OGATE at all: `estimate_tokens = bytes/4 > TOKEN_THRESHOLD` (6000), i.e. **> 24_000 bytes**;
+    // below it, full content is returned before the OGATE is consulted. (2) Given bodies, the outline
+    // is a handful of signature lines and compresses far past the 80% bar, so nothing else is needed.
+    // 60 filler functions (~33 KB) clears the byte floor with margin while staying a quarter of the
+    // old 300 — the size chased while first fighting the OGATE. `read:auto/outline`'s `view` marker is
+    // what proves this shrink did not tip the branch back to `[full]`.
     let mut big = format!("{b}pub fn bom_target() -> u32 {{\n");
     for i in 0..30 {
         let _ = writeln!(big, "    let x{i} = {i};");
     }
     big.push_str("    0\n}\n");
-    for i in 0..300 {
+    for i in 0..60 {
         let _ = writeln!(big, "pub fn filler{i}() -> u32 {{");
         for j in 0..30 {
             let _ = writeln!(big, "    let y{j} = {j};");
