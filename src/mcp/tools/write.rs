@@ -106,14 +106,21 @@ fn parse_overwrite_flag(f: &Value) -> Option<bool> {
     }
 }
 
+/// The human-facing `── diff ──` block. Display text with no hash anchor, so it strips a leading
+/// BOM (#64): the outer `overwrote:`/`append:` block already emits the anchor-bearing hashline echo
+/// over the raw bytes, and that echo — not this diff — is what `edit::apply_batch` verifies against.
+/// A BOM surviving into `- \u{feff}pub fn ...` here is the same glyph-the-reader-did-not-ask-for
+/// leak the rest of the read/search surfaces strip; pinned by `write:overwrite/diff` in
+/// `bom_surfaces`.
 fn render_text_diff(before: Option<&str>, after: &str) -> String {
+    use crate::lang::outline::strip_bom;
     let mut out = String::from("── diff ──\n--- before\n+++ after\n");
     if let Some(before) = before {
-        for line in before.lines() {
+        for line in strip_bom(before).lines() {
             let _ = writeln!(out, "- {line}");
         }
     }
-    for line in after.lines() {
+    for line in strip_bom(after).lines() {
         let _ = writeln!(out, "+ {line}");
     }
     out
