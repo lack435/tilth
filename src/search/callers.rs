@@ -114,7 +114,7 @@ fn targets_seen_in_scope(targets: &[&str], scope: &Path, glob: Option<&str>) -> 
     let seen: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     let all_seen = AtomicBool::new(false);
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let seen = &seen;
         let all_seen = &all_seen;
         Box::new(move |entry| {
@@ -189,7 +189,7 @@ pub(crate) fn find_callers_batch(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
 
         Box::new(move |entry| {

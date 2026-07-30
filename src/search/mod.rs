@@ -84,8 +84,37 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 /// are found. Used by both the parallel search walker (`walker()`) and the
 /// sequential map walker (`crate::map::generate`), which each apply their own
 /// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
+///
+/// # Cancellation
+///
+/// The `filter_entry` predicate also carries the abandoned-worker cancellation check (#61). Once
+/// the token is set, every entry is rejected: files are not yielded and directories are not
+/// descended into, so the walk drains to nothing without reading, parsing or allocating anything
+/// further.
+///
+/// **This was the whole fix first**, on the reasoning that one funnel beats eight `run()` call
+/// sites and that a ninth walk added later would silently miss the check — the enumeration failure
+/// #64 is a meta-issue about. Measurement refuted it: `ignore` consults `filter_entry` when it
+/// *enumerates* an entry, not when it hands one to a callback, so on a flat directory every entry
+/// clears the predicate before the deadline and the walk then spends minutes in callbacks the
+/// predicate never sees again. See `run_walk`, which carries the numbers and the `WalkState::Quit`
+/// check that does the work. This prune is kept for descent, which is where it does help.
+///
+/// Note that it is *not* true that every traversal is built from here — `find_basename_fallback`
+/// below builds its own, and it is reachable on the returned search path through
+/// `format_search_result`. It is a serial, `max_depth(6)`, stat-only walk, so it is left alone as
+/// bounded and cheap; but a cancelled walk yields a smaller match set, which is exactly when that
+/// fallback fires, so cancellation makes it *more* likely rather than less. Recorded because the
+/// combination is not obvious.
+///
+/// The token is captured **here, at build time**, not consulted per entry through the global. A
+/// walk therefore holds the token of the request that built it; see `cancel`'s module header for
+/// why identity rather than a shared epoch is what keeps a timeout from stopping somebody else's
+/// walk. Outside a request — the CLI, `map`, the test suite — `current()` yields a token that is
+/// never cancelled and the predicate costs one null check per entry.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
+    let cancel = crate::cancel::current();
     builder
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
@@ -95,7 +124,10 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
         .git_exclude(false)
         .ignore(false)
         .parents(false)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            if cancel.is_cancelled() {
+                return false;
+            }
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
                     return !SKIP_DIRS.contains(&name);
@@ -190,6 +222,57 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     }
 
     Ok(builder.build_parallel())
+}
+
+/// Run a parallel walk, quitting early if the request that built it has been abandoned (#61).
+///
+/// All eight search walks go through here rather than calling `WalkParallel::run` directly, so the
+/// cancellation check has one home instead of eight.
+///
+/// # Why `base_walk_builder`'s `filter_entry` check is not enough on its own
+///
+/// It was the whole fix first, on the reasoning that one funnel beats eight call sites.
+/// Measurement killed that: on a fixture of 400 flat files of 498 981 B each, eight
+/// expired-then-abandoned requests cost **17.5-17.9 s of CPU with the check and 17.7-17.8 s
+/// without it** — no effect at all, three reps per arm, `TILTH_THREADS=1`.
+///
+/// The reason is that `ignore` consults `filter_entry` when it *enumerates* an entry, not when it
+/// hands one to the callback. A flat directory is enumerated in milliseconds, so all 400 files pass
+/// the predicate long before the 1 s deadline, and the walk then spends minutes inside callbacks
+/// that the predicate never sees again. Pruning enumeration only helps where enumeration is still
+/// happening — which is why the same check *did* work on 25 000 small files across 50 directories.
+///
+/// `WalkState::Quit` is checked per callback, so it fires wherever the time is actually going. Both
+/// are kept: `Quit` is the one that works on expensive files, and the `filter_entry` prune still
+/// stops descent for any walk built from `base_walk_builder` that does not run through here.
+///
+/// The token is read here rather than threaded from `walker()`. **That is not because no request
+/// can begin in between** — one can: the serial loop only stops two requests being *waited on* at
+/// once, and an abandoned worker running alongside the next request is the whole premise of #61, so
+/// a worker sitting between `walker()` and `run_walk` can be overtaken. It is safe because
+/// mis-capture is harmless in both directions. An abandoned worker that captures the next request's
+/// token either fails to stop or stops early, and its result is discarded either way; a *live*
+/// request can never capture a cancelled token, because `begin_request` publishes a fresh `false`
+/// flag before its worker starts and only its own deadline arm can set it. The window is a handful
+/// of instructions, and threading the token from `walker()` would close it — worth doing if this
+/// ever stops being a two-line hop. See `cancel`'s module header.
+pub(crate) fn run_walk<'a, F>(walker: ignore::WalkParallel, mut factory: F)
+where
+    F: FnMut() -> Box<
+        dyn FnMut(Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState + Send + 'a,
+    >,
+{
+    let cancel = crate::cancel::current();
+    walker.run(move || {
+        let cancel = cancel.clone();
+        let mut inner = factory();
+        Box::new(move |entry| {
+            if cancel.is_cancelled() {
+                return ignore::WalkState::Quit;
+            }
+            inner(entry)
+        })
+    });
 }
 
 /// Parse `/pattern/` regex syntax. Returns (pattern, `is_regex`).
@@ -2693,6 +2776,124 @@ mod tests {
     }
 
     // ── walker unit tests ──
+
+    /// A cancelled request's walk yields nothing — the mechanism of #61, observed rather than
+    /// inferred from the fact that an abandoned worker eventually stops.
+    ///
+    /// Three things about the shape, each load-bearing:
+    ///
+    /// * **Both walkers are built before the cancel**, and only the second one runs after it. So
+    ///   the arms differ in nothing but the `cancel()` call between them, and a version that
+    ///   snapshotted the *boolean* at build time rather than holding the token would pass the
+    ///   control arm and fail here — which is the point of building early rather than late.
+    /// * **The control arm runs under a published, uncancelled request**, not under no request at
+    ///   all. `filter_entry` rejecting everything and the fixture simply being empty are
+    ///   indistinguishable from the cancelled arm alone, and this walks the crate's own `src`,
+    ///   whose contents are not this test's to guarantee.
+    /// * **Cancelling between the two runs** removes the race, so the assertion is `0` rather than
+    ///   "fewer than" and a partial regression cannot hide inside a tolerance.
+    #[test]
+    fn a_cancelled_request_prunes_the_walk() {
+        let _publish = crate::cancel::PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _visible = crate::cancel::make_visible_on_this_thread();
+
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let request = crate::cancel::begin_request();
+        let control = walker(&scope, None).expect("walker failed");
+        let cancelled = walker(&scope, None).expect("walker failed");
+
+        let count = |w: ignore::WalkParallel| {
+            let seen = std::sync::atomic::AtomicUsize::new(0);
+            w.run(|| {
+                let seen = &seen;
+                Box::new(move |entry| {
+                    if let Ok(e) = entry {
+                        if e.file_type().is_some_and(|ft| ft.is_file()) {
+                            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+            seen.load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let before = count(control);
+        assert!(
+            before > 10,
+            "fixture must yield files uncancelled or the cancelled arm proves nothing (got \
+             {before})"
+        );
+
+        request.cancel();
+        assert_eq!(
+            count(cancelled),
+            0,
+            "a cancelled walk kept yielding files, so an abandoned worker still parses them"
+        );
+    }
+
+    /// `run_walk`'s `Quit` check stops a walk that is **already past enumeration** — the half of
+    /// the fix `a_cancelled_request_prunes_the_walk` cannot reach.
+    ///
+    /// That test cancels before the walk starts, so `filter_entry` prunes everything and `Quit` is
+    /// never consulted; deleting the `Quit` check leaves it green. This one is the opposite shape
+    /// and it is the shape #61 is actually about: a flat directory, so every entry clears
+    /// `filter_entry` in milliseconds, and the cancel arrives from *inside* the first callback —
+    /// which is where an abandoned worker's deadline lands. Without `Quit` the walk then runs every
+    /// remaining file, which is exactly the 400-file measurement where the `filter_entry`-only
+    /// version moved nothing.
+    ///
+    /// The bound is loose on purpose. `Quit` stops the walk "as soon as possible", not instantly,
+    /// so other threads may finish entries already in hand — at most one per thread. Half the
+    /// fixture is far above that ceiling and far below the 400 an unguarded walk yields, so the
+    /// test discriminates without pinning a thread count it does not control.
+    #[test]
+    fn run_walk_quits_a_cancelled_walk_after_enumeration() {
+        let _publish = crate::cancel::PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _visible = crate::cancel::make_visible_on_this_thread();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        const FILES: usize = 400;
+        for i in 0..FILES {
+            std::fs::write(dir.path().join(format!("f{i:04}.rs")), "fn a(){}\n").expect("write");
+        }
+
+        let request = crate::cancel::begin_request();
+        let w = walker(dir.path(), None).expect("walker failed");
+
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        run_walk(w, || {
+            let seen = &seen;
+            let request = &request;
+            Box::new(move |entry| {
+                if let Ok(e) = entry {
+                    if e.file_type().is_some_and(|ft| ft.is_file()) {
+                        let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if n == 1 {
+                            // The deadline landing mid-walk, with enumeration already done.
+                            request.cancel();
+                        }
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+
+        let seen = seen.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            seen >= 1,
+            "fixture yielded nothing, so the cancel never fired and this proves nothing"
+        );
+        assert!(
+            seen < FILES / 2,
+            "a cancelled walk kept visiting files after enumeration: {seen} of {FILES}"
+        );
+    }
 
     #[test]
     fn walker_none_returns_all_file_types() {
