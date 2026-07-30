@@ -340,8 +340,18 @@ opinionated defaults:
   and creates a known duplicate-match problem when a path is reachable
   via multiple symlink chains — see [Open
   threads](#open-architectural-threads).
-- **Threads**: `TILTH_THREADS` env or `available_parallelism / 2`
-  clamped to `[2, 6]`.
+- **Threads**: `TILTH_THREADS` env, else `available_parallelism / 2`
+  clamped to `[2, 6]` — so at most 6 however large the machine. One
+  policy, in `util::worker_threads`, read by both the walkers and the
+  rayon pool.
+
+  Raising it costs **memory as well as CPU**, and the memory half is
+  the larger surprise: the definition walk holds one tree-sitter tree
+  per thread, and a tree is ~26x its file's bytes for ordinary source
+  and ~65x for a line-dense one. Measured over 60 files of 499 KB, a
+  search peaks at ~95 MB at 6 threads and ~448 MB at 32 (ordinary
+  source), or ~220 MB and ~1.1 GB (line-dense). The cost is linear in
+  the thread count. See `util::worker_threads` for the table and #70.
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.
