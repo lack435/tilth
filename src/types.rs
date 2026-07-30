@@ -176,8 +176,24 @@ pub struct Match {
 /// Stripping at the render sites instead would have fixed the glyph and left the mis-ranking
 /// in place.
 ///
-/// `trim_end` matches what every construction site already did, so it changes nothing on its
-/// own; it lives here only so the two operations cannot drift apart between backends.
+/// Since #57 the stakes are higher than reordering. `search::retain` bounds retention *before*
+/// the display cap, keyed on this same score, so a mis-scored line-1 definition can now fall
+/// below the retention bound and be dropped from the result set entirely rather than merely
+/// sorted low. A silent wrong answer, not a cosmetic one.
+///
+/// `trim_end` matches what every construction site already did — all nine — so it changes
+/// nothing on its own; it lives here only so the two operations cannot drift apart between
+/// backends.
+///
+/// Scope worth stating precisely: this strips U+FEFF from the start of *any* matched line, not
+/// only from a genuine byte-order mark at offset 0 of the file. U+FEFF is also a legal
+/// zero-width no-break space, so a line elsewhere in a file that begins with one renders here
+/// without it while `tilth_read mode=full` still shows it — the kind of cross-surface
+/// disagreement `read::read_file`'s own note argues against. Accepted rather than narrowed:
+/// distinguishing the two would mean threading a file-offset into every construction site, and
+/// the existing BOM helpers in `search::strip` and `read::imports` already take the same
+/// line-prefix view. The practical exposure is a ZWNBSP opening a line, which is vanishingly
+/// rare next to a BOM opening a file.
 pub(crate) fn match_text(line: &str) -> String {
     crate::lang::outline::strip_bom(line).trim_end().to_string()
 }

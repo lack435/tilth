@@ -870,8 +870,8 @@ mod tests {
     ///   * `find_callers_treesitter_batch` builds `call_text` as `lines[row].trim()`, and
     ///     `str::trim` does not remove U+FEFF, so a call site on **line 1** carried the glyph
     ///     into the `-> {call_text}` line. Now stripped at
-    ///     `bloom_walk::read_with_bloom_check`, the shared reader, so callees and deps get it
-    ///     too — and before `contains_any`, so the bloom filter tokenises line 1 the same way.
+    ///     `bloom_walk::read_with_bloom_check`, which `callees` shares — but not `deps`, whose
+    ///     own target read bypasses it; see the note there.
     ///   * The expansion re-reads the file directly, bypassing that reader, so it needs its
     ///     own strip for the expanded caller block.
     ///

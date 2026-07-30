@@ -793,7 +793,12 @@ fn misparsed_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
     let start_row = node.start_position().row;
     if start_row < lines.len() {
-        let line = lines[start_row].trim();
+        // BOM-aware, because `str::trim` is not. Signatures are rendered text: they reach
+        // `tilth_diff`'s `[~:sig]` lines (via `diff::overlay`, which reads content
+        // unstripped) and `ResolvedCallee.signature` in search's `-- calls --` block and
+        // grok's `## callees`. A definition on line 1 of a BOM'd file therefore printed the
+        // glyph inside its own signature — on both sides of a diff.
+        let line = crate::lang::outline::trim_start_bom_aware(lines[start_row]).trim_end();
         // Truncate at opening brace
         if let Some(pos) = line.find('{') {
             return line[..pos].trim().to_string();

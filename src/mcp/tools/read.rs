@@ -388,6 +388,47 @@ mod tests {
         );
     }
 
+    /// `mode=stripped` must not render a leading BOM.
+    ///
+    /// An explicit acceptance item of #51, alongside the search preview and the fenced block —
+    /// and the only one of the three that shipped unpinned: reverting the strip in
+    /// `read_stripped_file` left the whole suite green.
+    ///
+    /// Stripped mode takes the *outline* side of #42's rule rather than the full view's,
+    /// because it is a derived view (comments, debug logs and extra blanks removed) and its
+    /// gutter is `{line_num}  {line}` with no `{line}:{hash}|` anchor — so there is no
+    /// verification contract to desynchronise, which is the only thing that forced the full
+    /// view to keep its BOM. Asserted both ways for that reason: no glyph here, and
+    /// `both_full_view_modes_agree_about_a_bom` pins that the full view still keeps it.
+    #[test]
+    fn tool_read_stripped_mode_does_not_render_a_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bommed.rs");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"pub fn helper_fn() -> u32 {\n    // drop me\n    7\n}\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(
+            &serde_json::json!({ "path": path.to_str().unwrap(), "mode": "stripped" }),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("stripped read");
+
+        assert!(out.contains("[stripped]"), "stripped header missing: {out}");
+        assert!(
+            out.contains("pub fn helper_fn"),
+            "fixture is broken, the definition must survive stripping: {out}"
+        );
+        assert!(
+            !out.contains('\u{feff}'),
+            "a BOM reached mode=stripped output: {out}"
+        );
+    }
+
     #[test]
     fn tool_read_stripped_mode_drops_comments_and_keeps_doc_comments() {
         let dir = tempfile::tempdir().unwrap();

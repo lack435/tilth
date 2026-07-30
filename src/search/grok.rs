@@ -2143,6 +2143,67 @@ pub fn outer(x: u32) -> u32 {
         assert_eq!(bommed, plain, "a BOM changed grok output");
     }
 
+    /// The *cross-file* callee body read is a second, separate strip, and the single-file
+    /// fixture above cannot reach it.
+    ///
+    /// `read_delegate_content` short-circuits on `callee_file == target_path` and returns the
+    /// already-stripped target content, so with the target and its callee in one file the
+    /// cross-file branch never executes — I claimed that strip was covered in three places
+    /// while reverting it left the suite green. The callee therefore lives in its own BOM'd
+    /// file here, on line 1, with a `Cargo.toml` present so it resolves as an internal callee
+    /// and the delegate-body expansion actually fires.
+    #[test]
+    fn a_bom_does_not_change_a_cross_file_grok_callee_body() {
+        let run = |prefix: &[u8]| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+            write_fixture(
+                tmp.path(),
+                "src/lib.rs",
+                // A real `use` line is required, not just `pub mod`: `resolve_callees` scans
+                // files reached through *imports*, and `is_import_line` for Rust matches
+                // `use `. With only `pub mod helper;` the callee resolved as `extern`, the
+                // delegate-body read never ran, and this test could not see the strip at all.
+                "pub mod helper;\nuse crate::helper::helper_fn;\n\n\
+                 pub fn alpha_thing() -> u32 {\n    helper_fn()\n}\n",
+            );
+            // The callee's own file, BOM'd, definition on line 1.
+            let helper = tmp.path().join("src/helper.rs");
+            fs::create_dir_all(helper.parent().unwrap()).unwrap();
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(b"pub fn helper_fn() -> u32 {\n    7\n}\n");
+            fs::write(&helper, &bytes).unwrap();
+
+            let bloom = BloomFilterCache::default();
+            let session = crate::session::Session::default();
+            let result = grok(
+                "alpha_thing",
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+            )
+            .unwrap();
+            format_grok(&result, tmp.path())
+        };
+
+        let plain = run(&[]);
+        let bommed = run(&[0xEF, 0xBB, 0xBF]);
+
+        assert!(
+            plain.contains("helper_fn"),
+            "fixture is broken: the callee must resolve cross-file:\n{plain}"
+        );
+        assert!(
+            !bommed.contains('\u{feff}'),
+            "a BOM reached grok's cross-file callee output:\n{bommed}"
+        );
+        assert_eq!(
+            bommed, plain,
+            "a BOM changed grok's cross-file callee output"
+        );
+    }
+
     /// A short body (at or below BODY_DEGRADE_THRESHOLD) never degrades,
     /// so savings remain zero across repeated calls.
     #[test]

@@ -138,6 +138,12 @@ pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    // A conflict marker can be the very first line of a file, and `starts_with("<<<<<<<")`
+    // below is defeated by a leading BOM — so on a BOM'd file the block was never opened and
+    // the whole `# Conflicts:` section disappeared from `tilth_diff` with no warning. That is
+    // the #35 failure shape (a silently unmatched prefix test) in structural output rather
+    // than a rendering glyph, and `diff/` was outside every earlier sweep in this family.
+    let content = crate::lang::outline::strip_bom(&content);
 
     let lines: Vec<&str> = content.lines().collect();
     let mut conflicts = Vec::new();
@@ -168,7 +174,7 @@ pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
                 // Find enclosing function via outline.
                 let ft = detect_file_type(path);
                 let enclosing_fn = if let FileType::Code(lang) = ft {
-                    let entries = get_outline_entries(&content, lang);
+                    let entries = get_outline_entries(content, lang);
                     find_enclosing_function(&entries, (start + 1) as u32)
                 } else {
                     None
@@ -611,6 +617,43 @@ fn find_enclosing_function(entries: &[OutlineEntry], line: u32) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conflict marker on line 1 of a BOM'd file must still be detected.
+    ///
+    /// `detect_conflicts` gates on `lines[i].starts_with("<<<<<<<")`, which a leading BOM
+    /// defeats, so the block was never opened and the entire `# Conflicts:` section vanished
+    /// from `tilth_diff` with no warning. That is the #35 failure shape — a silently unmatched
+    /// prefix test — reaching *structural* output rather than just rendering a stray glyph,
+    /// and `diff/` sat outside every earlier sweep in this BOM family (#35, #41, #42, #43, and
+    /// the first three passes of #51).
+    ///
+    /// A conflict marker really can be line 1: it is wherever the conflicting hunk starts, and
+    /// a file whose first line differs between branches puts it there.
+    #[test]
+    fn a_bom_does_not_hide_a_line_one_conflict() {
+        let body = "<<<<<<< HEAD\npub fn ours() {}\n=======\npub fn theirs() {}\n\
+                    >>>>>>> other\npub fn ok() {}\n";
+
+        for (label, prefix) in [("plain", &[][..]), ("bom", &[0xEF, 0xBB, 0xBF][..])] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("lib.rs");
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(&file, &bytes).unwrap();
+
+            let conflicts = detect_conflicts(&file);
+            assert_eq!(
+                conflicts.len(),
+                1,
+                "{label}: a line-1 conflict must be detected, got {conflicts:?}"
+            );
+            assert!(
+                !conflicts[0].ours.contains('\u{feff}')
+                    && !conflicts[0].theirs.contains('\u{feff}'),
+                "{label}: a BOM reached the conflict bodies: {conflicts:?}"
+            );
+        }
+    }
 
     #[test]
     fn bare_git_ref_new_content_reads_working_tree() {

@@ -3352,6 +3352,14 @@ mod tests {
     /// naming a definition the other denies.
     ///
     /// `n == 2` is the case that matters; 0 and 1 are controls proving the fixture is sound.
+    ///
+    /// Naming caveat: this asserts search's side against the read side's *known* answer
+    /// (`[definition]`) rather than calling the read side and comparing. A read-side regression
+    /// would leave it green — the read side is pinned separately by
+    /// `read::tests::the_outline_and_the_heading_resolver_agree_on_a_bom_file`. It also covers
+    /// only `find_defs_markdown_buf`; the other half of that fix,
+    /// `markdown_enclosing_scope`, is pinned by
+    /// `a_doubled_bom_does_not_lose_the_markdown_scope_label`.
     #[test]
     fn search_and_the_read_side_agree_on_a_doubled_bom_markdown_heading() {
         let body = "# Alpha Section\n\ntext here\n\n# Beta Section\n\nmore\n";
@@ -3382,6 +3390,50 @@ mod tests {
         }
     }
 
+    /// The `in §Heading` scope label must survive a doubled BOM.
+    ///
+    /// `markdown_enclosing_scope` is the other half of the markdown fix, and
+    /// `search_and_the_read_side_agree_on_a_doubled_bom_markdown_heading` does not reach it —
+    /// that one pins `find_defs_markdown_buf` only, so reverting this strip left the suite
+    /// green while I claimed both were covered.
+    ///
+    /// The query has to match a *usage* inside a section rather than the heading itself, since
+    /// the label is only attached to usages, and the fixture needs **two** BOMs: tree-sitter-md
+    /// absorbs one, so at a single BOM the enclosing section is found either way.
+    #[test]
+    fn a_doubled_bom_does_not_lose_the_markdown_scope_label() {
+        let body = "# Alpha Section\n\nthe zzz_token lives here\n";
+
+        let run = |n: usize| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut bytes = Vec::new();
+            for _ in 0..n {
+                bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(tmp.path().join("notes.md"), &bytes).unwrap();
+            let cache = OutlineCache::new();
+            search_content("zzz_token", tmp.path(), &cache, None).unwrap()
+        };
+
+        let plain = run(0);
+        assert!(
+            plain.contains("Alpha Section"),
+            "fixture is broken: the unmarked file must carry the scope label:\n{plain}"
+        );
+        for n in [1, 2] {
+            let out = run(n);
+            assert!(
+                !out.contains('\u{feff}'),
+                "{n} BOM(s): a BOM reached search output:\n{out}"
+            );
+            assert!(
+                out.contains("Alpha Section"),
+                "{n} BOM(s): the enclosing-section label was lost:\n{out}"
+            );
+        }
+    }
+
     /// A BOM'd file must search identically to the same file without one.
     ///
     /// The acceptance case for #51, driven end to end through `search_symbol_expanded` rather
@@ -3394,10 +3446,18 @@ mod tests {
     ///     prefix-tested those same lines for the leading-import skip;
     ///   * `find_defs_markdown_buf` parsed markdown unstripped, disagreeing with the read side.
     ///
-    /// Asserting byte equality against the BOM-free spelling covers all of them at once, and
-    /// covers ordering too — which a "no glyph in the output" assertion would not. The paths
-    /// differ between the two trees, so the fixture uses the same filename in two tempdirs and
-    /// compares the outputs with the directory prefix removed.
+    /// Asserting byte equality against the BOM-free spelling covers all of them at once. The
+    /// paths differ between the two trees, so the fixture uses the same filename in two
+    /// tempdirs and compares the outputs with the directory prefix removed.
+    ///
+    /// Two honest limits on what this proves. It does **not** detect a reordering: the fixture
+    /// is one definition and one usage, which land in different `stratify_for_display` strata,
+    /// so no score change could permute them — ranking is pinned by
+    /// `rank::tests::a_bom_on_line_one_does_not_change_the_score` instead. And the byte
+    /// comparison quietly relies on the two `tempfile` paths having equal byte length, because
+    /// the `(~N tokens)` footer is computed before the `<TMP>` substitution; that holds for
+    /// `tempfile` today, and a mismatch would show up as a one-token diff rather than as a
+    /// silent pass.
     ///
     /// Two things about the fixture are load-bearing, both learned by watching this test pass
     /// while a fix was neutered:

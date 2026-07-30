@@ -409,11 +409,15 @@ fn query_intent_boost(m: &Match, query: &str) -> i32 {
 
     let looks_type = query.chars().next().is_some_and(char::is_uppercase);
     let looks_fn = query.chars().next().is_some_and(char::is_lowercase);
-    // BOM-aware, because `str::trim_start` is not — see `types::match_text`. Construction
-    // already strips the BOM, so this is defence in depth rather than the primary fix: the
-    // whole reason #51 existed is that a prefix test silently stopped matching, and that
-    // failure is invisible in output. A construction site added later that forgets the helper
-    // costs a rendering glyph; without this it would also cost 130 points of score.
+    // BOM-aware, because `str::trim_start` is not — see `types::match_text`.
+    //
+    // Unreachable today, and deliberately kept: all nine `Match.text` construction sites go
+    // through `match_text`, and nothing in live code assigns that field otherwise, so no
+    // `Match` currently reaches ranking carrying a BOM. The rank test has to hand-build one to
+    // exercise this, which is the honest signal that it is belt-and-braces rather than a live
+    // fix. It stays because the failure it guards is invisible: a construction site added later
+    // that forgets the helper costs a visible rendering glyph, but without this it would *also*
+    // cost 130 points of score with nothing in the output to show it.
     let text = crate::lang::outline::trim_start_bom_aware(&m.text);
 
     if looks_type
