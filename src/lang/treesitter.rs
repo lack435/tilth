@@ -912,8 +912,82 @@ fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
 /// its class, so that spelling is ill-formed C++; the valid out-of-line form is a
 /// `function_definition`, which the outline classifies without consulting this walk.
 pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
-    declarator_chain_has_kind(node, "function_declarator")
-        || declarator_chain_has_kind(node, "operator_cast")
+    inner_declarator(node).is_some_and(declarator_declares_function)
+}
+
+/// True when `declarator` — a declarator node itself, not the declaration wrapping it —
+/// declares a function.
+///
+/// The per-declarator half of `declarator_chain_has_function`, which is expressed in terms
+/// of this so the two can never disagree. Needed because one declaration can introduce
+/// several declarators of *different* kinds: in `int f(), x;` the first declares a function
+/// and the second a variable, and asking the enclosing node gives one answer for both (#81).
+pub(crate) fn declarator_declares_function(declarator: tree_sitter::Node) -> bool {
+    let mut current = Some(declarator);
+    for _ in 0..MAX_DECLARATOR_DEPTH {
+        let Some(n) = current else { return false };
+        if matches!(n.kind(), "function_declarator" | "operator_cast") {
+            return true;
+        }
+        current = inner_declarator(n);
+    }
+    false
+}
+
+/// Every declarator a C/C++ declaration introduces, in source order.
+///
+/// One declaration can name several things — `int mWidth, mHeight;`, `typedef int A, B;` —
+/// and the grammar hangs each declarator off the same node as a sibling. Enumerated by
+/// **field name** rather than by kind: `node-types.json` tags all of them `declarator`, and
+/// the alternative (accept any child of a declarator-ish kind) would also collect the `type`
+/// field, a `bitfield_clause`, a `default_value` and a `storage_class_specifier`, all of
+/// which appear as siblings in the shapes measured for #81.
+pub(crate) fn c_declarators(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
+    let mut out = Vec::new();
+    for i in 0..node.child_count() {
+        let idx = u32::try_from(i).unwrap_or(u32::MAX);
+        if node.field_name_for_child(idx) == Some("declarator") {
+            if let Some(child) = node.child(idx) {
+                out.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// Every name a definition node introduces, in source order.
+///
+/// Almost always one, and then this is exactly `extract_definition_name`. The exception is a
+/// C/C++ declaration carrying several declarators, where taking only the first left every
+/// later name unindexed — invisible to `tilth_search`, absent from the outline, and so
+/// neither an exported symbol for `tilth_deps` nor part of any blast radius, while text
+/// search still matched the line and called it a usage (#81).
+///
+/// The shape that turned up most on real code is the idiomatic C struct-plus-pointer
+/// typedef, `typedef struct { … } JMP_REL, *PJMP_REL;`, where every `*PFOO` alias was being
+/// dropped — five of them in one eight-entry header.
+///
+/// Falls back to the single-name path whenever there are fewer than two declarators, so no
+/// ordinary declaration takes a different route than before. That matters beyond tidiness:
+/// `extract_definition_name` also resolves misparsed class heads and nested-type wrappers,
+/// and re-deriving those here would be a second implementation of the same question.
+pub(crate) fn extract_definition_names(node: tree_sitter::Node, lines: &[&str]) -> Vec<String> {
+    let declarators = c_declarators(node);
+    if declarators.len() < 2 {
+        return extract_definition_name(node, lines).into_iter().collect();
+    }
+    let names: Vec<String> = declarators
+        .iter()
+        .filter_map(|d| c_declarator_name(*d, lines))
+        .collect();
+    // An unresolvable chain in *any* declarator falls back rather than reporting a partial
+    // set — a half-enumerated declaration is worse than the pre-#81 behaviour, which at
+    // least always named the first.
+    if names.len() == declarators.len() {
+        names
+    } else {
+        extract_definition_name(node, lines).into_iter().collect()
+    }
 }
 
 /// Extract the name defined by a tree-sitter definition node.
@@ -1817,6 +1891,121 @@ mod tests {
             cpp_name("using Callback = void(*)(int);\n", "alias_declaration"),
             Some("Callback".to_string())
         );
+    }
+
+    /// #81: one declaration, several names. Taking only the first left every later name
+    /// findable as a usage but never as a definition — invisible to the outline, to
+    /// `tilth_deps`' exported symbols and to blast radius, while text search still matched
+    /// the line.
+    #[test]
+    fn extract_definition_names_covers_every_declarator() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            // The shape that dominates the measurement: an ordinary class member.
+            (
+                "struct S { int mA, mB; };",
+                "field_declaration",
+                &["mA", "mB"],
+            ),
+            ("int gA, gB;", "declaration", &["gA", "gB"]),
+            ("static int sA = 1, sB = 2;", "declaration", &["sA", "sB"]),
+            ("typedef int A, B, C;", "type_definition", &["A", "B", "C"]),
+            (
+                "typedef void (*CbA)(int), (*CbB)(int);",
+                "type_definition",
+                &["CbA", "CbB"],
+            ),
+            (
+                "typedef struct { int x; } SA, SB;",
+                "type_definition",
+                &["SA", "SB"],
+            ),
+            // Mixed declarator shapes under one type.
+            ("int *p, q;", "declaration", &["p", "q"]),
+            ("int f(), x;", "declaration", &["f", "x"]),
+            ("const int cA = 1, cB = 2;", "declaration", &["cA", "cB"]),
+            (
+                "struct S { int a : 3, b : 4; };",
+                "field_declaration",
+                &["a", "b"],
+            ),
+            // Controls: single-declarator forms, which must take the unchanged path.
+            ("int only;", "declaration", &["only"]),
+            ("struct S { int m = 0; };", "field_declaration", &["m"]),
+            ("typedef int Alias;", "type_definition", &["Alias"]),
+        ];
+        for (src, kind, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                extract_definition_names(node, &lines),
+                *expected,
+                "wrong names for {src:?}"
+            );
+            // The single-name entry point keeps returning the first, unchanged — every other
+            // caller (scope labels, grok, deps) still asks "what does this node declare" and
+            // gets one answer.
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(expected[0]),
+                "the single-name path changed for {src:?}"
+            );
+        }
+    }
+
+    /// The enumeration is by field name, not by kind, and this is what that buys: a
+    /// `bitfield_clause`, a `default_value`, a `storage_class_specifier` and the `type` field
+    /// all sit alongside the declarators as siblings, and a kind-based filter would collect
+    /// them.
+    #[test]
+    fn declarator_enumeration_ignores_non_declarator_siblings() {
+        let cases: &[(&str, &str, usize)] = &[
+            ("struct S { int a : 3, b : 4; };", "field_declaration", 2),
+            ("struct S { int m = 0; };", "field_declaration", 1),
+            ("static const int x = 1;", "declaration", 1),
+            ("int only;", "declaration", 1),
+        ];
+        for (src, kind, want) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                c_declarators(node).len(),
+                *want,
+                "wrong declarator count for {src:?}"
+            );
+        }
+    }
+
+    /// One declaration can declare a function *and* a variable. `declarator_chain_has_function`
+    /// answers for the node — which is the first declarator — so the per-declarator form is
+    /// what the outline needs, and the two must agree on the first one or the entry the node
+    /// arm renders would disagree with the extras beside it.
+    #[test]
+    fn per_declarator_and_per_node_function_tests_agree_on_the_first() {
+        let cases: &[(&str, &[bool])] = &[
+            ("int f(), x;", &[true, false]),
+            ("int x, f();", &[false, true]),
+            ("void (*a)(int), (*b)(int);", &[true, true]),
+            ("int a, b;", &[false, false]),
+        ];
+        for (src, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let node = find_by_kind(tree.root_node(), "declaration");
+            let ds = c_declarators(node);
+            let got: Vec<bool> = ds
+                .iter()
+                .map(|d| declarator_declares_function(*d))
+                .collect();
+            assert_eq!(got, *expected, "wrong per-declarator kinds for {src:?}");
+            assert_eq!(
+                declarator_chain_has_function(node),
+                expected[0],
+                "the node-level test disagrees with the first declarator for {src:?}"
+            );
+        }
     }
 
     /// #68: tree-sitter-cpp carries a fixed set of builtin type spellings, so a typedef

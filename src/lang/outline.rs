@@ -1,7 +1,8 @@
 use crate::lang::treesitter::{
-    c_declarator_name, cpp_misparsed_class_name, declarator_chain_has_function,
-    enclosing_misparsed_class_name, is_bodied_specifier, is_cpp_macro_invocation,
-    is_named_bodied_specifier, misparsed_member_name, node_text_simple, SPECIFIER_KINDS,
+    c_declarator_name, c_declarators, cpp_misparsed_class_name, declarator_chain_has_function,
+    declarator_declares_function, enclosing_misparsed_class_name, is_bodied_specifier,
+    is_cpp_macro_invocation, is_named_bodied_specifier, misparsed_member_name, node_text_simple,
+    SPECIFIER_KINDS,
 };
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
@@ -121,9 +122,7 @@ pub(crate) fn walk_top_level(
             entries.extend(walk_top_level(child, lines, lang));
             continue;
         }
-        if let Some(entry) = node_to_entry(child, lines, lang, 0) {
-            entries.push(entry);
-        }
+        entries.extend(node_to_entries(child, lines, lang, 0));
     }
 
     entries
@@ -135,6 +134,89 @@ fn is_preproc_conditional(kind: &str) -> bool {
         kind,
         "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif" | "preproc_elifdef"
     )
+}
+
+/// `node_to_entry`, plus one entry per *additional* declarator the node introduces.
+///
+/// One C/C++ declaration can name several things — `int mWidth, mHeight;`,
+/// `typedef int A, B, C;` — and `node_to_entry` returns a single `OutlineEntry` by
+/// construction, so every name after the first was missing from the outline. Recovered 2 and
+/// 133 entries across two real C++ trees (2 948 and 4 000 files), dominated by the idiomatic
+/// `typedef struct { … } FOO, *PFOO;` where the pointer alias was always the lost one.
+///
+/// A wrapper rather than a new return type for `node_to_entry` itself: that function has
+/// eight call sites, four of which recurse through wrappers (`template_declaration`,
+/// `export_statement`, a `field_declaration` holding a nested class) where the multi-name
+/// case cannot arise. Widening all of them would be churn without meaning.
+fn node_to_entries(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+) -> Vec<OutlineEntry> {
+    let Some(first) = node_to_entry(node, lines, lang, depth) else {
+        return Vec::new();
+    };
+    if !matches!(lang, Lang::C | Lang::Cpp) {
+        return vec![first];
+    }
+    let declarators = c_declarators(node);
+    if declarators.len() < 2 {
+        return vec![first];
+    }
+    let mut out = Vec::with_capacity(declarators.len());
+    out.push(first);
+    // Skip the first: `node_to_entry` already rendered it, with all the special-casing that
+    // arm carries (macro invocations, nested types, misparsed class bodies). The extras are
+    // the same declaration seen through a different declarator, so they share its range and
+    // differ only in name and — for `int f(), x;` — in kind.
+    for d in declarators.iter().skip(1) {
+        let Some(name) = c_declarator_name(*d, lines) else {
+            continue;
+        };
+        let kind = declarator_kind(node, *d, lines);
+        out.push(OutlineEntry {
+            kind,
+            name,
+            start_line: node.start_position().row as u32 + 1,
+            end_line: node.end_position().row as u32 + 1,
+            signature: None,
+            doc: None,
+            children: Vec::new(),
+        });
+    }
+    out
+}
+
+/// The outline kind for one declarator of a multi-declarator C/C++ declaration.
+///
+/// Mirrors the classification its node's own arm applies, but asks the *declarator* rather
+/// than the declaration — the two differ for `int f(), x;`, where one node declares both a
+/// function and a variable, and asking the node would label both the same.
+fn declarator_kind(
+    node: tree_sitter::Node,
+    declarator: tree_sitter::Node,
+    lines: &[&str],
+) -> OutlineKind {
+    // `type_definition` is decided by the node, not the declarator, and is checked first for
+    // that reason: `typedef void (*CbA)(int), (*CbB)(int);` has a `function_declarator` for
+    // each alias, but both are type aliases. Testing function-ness first rendered the first
+    // as `type CbA` (from `node_to_entry`'s arm) and the second as `fn CbB` — the two halves
+    // of one declaration disagreeing, which is the whole defect class this fix is in.
+    if node.kind() == "type_definition" {
+        return OutlineKind::TypeAlias;
+    }
+    if declarator_declares_function(declarator) {
+        return OutlineKind::Function;
+    }
+    match node.kind() {
+        "field_declaration" => OutlineKind::Property,
+        // A data member of a macro-misparsed class body arrives as a `declaration`, and the
+        // `declaration` arm renders it `prop` rather than `let` for parity with the same
+        // class spelled without its export macro. The extras have to follow.
+        _ if enclosing_misparsed_class_name(node, lines).is_some() => OutlineKind::Property,
+        _ => OutlineKind::Variable,
+    }
 }
 
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
@@ -594,9 +676,7 @@ fn collect_member(
             return;
         }
     }
-    if let Some(entry) = node_to_entry(child, lines, lang, depth) {
-        out.push(entry);
-    }
+    out.extend(node_to_entries(child, lines, lang, depth));
     // A nested type definition consumes its whole `declaration`, so a member declared
     // right after it (`class Inner { … }; Outer();`) is never reached. Emitted after
     // the type rather than before it, so the outline keeps source order.

@@ -729,6 +729,126 @@ using           uint16_t = UINT16;
         );
     }
 
+    /// #81: one C/C++ declaration can introduce several names, and the outline rendered only
+    /// the first. Class members are the shape that matters — `int mWidth, mHeight;` is
+    /// ordinary style, and on two real trees this cost 266 and 97 105 names.
+    ///
+    /// `mScaleX` and `only` are controls: single-declarator forms that always worked and must
+    /// be untouched.
+    #[test]
+    fn cpp_outline_names_every_declarator_of_a_declaration() {
+        let rendered = outline(
+            "\
+typedef int A, B, C;
+typedef void (*CbA)(int), (*CbB)(int);
+int gA, gB;
+static int sA = 1, sB = 2;
+int *p, q;
+int only;
+class Widget
+{
+private:
+    int mWidth, mHeight;
+    float mScaleX;
+};
+",
+            Lang::Cpp,
+            1000,
+        );
+        for want in [
+            "type A",
+            "type B",
+            "type C",
+            "type CbA",
+            "type CbB",
+            "let gA",
+            "let gB",
+            "let sA",
+            "let sB",
+            "let p",
+            "let q",
+            "let only",
+            "prop mWidth",
+            "prop mHeight",
+            "prop mScaleX",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+    }
+
+    /// A declaration can introduce declarators of *different* kinds — `int f(), x;` declares a
+    /// function and a variable — so the kind has to come from each declarator rather than from
+    /// the declaration. Asking the node would label both the same, which is the confidently
+    /// mislabelled entry #55 and #58 both recorded.
+    #[test]
+    fn cpp_outline_kinds_come_from_each_declarator_not_the_declaration() {
+        let rendered = outline("int f(), x;\nstruct S { int m(), n; };\n", Lang::Cpp, 1000);
+        for want in ["fn f", "let x", "fn m", "prop n"] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+    }
+
+    /// The parity assertion, and the reason this is not just "the second name appears": the
+    /// outline and `tilth_search` reach names through different entry points —
+    /// `node_to_entries` and `extract_definition_names` — and a change to one has drifted from
+    /// the other in #63, #68 and #75. Pin that every name one surface knows, the other does
+    /// too.
+    #[test]
+    fn outline_and_definition_names_agree_on_multi_declarator_declarations() {
+        fn collect(entries: &[crate::types::OutlineEntry], out: &mut Vec<String>) {
+            for e in entries {
+                out.push(e.name.clone());
+                collect(&e.children, out);
+            }
+        }
+
+        use crate::lang::treesitter::extract_definition_names;
+        let src = "\
+typedef int A, B, C;
+int gA, gB;
+static int sA = 1, sB = 2;
+int *p, q;
+int f(), x;
+struct S { int mA, mB; float mC; };
+";
+        let language = crate::lang::outline::outline_language(Lang::Cpp).expect("grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("grammar loads");
+        let tree = parser.parse(src, None).expect("parse");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Every name the definition walk would match on, from every declaration node.
+        let mut from_names: Vec<String> = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        let mut cursor = tree.root_node().walk();
+        while let Some(n) = stack.pop() {
+            if matches!(
+                n.kind(),
+                "field_declaration" | "declaration" | "type_definition"
+            ) {
+                from_names.extend(extract_definition_names(n, &lines));
+            }
+            stack.extend(n.children(&mut cursor));
+        }
+        from_names.sort();
+
+        // Every name the outline renders, flattened over nesting.
+        let mut from_outline = Vec::new();
+        collect(
+            &crate::lang::outline::get_outline_entries(src, Lang::Cpp),
+            &mut from_outline,
+        );
+        // The struct itself is an outline entry with no declarator, so it has no counterpart
+        // in the declaration-node walk above.
+        from_outline.retain(|n| n != "S");
+        from_outline.sort();
+
+        assert_eq!(
+            from_outline, from_names,
+            "the outline and the definition walk disagree about which names exist"
+        );
+    }
+
     /// #58: the two declarator shapes that stayed `<anonymous>` after #55 — explicit
     /// template specialisations and conversion operators. End-to-end through the rendered
     /// outline, since that is where the defect was visible.
