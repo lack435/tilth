@@ -273,6 +273,17 @@ pub fn search_multi_symbol_expanded(
     // result is identical to a lone `symbol::search`'s.
     let results = symbol::search_multi(queries, scope, context, glob, full)?;
 
+    // Warm across *every* target in one pass, before rendering any of them.
+    //
+    // `format_matches` warms its own batch and is what makes the labels correct; this is
+    // purely about how many times a file gets parsed. It has to be a single call rather than
+    // one per target, because the grouping that gives "one parse per file" happens *inside*
+    // `warm_labels` — five separate calls over the same file parse it five times, which is
+    // what a comma query whose matches share a file does. Measured on 40 matches in one
+    // 385 KB file: 3.5 s with no warm here, 0.72 s warming per target, 0.42 s warming across
+    // targets, against main's 0.40 s.
+    warm_match_labels(results.iter().flat_map(|r| r.matches.iter()), cache);
+
     for result in &results {
         let mut out = format::search_header(
             &result.query,
@@ -445,6 +456,10 @@ fn format_matches(
     out: &mut String,
     segments: &mut Vec<(i64, usize, usize)>,
 ) {
+    // Every rendered entry goes through here, so this is where scope annotations get
+    // resolved — see `warm_match_labels`.
+    warm_match_labels(matches.iter(), cache);
+
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
     let multi_file = matches
@@ -494,6 +509,33 @@ type DefKey<'a> = (
     Option<&'a str>,
     Option<&'a str>,
 );
+
+/// Resolve every scope annotation `matches` can ask for, up front and grouped by file.
+///
+/// Called from `format_matches`, which is the choke point every rendered entry passes
+/// through — including `search_multi_symbol_expanded`, which builds its own header and never
+/// calls `format_search_result`. Warming one level up covered the faceted path and silently
+/// missed the comma-query one, where each shown usage then re-parsed its whole file: 404 ms
+/// to 3.5 s on a page concentrated in one 385 KB file. Two render entry points and one warm
+/// site is the shape that drifts, so the warm site is the shared one.
+///
+/// Idempotent and cheap to repeat, because `warm_labels` skips lines already answered for the
+/// file's current mtime. That is what lets callers warm a wider set first as an optimisation
+/// without this one doing the work twice.
+///
+/// Definitions and impl matches carry their own name and never ask for a label, and non-code
+/// files are answered by the markdown walker or not at all, so both are filtered out rather
+/// than parsed for nothing.
+fn warm_match_labels<'a>(matches: impl IntoIterator<Item = &'a Match>, cache: &OutlineCache) {
+    scope::warm_labels(
+        matches
+            .into_iter()
+            .filter(|m| !m.is_definition && m.impl_target.is_none())
+            .filter(|m| matches!(crate::lang::detect_file_type(&m.path), FileType::Code(_)))
+            .map(|m| (m.path.as_path(), m.line)),
+        cache,
+    );
+}
 
 /// Returns a Vec of groups, where each group is a slice of matches.
 /// Definitions and impl matches are always singleton groups.
@@ -1109,25 +1151,6 @@ fn format_search_result(
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
     let mut segments: Vec<(i64, usize, usize)> = Vec::new();
-
-    // Resolve every scope annotation this page can ask for, up front and grouped by file.
-    //
-    // `result.matches` is already the post-cap shown set (`merged.truncate(max_matches)` in
-    // `symbol.rs`), so this asks for exactly what the formatter below will render — no
-    // speculative work. Doing it here rather than lazily per match is what holds peak memory
-    // to one tree: `warm_labels` parses each distinct file once and drops its tree before
-    // moving on, where the lazy path used to leave every file's tree alive in the cache for
-    // the life of the process (#67). Definitions carry their own name and never ask, so they
-    // are skipped.
-    scope::warm_labels(
-        result
-            .matches
-            .iter()
-            .filter(|m| !m.is_definition && m.impl_target.is_none())
-            .filter(|m| matches!(crate::lang::detect_file_type(&m.path), FileType::Code(_)))
-            .map(|m| (m.path.as_path(), m.line)),
-        cache,
-    );
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
