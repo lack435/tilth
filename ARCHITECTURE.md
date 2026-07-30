@@ -340,8 +340,27 @@ opinionated defaults:
   and creates a known duplicate-match problem when a path is reachable
   via multiple symlink chains — see [Open
   threads](#open-architectural-threads).
-- **Threads**: `TILTH_THREADS` env or `available_parallelism / 2`
-  clamped to `[2, 6]`.
+- **Threads**: `TILTH_THREADS` env, else `available_parallelism / 2`
+  clamped to `[2, 6]` — so at most 6 however large the machine. One
+  policy, in `util::worker_threads`, read by both the walkers and the
+  rayon pool.
+
+  Raising it costs **memory as well as CPU**: parses hold one
+  tree-sitter tree per thread, and a tree is ~26x its file's bytes for
+  ordinary source and ~65x for a line-dense one. That term used to
+  scale linearly with the thread count — ~448 MB at 32 threads on
+  ordinary 499 KB files, ~1.1 GB line-dense — and is now bounded by
+  `lang::parse_budget` instead. See `util::worker_threads` for the
+  measurements and #70.
+- **Parse memory**: `TILTH_PARSE_BUDGET_MB` (default 256) caps the
+  bytes of tree-sitter tree held concurrently, by reserving an
+  estimate per file before parsing and waiting when it would not fit.
+  Inert at the default thread count; at `TILTH_THREADS=32` it holds
+  peak to ~232 MB where it was ~1.1 GB, for ~24% wall on that shape.
+  `0` disables it. Deadlock-free by construction: a file whose
+  estimate exceeds the whole ceiling is still parsed, so a tiny
+  ceiling degrades to serial parsing rather than hanging. See
+  `lang::parse_budget`.
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.

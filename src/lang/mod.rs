@@ -1,6 +1,7 @@
 pub mod cpp_macro;
 pub mod detection;
 pub mod outline;
+pub mod parse_budget;
 pub mod treesitter;
 
 use std::path::Path;

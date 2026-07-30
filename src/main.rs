@@ -460,21 +460,14 @@ fn terminal_height() -> usize {
     24
 }
 
-/// Configure rayon global thread pool to limit CPU usage.
+/// Configure the rayon global thread pool.
 ///
-/// Defaults to min(cores / 2, 6). Override with `TILTH_THREADS` env var.
-/// This matters for long-lived MCP sessions where back-to-back searches
-/// can sustain high CPU (see #27).
+/// Same count as every parallel file walk, and for the same reasons — CPU in a long-lived MCP
+/// session (#27) and one tree-sitter tree per thread (#70). Both are recorded, with measurements,
+/// on `util::worker_threads`.
 fn configure_thread_pools() {
-    let num_threads = std::env::var("TILTH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
-        });
-
     rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
+        .num_threads(tilth::util::worker_threads())
         .build_global()
         .ok();
 }

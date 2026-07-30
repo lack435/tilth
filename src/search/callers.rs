@@ -265,7 +265,7 @@ fn find_callers_treesitter_batch(
         return Vec::new();
     };
 
-    let Some(tree) = crate::lang::parse_masked(content, Some(lang), ts_lang) else {
+    let Some(tree) = crate::lang::parse_budget::parse_budgeted(content, Some(lang), ts_lang) else {
         return Vec::new();
     };
 
