@@ -1110,6 +1110,25 @@ fn format_search_result(
     let mut expanded_files = HashSet::new();
     let mut segments: Vec<(i64, usize, usize)> = Vec::new();
 
+    // Resolve every scope annotation this page can ask for, up front and grouped by file.
+    //
+    // `result.matches` is already the post-cap shown set (`merged.truncate(max_matches)` in
+    // `symbol.rs`), so this asks for exactly what the formatter below will render — no
+    // speculative work. Doing it here rather than lazily per match is what holds peak memory
+    // to one tree: `warm_labels` parses each distinct file once and drops its tree before
+    // moving on, where the lazy path used to leave every file's tree alive in the cache for
+    // the life of the process (#67). Definitions carry their own name and never ask, so they
+    // are skipped.
+    scope::warm_labels(
+        result
+            .matches
+            .iter()
+            .filter(|m| !m.is_definition && m.impl_target.is_none())
+            .filter(|m| matches!(crate::lang::detect_file_type(&m.path), FileType::Code(_)))
+            .map(|m| (m.path.as_path(), m.line)),
+        cache,
+    );
+
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
     if let Some(file_outline) =
