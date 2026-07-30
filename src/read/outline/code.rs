@@ -689,8 +689,14 @@ public:
     /// made of, and the outline was the only surface that lost the name: symbol search
     /// resolved it all along.
     ///
-    /// `MyByte` and `wchar_t` are controls — same source shape, `type_identifier`
-    /// declarator, never broken.
+    /// The reference row is what covers the `is_declarator_link` half end to end, and it
+    /// only does so because its alias is *also* a builtin: `typedef UINT8& int16_t;` puts
+    /// a `primitive_type` under the `reference_declarator`, where `typedef UINT8&
+    /// uint8_ref_t;` puts a `type_identifier` and would have passed on `main`. Whether a
+    /// row is a case or a control turns on the alias name alone, never on the decoration.
+    ///
+    /// `MyByte` and `wchar_t` are the deliberate controls — same source shape, but the
+    /// grammar reads those declarators as `type_identifier`, so they were never broken.
     #[test]
     fn cpp_outline_names_typedef_aliases_that_shadow_builtins() {
         let rendered = outline(
@@ -698,7 +704,7 @@ public:
 typedef UINT8   uint8_t;
 typedef INT64   int64_t;
 typedef SSIZE_T ssize_t;
-typedef UINT8&  uint8_ref_t;
+typedef UINT8&  int16_t;
 typedef UINT8   MyByte;
 typedef int     wchar_t;
 using           uint16_t = UINT16;
@@ -710,6 +716,7 @@ using           uint16_t = UINT16;
             "type uint8_t",
             "type int64_t",
             "type ssize_t",
+            "type int16_t",
             "type MyByte",
             "type wchar_t",
             "type uint16_t",

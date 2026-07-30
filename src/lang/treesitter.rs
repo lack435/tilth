@@ -278,13 +278,27 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
         //   primitive_type  "uint8_t"   <- the declarator: the name being declared
         // ```
         //
-        // This function is only ever entered from a declarator position, and a declarator
-        // is by construction the thing being named, so accepting it here cannot turn a
-        // type *reference* into a name. Without it the walk answered `None` and the
-        // outline said `type <anonymous>` — while `extract_definition_name` resolved
-        // `uint8_t` correctly, because `primitive_type` is not in `C_DECLARATOR_KINDS` and
-        // its generic probe reads the declarator's raw text, which for a bare token is
-        // right. One symbol under two names depending on the caller (#68).
+        // Accepting it cannot turn a type *reference* into a name, and the grammar is what
+        // guarantees that rather than a reading of the call sites. `node-types.json` puts
+        // `primitive_type` in exactly one declarator supertype — `_type_declarator`, which
+        // `_declarator`, `_field_declarator` and `_abstract_declarator` all exclude — and
+        // the only node rooting a `_type_declarator` chain is `type_definition`. So a
+        // `primitive_type` in declarator position *is* a typedef's alias, in both the c and
+        // cpp grammars. `int *size_t;` yields `pointer_declarator → identifier`, while
+        // `typedef int *size_t;` yields `pointer_declarator → primitive_type`.
+        //
+        // Without this the walk answered `None` and the outline said `type <anonymous>` —
+        // while `extract_definition_name` resolved `uint8_t` correctly, because
+        // `primitive_type` is not in `C_DECLARATOR_KINDS`, so its generic probe read the
+        // declarator's raw text, which for a bare token is right. One symbol under two
+        // names depending on the caller (#68).
+        //
+        // Deliberately *not* added to `C_DECLARATOR_KINDS`, unlike the templated kinds in
+        // 7c45ef2. That entry exists to stop the gate and the walk disagreeing, and here
+        // they cannot: both end up calling `node_text_simple` on the same node.
+        // `declarator_kinds_are_unreachable_outside_the_c_family` pins the other half of
+        // the argument — `primitive_type` is the one kind in these lists that is not
+        // C/C++-exclusive, so it needs a reachability guard rather than an exclusivity one.
         "identifier" | "field_identifier" | "type_identifier" | "destructor_name"
         | "operator_name" | "primitive_type" => {
             let text = node_text_simple(node, lines);
@@ -1541,6 +1555,99 @@ mod tests {
                 o.iter().all(|g| *g == "c" || *g == "cpp"),
                 "{kind} is not C/C++-exclusive (owners: {o:?}) — registering it globally \
                  would change behaviour for those grammars"
+            );
+        }
+    }
+
+    /// The companion guard to `definition_kinds_are_not_ambiguous_across_grammars`, for
+    /// the *declarator* lists. `DEFINITION_KINDS` had one and these did not, which is how
+    /// #68 could add `primitive_type` — a kind four grammars own — to a name walk with
+    /// nothing asserting that the other three cannot reach it.
+    ///
+    /// The walk is only ever entered through a `declarator` **field**, so that field is
+    /// the whole gate. Two facts make it hold, and both are pinned here because either
+    /// one silently changing is what would break it:
+    ///
+    ///   * only the C family and Java expose a `declarator` field at all;
+    ///   * Java has no `primitive_type` node kind (it spells them `integral_type` and
+    ///     `floating_point_type`), and its declarator is a `variable_declarator`, which is
+    ///     not in `C_DECLARATOR_KINDS`.
+    ///
+    /// So the grammars that own `primitive_type` outside C/C++ have no way to enter the
+    /// walk, and the grammar that could enter it does not own the kind.
+    #[test]
+    fn declarator_kinds_are_unreachable_outside_the_c_family() {
+        let grammars: Vec<(&str, tree_sitter::Language)> = vec![
+            ("rust", tree_sitter_rust::LANGUAGE.into()),
+            ("go", tree_sitter_go::LANGUAGE.into()),
+            ("java", tree_sitter_java::LANGUAGE.into()),
+            ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
+            ("c", tree_sitter_c::LANGUAGE.into()),
+            ("cpp", tree_sitter_cpp::LANGUAGE.into()),
+            ("scala", tree_sitter_scala::LANGUAGE.into()),
+            ("php", tree_sitter_php::LANGUAGE_PHP.into()),
+            ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
+            (
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            ("javascript", tree_sitter_javascript::LANGUAGE.into()),
+            ("python", tree_sitter_python::LANGUAGE.into()),
+            ("swift", tree_sitter_swift::LANGUAGE.into()),
+        ];
+
+        // Grammars exposing a `declarator` field — the only way into the walk.
+        let with_declarator: Vec<&str> = grammars
+            .iter()
+            .filter(|(_, l)| l.field_id_for_name("declarator").is_some())
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            with_declarator,
+            ["java", "c", "cpp"],
+            "the set of grammars with a `declarator` field changed; the declarator walk \
+             may now be reachable from a language it was never checked against"
+        );
+
+        // Java is the one non-C-family grammar that can enter the walk. It must own none
+        // of the kinds the walk acts on, or `extract_definition_name`'s gate would admit
+        // a Java declarator into C/C++ naming rules.
+        let java = &grammars
+            .iter()
+            .find(|(n, _)| *n == "java")
+            .expect("java grammar")
+            .1;
+        for kind in C_DECLARATOR_KINDS.iter().copied().chain([
+            "primitive_type",
+            "field_identifier",
+            "destructor_name",
+        ]) {
+            assert_eq!(
+                java.id_for_node_kind(kind, true),
+                0,
+                "java owns {kind:?}, so a Java `declarator` field could reach the C/C++ \
+                 declarator walk"
+            );
+        }
+
+        // `primitive_type` is not C/C++-exclusive — unlike every other kind in these
+        // lists — so it is the one that needs the reachability argument rather than an
+        // exclusivity one. Pinned so the argument is not quietly invalidated.
+        let owners: Vec<&str> = grammars
+            .iter()
+            .filter(|(_, l)| l.id_for_node_kind("primitive_type", true) != 0)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(
+            owners,
+            ["rust", "c", "cpp", "php"],
+            "the set of grammars owning `primitive_type` changed"
+        );
+        for lang in ["rust", "php"] {
+            assert!(
+                !with_declarator.contains(&lang),
+                "{lang} owns `primitive_type` and now has a `declarator` field — the walk \
+                 is reachable there, and a {lang} type reference could be named as a symbol"
             );
         }
     }
