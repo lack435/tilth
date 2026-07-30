@@ -398,6 +398,9 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod bom_surfaces;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

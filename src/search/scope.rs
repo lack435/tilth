@@ -174,7 +174,16 @@ fn resolve_lines(
     };
     let ts_lang = crate::lang::outline::outline_language(lang)?;
     let content = std::fs::read_to_string(path).ok()?;
-    let tree = crate::lang::parse_masked(&content, Some(lang), &ts_lang)?;
+    // Strip the BOM before parsing. Unstripped, tree-sitter sees U+FEFF ahead of the first token and
+    // line 1 resolves to an error node, so `walk_to_enclosing_definition` finds nothing and the
+    // caller renders `[usage]` where it should render `[usage in function foo]` — a wrong answer with
+    // no U+FEFF anywhere in the output to show for it. This is the seventh parse of this shape; #41
+    // fixed six and did not reach here, and `bom_surfaces` is what finally caught it.
+    //
+    // Row indices stay aligned because a BOM carries no newline, so `src` below and the rows
+    // tree-sitter reports still agree — the same argument `find_defs_markdown_buf` makes.
+    let content = crate::lang::outline::strip_bom(&content);
+    let tree = crate::lang::parse_masked(content, Some(lang), &ts_lang)?;
     let src: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
 
