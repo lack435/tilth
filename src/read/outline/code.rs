@@ -683,6 +683,54 @@ public:
         );
     }
 
+    /// #58: the two declarator shapes that stayed `<anonymous>` after #55 — explicit
+    /// template specialisations and conversion operators. End-to-end through the rendered
+    /// outline, since that is where the defect was visible.
+    ///
+    /// The `prop` count is the same second-half check as
+    /// `cpp_outline_names_reference_returning_members`: a conversion operator has no
+    /// `function_declarator` in its chain, so naming it without teaching
+    /// `declarator_chain_has_function` about `operator_cast` renders it as data.
+    #[test]
+    fn cpp_outline_names_specialisations_and_conversion_operators() {
+        let rendered = outline(
+            "\
+template <> const char* Cls::GetName<wchar_t>() { return 0; }
+
+class Holder
+{
+public:
+    template <> int CallMethod<int>() { return 0; }
+    operator bool() const;
+    operator Holder&();
+    operator const char*();
+    int Value;
+};
+",
+            Lang::Cpp,
+            1000,
+        );
+        for want in [
+            "fn GetName",
+            "fn CallMethod",
+            "fn operator bool",
+            "fn operator Holder&",
+            "fn operator const char*",
+            "prop Value",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+        assert!(
+            !rendered.contains("<anonymous>"),
+            "no entry should be anonymous:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("prop ").count(),
+            1,
+            "only `Value` is data — a conversion operator is a function:\n{rendered}"
+        );
+    }
+
     /// Parity alone would be satisfied by both sides being equally wrong, so pin the
     /// things #49 got wrong as absolute facts: the class's range covers the whole
     /// class, and every member is a *child* of it rather than a top-level sibling.

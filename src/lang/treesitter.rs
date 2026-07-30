@@ -116,6 +116,21 @@ pub(crate) fn is_named_bodied_specifier(node: tree_sitter::Node) -> bool {
 ///
 /// `void Holder::Work()` nests as `function_declarator` → `qualified_identifier`
 /// → `identifier`; pointers, references and arrays add further layers.
+///
+/// `operator_cast` is here because a conversion operator's *whole* declarator is one —
+/// `operator Holder&() { … }` is a `function_definition` whose `declarator` field is an
+/// `operator_cast`, with no `function_declarator` above it. Without the entry,
+/// `extract_definition_name`'s gate rejected the chain and fell through to the raw
+/// declarator text.
+///
+/// The template-specialisation kinds (`template_function`, `template_method`) are
+/// deliberately *not* here. `node-types.json` makes them members of the `_declarator` and
+/// `_field_declarator` supertypes, so they *can* be a definition node's own `declarator`
+/// — but only for `void Apply<int>(int);`, a declarator carrying template arguments with
+/// no `template <>` clause of its own. In that shape the chain above them is a
+/// `function_declarator` regardless, so the gate already admits it and
+/// `c_declarator_name`'s own arm does the naming. Listing them here would widen the gate
+/// without reaching anything it does not already reach.
 const C_DECLARATOR_KINDS: &[&str] = &[
     "function_declarator",
     "pointer_declarator",
@@ -125,6 +140,21 @@ const C_DECLARATOR_KINDS: &[&str] = &[
     "attributed_declarator",
     "init_declarator",
     "qualified_identifier",
+    "operator_cast",
+];
+
+/// C/C++ *abstract* declarator kinds — a declarator with no name in it.
+///
+/// These carry the decoration of a type rather than of a named declaration:
+/// `operator Holder&()` nests `abstract_reference_declarator` →
+/// `abstract_function_declarator`. Only `operator_cast_name` walks them, to find where
+/// a conversion operator's spelling ends.
+const C_ABSTRACT_DECLARATOR_KINDS: &[&str] = &[
+    "abstract_function_declarator",
+    "abstract_pointer_declarator",
+    "abstract_reference_declarator",
+    "abstract_array_declarator",
+    "abstract_parenthesized_declarator",
 ];
 
 /// True when `node` is a definition node for `lang`.
@@ -182,6 +212,18 @@ pub(crate) fn is_definition_node(node: tree_sitter::Node, lang: Option<Lang>) ->
         if is_cpp_member_template_declaration(node) {
             return true;
         }
+        // 4. A conversion operator declared inside a class body: `operator bool();`
+        //    arrives as a `declaration` where `bool Get();` beside it is a
+        //    `field_declaration` (already covered by `C_FAMILY_DEFINITION_KINDS`). With
+        //    no return type there is nothing for the grammar to read as a field, so this
+        //    is the only place the shape can be recognised — and without it a conversion
+        //    operator was the one kind of member prototype `tilth_search` reported as a
+        //    *usage* while calling the member declared on the next line a definition.
+        //    Anchored on `field_declaration_list`, like case 3, so nothing at namespace
+        //    scope is affected.
+        if is_cpp_member_conversion_declaration(node) {
+            return true;
+        }
         return declarator_chain_has_kind(node, "qualified_identifier")
             && !declarator_chain_has_function(node)
             && !has_extern_storage_class(node);
@@ -229,6 +271,32 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
         "qualified_identifier" => node
             .child_by_field_name("name")
             .and_then(|n| c_declarator_name_at(n, lines, depth + 1)),
+        // `GetName<wchar_t>` in `template <> const TCHAR* Cls::GetName<wchar_t>() { … }`,
+        // and `CallMethod<int>` for the in-class form. An explicit specialisation's
+        // declarator is a `template_function` (or `template_method`), which exposes
+        // `name` and `arguments` but **no `declarator`** — so the generic arm below gave
+        // up and every explicit specialisation resolved as `<anonymous>`.
+        //
+        // Resolves to the bare `GetName`, dropping the template arguments, exactly as
+        // the `qualified_identifier` arm drops its scope: tilth names a symbol by its
+        // trailing identifier in every language, and grok's `split_qualified` retry
+        // relies on that. It also means a specialisation and its primary template share
+        // one name, which is what a reader searching `GetName` is asking for — and it
+        // matches `trailing_type_identifier`, which already resolves `Box<int>` to `Box`
+        // when matching a specialised class's constructor.
+        //
+        // `template_type` is the third templated-name kind and is deliberately absent.
+        // The grammar allows it as a `qualified_identifier`'s `name`, but only a *type*
+        // is spelled that way, and this walk is only ever entered from a `declarator`
+        // field — so no C++ reaches it here, and an arm no test can reach is an arm that
+        // cannot be trusted. `trailing_type_identifier` covers the specifier-name
+        // position where `template_type` does occur.
+        "template_function" | "template_method" => node
+            .child_by_field_name("name")
+            .and_then(|n| c_declarator_name_at(n, lines, depth + 1)),
+        // `operator Holder&()`, `operator bool() const`. A conversion operator declares
+        // no name at all — see `operator_cast_name` for what it is called instead.
+        "operator_cast" => operator_cast_name(node, lines),
         // `(*Cb)` in `typedef void (*Cb)(int);` — a `parenthesized_declarator` wraps
         // its inner declarator as an *unnamed* child, so `child_by_field_name` finds
         // nothing and the generic arm below would give up. Without this, function
@@ -246,6 +314,72 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
         // Every other declarator kind wraps the next one down.
         _ => inner_declarator(node).and_then(|d| c_declarator_name_at(d, lines, depth + 1)),
     }
+}
+
+/// The symbol name of a C++ conversion operator: `operator bool`, `operator Holder&`,
+/// `operator const char*`.
+///
+/// Unlike every other declarator, `operator_cast` holds no name — what is being declared
+/// is spelled by a `type` field plus whatever pointer/reference decoration sits in its
+/// `declarator`. So the name has to be *decided* rather than read, and the decision is:
+/// **the verbatim source text from `operator` up to the parameter list**, trailing
+/// whitespace trimmed.
+///
+/// Three reasons for verbatim rather than reassembling the `type` field:
+///
+///   * It matches the `operator_name` arm, which already returns raw text. `operator==`,
+///     `operator[]` and `operator<<` are all existing names carrying punctuation, so
+///     this introduces no shape the rest of tilth has not already seen.
+///   * The result is a contiguous substring of the line it came from — which is a
+///     requirement, not a nicety. `symbol::defs_from_tree`'s callers gate every file on
+///     `memchr::memmem::find(content, query)` before parsing it, so a name assembled
+///     out of order would be unfindable by the very search that resolves it.
+///   * The `type` field alone loses too much to *be* a name. `operator const char*()`
+///     keeps `const` and `*` outside it, so type-only would yield `operator char` — not
+///     a shortened form of the real name but a different operator, one that can legally
+///     coexist with it in the same class.
+///
+/// The cut lands at the `parameter_list`, so `const`, `noexcept` and any trailing return
+/// are excluded; `explicit` is excluded too, since it is a sibling of `operator_cast`
+/// rather than part of it. A conversion operator split across lines yields `None` rather
+/// than the first line's fragment: a partial spelling would be a name no search could
+/// match, which is worse than the `<anonymous>` it replaces.
+fn operator_cast_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let params = abstract_parameter_list(node)?;
+    let row = node.start_position().row;
+    if row != params.start_position().row || row >= lines.len() {
+        return None;
+    }
+    let start = node.start_position().column;
+    let end = params.start_position().column.min(lines[row].len());
+    // `get` rather than indexing: columns are byte offsets, and a multi-byte character
+    // in a type name would otherwise panic on a non-boundary slice.
+    let text = lines[row].get(start..end)?.trim_end();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The `parameter_list` of a conversion operator, through the abstract declarator chain
+/// that carries its return decoration.
+///
+/// `operator bool()` holds an `abstract_function_declarator` directly;
+/// `operator Holder&()` and `operator const char*()` wrap that in an
+/// `abstract_reference_declarator` / `abstract_pointer_declarator`. Those wrappers hold
+/// their inner declarator as an *unnamed* child, the same way `reference_declarator`
+/// does, so the step down is by allowlist — see `inner_declarator` for why guessing
+/// positionally is not safe here either.
+fn abstract_parameter_list(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut current = node.child_by_field_name("declarator")?;
+    for _ in 0..MAX_DECLARATOR_DEPTH {
+        if let Some(params) = current.child_by_field_name("parameters") {
+            return Some(params);
+        }
+        let mut cursor = current.walk();
+        let next = current
+            .children(&mut cursor)
+            .find(|c| C_ABSTRACT_DECLARATOR_KINDS.contains(&c.kind()));
+        current = next?;
+    }
+    None
 }
 
 /// The next declarator down a C/C++ declarator chain.
@@ -601,6 +735,27 @@ fn trailing_type_identifier(node: tree_sitter::Node, lines: &[&str]) -> Option<S
     None
 }
 
+/// True when `node` is a `declaration` for a conversion operator declared inside a class
+/// body — `field_declaration_list` → `declaration` with an `operator_cast` declarator.
+///
+/// `operator bool();` and `operator Holder&();` are member *prototypes*, but they do not
+/// parse as `field_declaration` the way `bool Get();` does: a conversion operator has no
+/// return type, so there is no field for the grammar to see. Every other member prototype
+/// is a definition here, so without this one shape the class's own conversion operator
+/// came back from `tilth_search` as a usage.
+///
+/// Only the in-class form. An out-of-line conversion operator is always *defined*
+/// (`Thing::operator Holder&() { … }`), which is a `function_definition` and already a
+/// definition kind — so the `field_declaration_list` anchor costs nothing and keeps the
+/// existing rule that a namespace-scope prototype is not a definition.
+fn is_cpp_member_conversion_declaration(node: tree_sitter::Node) -> bool {
+    node.parent()
+        .is_some_and(|p| p.kind() == "field_declaration_list")
+        && node
+            .child_by_field_name("declarator")
+            .is_some_and(|d| d.kind() == "operator_cast")
+}
+
 /// True when `node` is a `declaration` for a member template inside a class body —
 /// `field_declaration_list` → `template_declaration` → `declaration`.
 fn is_cpp_member_template_declaration(node: tree_sitter::Node) -> bool {
@@ -652,8 +807,17 @@ fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
 
 /// True when `node`'s C/C++ declarator chain declares a function — the marker that
 /// separates a real definition (`class Foo bar() { … }`) from a misparsed class head.
+///
+/// `operator_cast` counts as well, and has to. A conversion operator is always a
+/// function, but its parameter list hangs off an `abstract_function_declarator`, so no
+/// `function_declarator` appears anywhere in its chain. Once the name walk learned to
+/// resolve one, `node_to_entry`'s member arms would have rendered `operator bool();` as
+/// `prop operator bool` — the same trap #55 recorded for reference-returning members,
+/// where naming a member without also teaching this walk what it is produces a
+/// confidently mislabelled entry instead of a missing one.
 pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
     declarator_chain_has_kind(node, "function_declarator")
+        || declarator_chain_has_kind(node, "operator_cast")
 }
 
 /// Extract the name defined by a tree-sitter definition node.
@@ -1956,6 +2120,261 @@ mod tests {
                 "{src:?} must be a definition"
             );
         }
+    }
+
+    /// #58, shape 1: an explicit specialisation's declarator is a `template_function`
+    /// (or `template_method`), which exposes `name` and `arguments` but no `declarator`
+    /// — so the generic arm gave up and the symbol was not indexed under any name.
+    ///
+    /// Every case resolves to the *bare* name, dropping both the template arguments and
+    /// any qualifier, so a specialisation and its primary template share one name.
+    #[test]
+    fn extract_definition_name_cpp_explicit_specialisations() {
+        let cases: &[(&str, &str)] = &[
+            // An explicit *function* specialisation, with and without a qualifier and
+            // with the pointer-return layer that the real-world spelling carries.
+            ("template <> void Apply<int>(int V) {}", "Apply"),
+            (
+                "template <> const char* Cls::GetName<wchar_t>() { return 0; }",
+                "GetName",
+            ),
+            ("template <> void Cls::Apply<int>(int V) {}", "Apply"),
+            // A reference return puts a `reference_declarator` above the chain too.
+            ("template <> Holder& Cls::Ref<int>() { return L; }", "Ref"),
+        ];
+        for (src, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            // `template_declaration` is a transparent wrapper — the definition is inside.
+            let node = find_by_kind(tree.root_node(), "function_definition");
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "wrong name for {src:?}"
+            );
+            assert!(
+                is_definition_node(node, Some(Lang::Cpp)),
+                "{src:?} must be a definition"
+            );
+        }
+    }
+
+    /// The in-class half of #58's shape 1, kept separate because the two reach the
+    /// grammar's specialisation nodes through different supertypes:
+    ///
+    ///   * a member carrying a `template <>` clause is a `declaration`, whose declarator
+    ///     supertype `_declarator` supplies `template_function`;
+    ///   * a member whose declarator carries template arguments with no clause of its own
+    ///     is a `field_declaration`, whose `_field_declarator` supplies `template_method`.
+    ///
+    /// Without the second case the `template_method` arm of `c_declarator_name` would be
+    /// unreachable, and an arm no test can reach is an arm that cannot be trusted.
+    #[test]
+    fn extract_definition_name_cpp_explicit_method_specialisations() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "struct S { template <> int CallMethod<int>() { return 0; } };",
+                "function_definition",
+                "CallMethod",
+            ),
+            (
+                "struct S { template <> void Apply<int>(int V); };",
+                "declaration",
+                "Apply",
+            ),
+            // `template_method`: template arguments in the declarator, no clause.
+            (
+                "struct S { void Apply<int>(int V); };",
+                "field_declaration",
+                "Apply",
+            ),
+            (
+                "struct S { int& Apply<int>(int V); };",
+                "field_declaration",
+                "Apply",
+            ),
+        ];
+        for (src, kind, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "wrong name for {src:?} (node kind {kind})"
+            );
+            assert!(
+                is_definition_node(node, Some(Lang::Cpp)),
+                "{src:?} must be a definition"
+            );
+        }
+    }
+
+    /// #58, shape 2, and the recorded answer to the question it left open: a conversion
+    /// operator's symbol name is its **verbatim spelling up to the parameter list**.
+    ///
+    /// The alternative — `"operator "` plus the `type` field — is what makes the
+    /// `const char*` row load-bearing. `const` and `*` sit outside that field, so
+    /// type-only would name it `operator char`: not a shortened form of the real name
+    /// but a *different* operator, one that can legally coexist with it in the same
+    /// class. Every expected value here is also a contiguous substring of its source,
+    /// which is what `symbol.rs`' `memmem` prefilter needs to find it again.
+    #[test]
+    fn extract_definition_name_cpp_conversion_operators() {
+        let cases: &[(&str, &str, &str)] = &[
+            // To a reference, and to a plain type — the two the issue asks for.
+            (
+                "struct Thing { operator Holder&() { return H; } };",
+                "function_definition",
+                "operator Holder&",
+            ),
+            (
+                "struct S { operator bool() const { return true; } };",
+                "function_definition",
+                "operator bool",
+            ),
+            // Decoration that lives outside the `type` field must survive.
+            (
+                "struct S { operator const char*() { return 0; } };",
+                "function_definition",
+                "operator const char*",
+            ),
+            (
+                "struct S { operator Holder&&() { return {}; } };",
+                "function_definition",
+                "operator Holder&&",
+            ),
+            // A multi-token, a qualified and a templated target type.
+            (
+                "struct S { explicit operator unsigned int() const { return 0; } };",
+                "function_definition",
+                "operator unsigned int",
+            ),
+            (
+                "struct S { operator std::string() { return {}; } };",
+                "function_definition",
+                "operator std::string",
+            ),
+            (
+                "struct S { operator Box<int>() { return {}; } };",
+                "function_definition",
+                "operator Box<int>",
+            ),
+            // Out-of-line: the `operator_cast` is a `qualified_identifier`'s `name`.
+            (
+                "Thing::operator Holder&() { return H; }",
+                "function_definition",
+                "operator Holder&",
+            ),
+        ];
+        for (src, kind, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "wrong name for {src:?}"
+            );
+            assert!(
+                is_definition_node(node, Some(Lang::Cpp)),
+                "{src:?} must be a definition"
+            );
+            assert!(
+                owned.contains(expected),
+                "{expected:?} must be a literal substring of {src:?} — `symbol.rs` gates \
+                 every file on `memmem::find(content, query)` before parsing it, so a name \
+                 that is not one cannot be found by the search that resolved it"
+            );
+        }
+    }
+
+    /// The classification half, and the trap #55 recorded: naming a member without also
+    /// teaching the chain walk what it is produces a confidently *mislabelled* entry
+    /// rather than a missing one.
+    ///
+    /// A conversion operator's parameter list hangs off an `abstract_function_declarator`,
+    /// so no `function_declarator` appears anywhere in its chain — left alone,
+    /// `node_to_entry`'s member arms would have rendered `operator bool();` as
+    /// `prop operator bool`.
+    #[test]
+    fn conversion_operator_reads_as_a_function() {
+        let cases = [
+            "struct S { operator bool(); };",
+            "struct S { operator Holder&(); };",
+            "struct S { operator const char*(); };",
+            "struct S { operator bool() const { return true; } };",
+        ];
+        for src in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let spec = tree.root_node().named_child(0).expect("a top-level node");
+            let body = spec.child_by_field_name("body").expect("a body");
+            let member = body.named_child(0).expect("one member");
+            assert!(
+                declarator_chain_has_function(member),
+                "{src:?} member ({}) must read as a function",
+                member.kind()
+            );
+        }
+    }
+
+    /// A conversion operator is the one member prototype that does not parse as a
+    /// `field_declaration`: with no return type there is no field for the grammar to see,
+    /// so `operator bool();` arrives as a `declaration` while `bool Get();` beside it is a
+    /// `field_declaration` and so already a definition.
+    ///
+    /// Pinned as *parity* with the plain member rather than as a bare assertion, because
+    /// the defect was the asymmetry: `tilth_search` called one of two adjacent member
+    /// prototypes a definition and the other a usage.
+    #[test]
+    fn member_conversion_operator_prototype_matches_a_plain_prototype() {
+        let cases = [
+            ("struct S { operator bool(); };", "bool Get();"),
+            ("struct S { operator Holder&(); };", "Holder& Get();"),
+        ];
+        for (conversion, plain_member) in cases {
+            for (src, label) in [
+                (conversion.to_string(), "conversion operator"),
+                (format!("struct S {{ {plain_member} }};"), "plain member"),
+            ] {
+                let owned = format!("{src}\n");
+                let tree = parse(&owned, Lang::Cpp);
+                let spec = tree.root_node().named_child(0).expect("a top-level node");
+                let body = spec.child_by_field_name("body").expect("a body");
+                let member = body.named_child(0).expect("one member");
+                assert!(
+                    is_definition_node(member, Some(Lang::Cpp)),
+                    "the {label} in {src:?} must be a definition (node kind {})",
+                    member.kind()
+                );
+            }
+        }
+        // The anchor holds: nothing at namespace scope changed, keeping the existing rule
+        // that a free prototype is a declaration and not a definition.
+        let free = "int Free();\n";
+        let tree = parse(free, Lang::Cpp);
+        let node = tree.root_node().named_child(0).expect("a top-level node");
+        assert!(
+            !is_definition_node(node, Some(Lang::Cpp)),
+            "a namespace-scope prototype must stay a declaration"
+        );
+    }
+
+    /// `operator_cast_name` cuts a verbatim span out of one line, so it has to say what it
+    /// does when the spelling is not on one line. It answers `None`: a name search could
+    /// never match `"operator"` alone, so half a spelling is worse than the `<anonymous>`
+    /// it would replace.
+    #[test]
+    fn multiline_conversion_operator_yields_no_name() {
+        let src = "struct S { operator\n  Holder&() { return H; } };\n";
+        let tree = parse(src, Lang::Cpp);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "operator_cast");
+        assert_eq!(c_declarator_name(node, &lines), None);
     }
 
     /// A comment is a tree-sitter *extra*: it is a **named** child and can be the
