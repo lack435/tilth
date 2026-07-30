@@ -648,7 +648,7 @@ fn find_definitions(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         // `context` is passed, not `None`. Retention decides what `assemble` will later rank *with*
         // the context boost, so a scorer blind to context drops the very matches the boost exists to
@@ -823,7 +823,7 @@ fn find_definitions_multi(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         let needles = &needles;
         // One `Scorer` per query per thread: score depends on the query, and `Scorer` is `&mut`
@@ -995,7 +995,7 @@ fn find_usages_multi(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         // One `Scorer` per query per thread — see `find_definitions_multi`.
         let mut scorers: Vec<super::rank::Scorer<'_>> = queries
@@ -1480,7 +1480,7 @@ fn find_usages(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matches = &matches;
         // One `Scorer` per walk thread. It is `&mut` and caches package roots, so this both keeps
         // scoring off the shared lock and stops every thread re-walking the same ancestors.

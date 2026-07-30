@@ -114,7 +114,7 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
 
     let walker = super::walker(scope, None)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matcher = &matcher;
         let kept = &kept;
         let total_found = &total_found;

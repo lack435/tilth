@@ -87,7 +87,7 @@ pub fn search(
 
     let walker = super::walker(scope, glob)?;
 
-    walker.run(|| {
+    super::run_walk(walker, || {
         let matcher = &matcher;
         let sink = &sink;
         // One scorer per worker thread. It memoises package-root lookups, and omitting the
