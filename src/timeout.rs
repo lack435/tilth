@@ -17,8 +17,10 @@
 //! branch that has already won `ThreadCoord::claim_timeout` — that CAS is what
 //! guarantees the result is discarded, and it is the whole reason a per-file
 //! flag check here is not the nondeterminism #8/#18 removed. `cancel`'s module
-//! header states the property in full; `cancelling_cannot_change_a_returned_result`
-//! below pins it against the race.
+//! header states the property in full, including the half a cancel *does* reach:
+//! an abandoned worker still renders, so state that outlives the request needs
+//! its own guard. `only_the_expired_request_is_cancelled` below pins the two
+//! properties this module owns.
 //!
 //! [`ThreadCoord`] is a `RUNNING` → (`TIMED_OUT` | `FINISHED`) CAS state
 //! machine that guarantees the tracker is incremented and decremented exactly
@@ -220,7 +222,11 @@ where
     let handle = std::thread::spawn(move || {
         // Keeps this request's token published for the worker's whole life; see the comment on
         // `cancel` above. Never read here — held for its `Drop`.
-        let _cancel_published = cancel_worker;
+        let _cancel_published = Arc::clone(&cancel_worker);
+        // Binds the token to *this* thread, which is what the post-walk render stage consults
+        // before writing to the shared session. It cannot use the published token: by then the
+        // serial loop has published the next request's. See `cancel::worker_request_cancelled`.
+        let _bound = crate::cancel::bind_worker(cancel_worker.token());
         // catch_unwind ensures claim_finish / record_finish_after_timeout run
         // even if work() panics after the main thread has already timed out.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));

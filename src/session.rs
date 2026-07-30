@@ -65,6 +65,9 @@ impl Session {
     /// `returned_tokens`: estimated tokens for what tilth actually returned.
     /// Per-event clamp via `saturating_sub` ensures saved is never negative.
     pub fn record_savings(&self, baseline_tokens: u64, returned_tokens: u64) {
+        if crate::cancel::worker_request_cancelled() {
+            return;
+        }
         self.baseline_tokens
             .fetch_add(baseline_tokens, Ordering::Relaxed);
         self.saved_tokens.fetch_add(
@@ -160,7 +163,15 @@ impl Session {
             .is_some_and(|&recorded| recorded == current_mtime)
     }
 
+    /// Both writers refuse an abandoned request, and the check belongs here rather than at the six
+    /// call sites for a reason the walk check could not claim: this *is* the state that outlives a
+    /// request, so guarding it is total, whereas guarding walk construction only covers the
+    /// construction paths someone remembered to enumerate. See `cancel::worker_request_cancelled`
+    /// for why a cancelled worker reaches these at all.
     pub fn record_expand(&self, path: &Path, line: u32, mtime: SystemTime) {
+        if crate::cancel::worker_request_cancelled() {
+            return;
+        }
         let key = format!("{}:{}", path.display(), line);
         self.expanded
             .lock()
@@ -221,6 +232,48 @@ mod tests {
             runs[0].contains("alpha (1), bravo (1), charlie (1), delta (1), echo (1)"),
             "tied counts must be broken by name:\n{}",
             runs[0]
+        );
+    }
+
+    /// A worker whose request was abandoned must leave no trace in state that outlives it.
+    ///
+    /// `record_expand` is the one that can be *seen*: a later request reads it through
+    /// `is_expanded` and prints `[shown earlier]` instead of a definition body. Since a cancelled
+    /// walk stops wherever the deadline landed, without this guard how much got recorded would be
+    /// a function of scheduling — and it would reach an answer that *is* returned, which is the
+    /// shape #8/#18 removed.
+    ///
+    /// The uncancelled arm is what makes this a test rather than an assertion that the methods are
+    /// broken: the same calls must still record normally when the request is live.
+    #[test]
+    fn an_abandoned_request_writes_nothing_that_outlives_it() {
+        let _publish = crate::cancel::PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = Session::new();
+        let request = crate::cancel::begin_request();
+        let _bound = crate::cancel::bind_worker(request.token());
+        let t = SystemTime::UNIX_EPOCH;
+
+        session.record_expand(Path::new("live.rs"), 1, t);
+        session.record_savings(1000, 200);
+        assert!(
+            session.is_expanded(Path::new("live.rs"), 1, t),
+            "a live request must still record, or this test is passing for the wrong reason"
+        );
+        assert_eq!(session.savings(), (1000, 800));
+
+        request.cancel();
+        session.record_expand(Path::new("abandoned.rs"), 1, t);
+        session.record_savings(5000, 100);
+        assert!(
+            !session.is_expanded(Path::new("abandoned.rs"), 1, t),
+            "an abandoned request polluted the dedup state a later request reads"
+        );
+        assert_eq!(
+            session.savings(),
+            (1000, 800),
+            "an abandoned request's discarded output was counted as savings"
         );
     }
 

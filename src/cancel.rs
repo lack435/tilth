@@ -14,11 +14,20 @@
 //! > `ThreadCoord::claim_timeout`, and winning that CAS is what guarantees the worker's result will
 //! > be discarded.
 //!
-//! So a cancelled walk's output is never rendered, never ranked and never returned — the flag
-//! cannot change an answer because there is no answer left to change. It is emphatically not a
-//! general bound on the walk. `only_the_expired_request_is_cancelled` in `timeout.rs` pins both
-//! halves — that an expired worker sees the cancel, and that the next request does not — and it is
-//! the test to keep if any of the rest is rewritten.
+//! So a cancelled walk's *own* result is never returned — the flag cannot change that answer
+//! because there is no answer left to change. It is emphatically not a general bound on the walk.
+//! `only_the_expired_request_is_cancelled` in `timeout.rs` pins both halves — that an expired
+//! worker sees the cancel, and that the next request does not — and it is the test to keep if any
+//! of the rest is rewritten.
+//!
+//! **That is not the whole story, and the shorter version of this paragraph was wrong.** A
+//! cancelled worker is not killed: it finishes ranking and rendering whatever it retained, and
+//! rendering *writes to state the request outlives* — `Session::record_expand` decides whether a
+//! later request prints a definition body or `[shown earlier]`, and `record_savings` feeds
+//! `tilth_savings`. A walk stopped mid-flight records less than a walk that ran to completion, so
+//! without a second guard "how much got recorded" would become a function of when the deadline
+//! landed, and that *would* reach a returned answer. [`worker_request_cancelled`] is that guard,
+//! and it is why this module has two mechanisms rather than one.
 //!
 //! # Why the token is passed by identity through a global rather than by argument
 //!
@@ -26,7 +35,9 @@
 //! Three ways were available and two of them are wrong here:
 //!
 //! * **Threading a `&CancelToken` through every search signature** is airtight and was rejected on
-//!   churn alone — it is ~30 signatures between `dispatch_tool` and the walk builders.
+//!   churn alone: eight functions build walks, and the parameter would have to travel from
+//!   `dispatch_tool` through every caller between. The count was never derived exactly — read it as
+//!   "a lot of signatures", not as a measured figure.
 //! * **A `thread_local` set on the worker thread** does not work, and the reason is already
 //!   recorded in this crate: `symbol::search` builds its two walkers inside `rayon::join`, which
 //!   may run either closure on a stolen thread (see `search::WALKS_BUILT`, which had to be keyed by
@@ -60,42 +71,61 @@
 //!
 //! Eight `tilth_search` calls issued back to back with `TILTH_TIMEOUT=1`, so every one expires and
 //! abandons its worker, against an MCP server over stdio. `TILTH_THREADS=1` throughout — the walk
-//! is per thread, so an unlabelled figure here is not reproducible. Three reps, peak and live
-//! working set of the whole process, and CPU seconds charged to it after `initialize`. Fixtures:
-//! **dense** is 40 files of 498 981 B with a definition on every line (parse-dominated); **spread**
-//! is 25 000 two-line files across 50 directories (walk-dominated). Both arms are given 90 s to
-//! settle, which matters — see below.
+//! is per thread, so an unlabelled figure here is not reproducible. Three reps; CPU seconds charged
+//! to the process after `initialize`, peak working set, peak private commit
+//! (`PeakPagedMemorySize64`, i.e. `PeakPagefileUsage`), and live working set at the end.
+//!
+//! Two fixtures, both of which every arm searched in full — `timed_out=8, refused=0` in every row,
+//! so no arm skipped work by hitting `MAX_ABANDONED_THREADS`, which would otherwise confound any
+//! memory comparison. **dense** is 40 files of 498 981 B with a definition on every line
+//! (parse-dominated); **spread** is 25 000 two-line files across 50 directories (walk-dominated).
+//! Both arms get 90 s to settle so both *finish*, which turns out to matter more than anything else
+//! here — see the note on the 400-file fixture below.
 //!
 //! ```text
-//!                        CPU s        peak MB       live MB    9th call refused?
-//! dense    before     98.4-98.5     59.8-61.3     28.5-41.2                   no
-//!          after        9.3-9.5     67.1-69.5     17.2-18.4                   no
-//! spread   before     20.7-21.2     25.5-25.7     18.0-18.4                   no
-//!          after      13.1-13.6     20.6-22.6     10.4-11.0                   no
+//!                        CPU s      peak WS MB    peak commit MB     live WS MB
+//! dense    before     94.1-98.0     59.1-60.9         57.4-58.6      38.4-42.4
+//!          after        9.1-9.4     67.1-67.5         68.8-69.2      16.1-18.1
+//! spread   before     20.7-21.2     25.5-25.7                 —      18.0-18.4
+//!          after      13.1-13.6     20.6-22.6                 —      10.4-11.0
 //! ```
 //!
-//! **CPU is the result**: 98.5 s → 9.4 s on the dense shape, a 10.5x reduction, and that is the
-//! wasted work the issue is about. Live RSS falls with it. The abandoned set drains, which is the
-//! acceptance item stated as "stops within a bounded time": on a 400-file version of the dense
-//! fixture the ninth call comes back `server busy` before the change and is served after it, so the
-//! workers holding those eight slots have exited rather than been inferred to have exited.
+//! **CPU is the result**: 98 s → 9.2 s on the dense shape, a **10.5x** reduction, and that is the
+//! wasted work the issue is about. Live working set falls with it, 38-42 MB → 16-18 MB.
 //!
-//! **Peak RSS is 12% higher after, reproducibly, and that is not explained away.** Two candidate
-//! mechanisms were tested and one survives:
+//! **The abandoned set drains**, which is the acceptance item stated as "stops within a bounded
+//! time, assert it rather than infer it". On a 400-file version of the dense fixture, where a walk
+//! runs ~170 s and eight abandoned workers therefore overlap, a ninth call comes back `server busy`
+//! before the change and is *served* after it. `MAX_ABANDONED_THREADS` refuses at 8, so being
+//! served is a direct observation that those eight workers have exited.
 //!
-//! * *The process-wide parse budget* — refuted. Peak does not move with `TILTH_PARSE_BUDGET_MB` at
-//!   64, 384 or 1024 MB (67.0-69.4 MB after, 34.1-35.4 before, dense, 400 files).
-//! * *Compression* — consistent with everything, not confirmed. A cancelled worker still ranks and
-//!   renders whatever it retained; the change removes the walking, not the rendering. So the same
-//!   per-request work is packed into 9 s instead of 98 s, and more of it coexists. The 400-file
-//!   fixture supports this from the other side: measured at 18 s, before never *finished* a walk
-//!   and read a flat 34 MB at any request count, while after read 67 MB. Letting both arms complete
-//!   moved before from 34 MB to 60 MB and shrank the gap to 12% — most of the apparent regression
-//!   was a mid-flight snapshot, and the residual is the part that is real.
+//! ## Peak memory rises on the dense shape, and I did not explain it
 //!
-//! Cancelling the render stage too would likely remove the residual, and is deliberately not in
-//! this change: the walk is where the seconds are, and the render is already bounded by
-//! `MAX_RETAINED`.
+//! Scope first, because the unqualified version of this sentence is wrong: peak **falls** on spread
+//! (25.5-25.7 → 20.6-22.6 MB) and **rises** on dense (59.1-60.9 → 67.1-67.5 MB, +11%). The
+//! regression is dense-only. Three candidate mechanisms, two dead:
+//!
+//! * *The process-wide parse budget* — **refuted.** Peak does not move with
+//!   `TILTH_PARSE_BUDGET_MB` at 64, 384 or 1024 MB (67.0-69.4 after, 34.1-35.4 before).
+//! * *Working-set trimming* — **refuted.** Peak working set cannot distinguish "allocated less"
+//!   from "was trimmed", and the before arm lives 10x longer, so it is the arm Windows would trim.
+//!   Peak private commit is trim-immune and shows the same gap in the same direction, slightly
+//!   larger (57.4-58.6 → 68.8-69.2, +18%). The after arm genuinely commits more.
+//! * *Compression* — **survives, but does not fit all the data.** A cancelled worker still ranks and
+//!   renders what it retained; this change removes the walking, not the rendering. So per-request
+//!   work packs into 9 s instead of 98 s and more of it coexists. Peak does climb with concurrency
+//!   in the after arm (36.8 / 39.7 / 64.7 / 67.2 MB at 1 / 2 / 4 / 8 requests). But spread
+//!   compressed 1.6x too and its peak *fell*, so compression alone is not sufficient, and I am
+//!   recording it as the surviving candidate rather than the explanation.
+//!
+//! What the 400-file fixture *does* settle is that most of the apparent regression was an artefact
+//! of the observation window. Measured at 18 s, the before arm never finished a walk and read a flat
+//! ~34 MB at every request count from 1 to 8, against 67 MB after — an apparent 2x. Letting both
+//! arms complete moved before to ~60 MB and the gap to 11%. A peak read before the slow arm
+//! finishes is not a peak.
+//!
+//! The effect is small, bounded and reproducible. Cancelling the render stage as well would likely
+//! remove it and is deliberately not in this change: the walk is where the seconds are.
 //!
 //! # What this does not reach
 //!
@@ -158,6 +188,60 @@ impl RequestCancel {
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
+
+    /// A read-only view, for binding to the worker thread.
+    pub(crate) fn token(&self) -> CancelToken {
+        CancelToken(Some(Arc::clone(&self.0)))
+    }
+}
+
+thread_local! {
+    /// The token of the request whose worker *is* this thread, if any.
+    ///
+    /// Deliberately separate from [`CURRENT`], and the difference is the whole reason both exist.
+    /// `CURRENT` answers "which request is in flight now", which is what a walk builder wants and
+    /// what a thread-local cannot answer (builders run wherever `rayon::join` puts them). This
+    /// answers "which request am *I* working for", which `CURRENT` cannot: by the time an
+    /// abandoned worker reaches its render stage, the serial loop has already published the *next*
+    /// request's token, so a worker asking `CURRENT` would be told it is not cancelled.
+    ///
+    /// Absent on rayon's stolen threads, which reads as not-cancelled — the same
+    /// never-wrongly-cancelled direction the rest of this module fails in.
+    static WORKER: std::cell::RefCell<Option<CancelToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Bind `token` to this thread for the life of the guard. Set by `spawn_with_timeout` on the
+/// worker thread it spawns.
+pub(crate) fn bind_worker(token: CancelToken) -> WorkerBinding {
+    WORKER.with(|w| *w.borrow_mut() = Some(token));
+    WorkerBinding
+}
+
+pub(crate) struct WorkerBinding;
+
+impl Drop for WorkerBinding {
+    fn drop(&mut self) {
+        WORKER.with(|w| *w.borrow_mut() = None);
+    }
+}
+
+/// Whether the request *this thread is working for* has been abandoned.
+///
+/// The guard on state that outlives a request. A cancelled worker still ranks and renders what it
+/// retained — this change stops the walking, not the rendering — and rendering writes to the
+/// shared [`crate::session::Session`]: `record_expand` decides whether a *later* request prints a
+/// definition body or `[shown earlier]`, and `record_savings` feeds `tilth_savings`. Those writes
+/// survive the request that made them.
+///
+/// Before cancellation existed the pollution was at least deterministic, because the walk always
+/// ran to completion and the retained set is order-independent from a fixed input. Cancelling
+/// mid-walk makes *how much* got recorded a function of when the deadline landed — so without this
+/// guard a scheduling-dependent quantity would reach a returned answer, which is precisely the
+/// shape #8/#18 removed. The output of the cancelled request itself is discarded either way; it is
+/// the residue that needed stopping.
+pub(crate) fn worker_request_cancelled() -> bool {
+    WORKER.with(|w| w.borrow().as_ref().is_some_and(CancelToken::is_cancelled))
 }
 
 /// Un-publish on the way out, so nothing is published between requests.
@@ -188,10 +272,12 @@ impl Drop for RequestCancel {
 
 /// Publish a fresh token as the in-flight request's, replacing whatever was there.
 ///
-/// Replacing rather than clearing-on-completion is deliberate: a completed request's token can
-/// never be cancelled — only the deadline arm that created it sets one, and that arm did not run —
-/// so a stale published token is inert, and leaving it avoids a drop-order dance to decide whether
-/// the thing being cleared is still ours.
+/// Always a *fresh* flag, never a reused one, which is what makes a live request unable to observe
+/// a cancel: whatever was published before, this request's walks capture something that is `false`
+/// and that only this request's deadline arm can set.
+///
+/// Publication also ends on `RequestCancel`'s `Drop` rather than only being overwritten here — see
+/// that impl for why that turned out to be load-bearing rather than tidy.
 pub(crate) fn begin_request() -> RequestCancel {
     let flag = Arc::new(AtomicBool::new(false));
     let mut current = CURRENT
