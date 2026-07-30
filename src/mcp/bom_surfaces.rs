@@ -722,14 +722,21 @@ fn render(surface: &Surface, root: &Path) -> String {
     let out = dispatch_tool(surface.tool, &args, &services)
         .unwrap_or_else(|e| panic!("surface `{}` failed: {e}", surface.label));
     let s = root.to_string_lossy().to_string();
-    // Both the plain and the verbatim (`\\?\`) spellings appear on Windows.
-    // Three spellings, all of which appear: the verbatim `\\?\` prefix, the plain path, and — in
-    // `diff`'s rendering of a file pair — the path with its separators doubled. Missing the third
-    // made `diff:files` compare two different tempdir paths and fail as a leak.
+    // The diff surfaces render a file-pair path in a spelling that is NOT the raw root, and it
+    // differs by platform — so `<ROOT>` substitution has to cover every spelling or the two tempdir
+    // names leak into the file-detail line and `diff:files` fails as a false leak. The plain `&s`
+    // replace handles the header on both platforms (it prints the absolute path via `a.display()`);
+    // the extra spellings catch the `## <path> (N symbols)` line, which comes from `git diff`:
+    //   * Windows: the verbatim `\\?\` prefix, and the path with its separators doubled.
+    //   * Linux: git's `a/`/`b/` convention strips the leading `/`, so `/tmp/.tmpXXX` renders as
+    //     `tmp/.tmpXXX`. Missing this passed locally on Windows but failed on CI (Linux), comparing
+    //     two different tempdirs. The trailing replace catches it; on Windows the stripped form
+    //     equals `&s` (no leading separator), so it is a harmless second pass.
     let out = out
         .replace(&format!("\\\\?\\{s}"), "<ROOT>")
         .replace(&s.replace('\\', "\\\\"), "<ROOT>")
-        .replace(&s, "<ROOT>");
+        .replace(&s, "<ROOT>")
+        .replace(s.trim_start_matches(['/', '\\']), "<ROOT>");
     normalise_header_token_estimate(&out)
 }
 
