@@ -683,6 +683,52 @@ public:
         );
     }
 
+    /// #68: the largest `<anonymous>` family left after #58 — a typedef whose alias
+    /// shadows one of tree-sitter-cpp's builtin type spellings, so the *declarator*
+    /// parses as a `primitive_type`. The shape that platform compatibility headers are
+    /// made of, and the outline was the only surface that lost the name: symbol search
+    /// resolved it all along.
+    ///
+    /// The reference row is what covers the `is_declarator_link` half end to end, and it
+    /// only does so because its alias is *also* a builtin: `typedef UINT8& int16_t;` puts
+    /// a `primitive_type` under the `reference_declarator`, where `typedef UINT8&
+    /// uint8_ref_t;` puts a `type_identifier` and would have passed on `main`. Whether a
+    /// row is a case or a control turns on the alias name alone, never on the decoration.
+    ///
+    /// `MyByte` and `wchar_t` are the deliberate controls — same source shape, but the
+    /// grammar reads those declarators as `type_identifier`, so they were never broken.
+    #[test]
+    fn cpp_outline_names_typedef_aliases_that_shadow_builtins() {
+        let rendered = outline(
+            "\
+typedef UINT8   uint8_t;
+typedef INT64   int64_t;
+typedef SSIZE_T ssize_t;
+typedef UINT8&  int16_t;
+typedef UINT8   MyByte;
+typedef int     wchar_t;
+using           uint16_t = UINT16;
+",
+            Lang::Cpp,
+            1000,
+        );
+        for want in [
+            "type uint8_t",
+            "type int64_t",
+            "type ssize_t",
+            "type int16_t",
+            "type MyByte",
+            "type wchar_t",
+            "type uint16_t",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+        assert!(
+            !rendered.contains("<anonymous>"),
+            "no entry should be anonymous:\n{rendered}"
+        );
+    }
+
     /// #58: the two declarator shapes that stayed `<anonymous>` after #55 — explicit
     /// template specialisations and conversion operators. End-to-end through the rendered
     /// outline, since that is where the defect was visible.
