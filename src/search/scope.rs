@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::cache::OutlineCache;
+use crate::cache::{OutlineCache, ScopeLabel};
 use crate::lang::treesitter::{
     cpp_misparsed_class_name, extract_definition_name, extract_elixir_definition_name,
     is_definition_node, is_elixir_definition, node_text_simple,
@@ -35,17 +35,6 @@ const TYPE_KINDS: &[&str] = &[
     "union_specifier",
     "enum_specifier",
 ];
-
-/// Resolved enclosing-definition context for a (file, line). Used by the
-/// search formatter to annotate usages with their containing scope.
-#[derive(Debug)]
-pub struct EnclosingScope {
-    /// Normalized kind label (e.g. `"function"`, `"class"`, `"struct"`).
-    pub kind: &'static str,
-    /// Identifier of the definition. Qualified with its enclosing type or
-    /// module when one wraps it (e.g. `"Class.method"`, `"Module.func"`).
-    pub name: String,
-}
 
 /// Walk up the AST from `node` to the nearest definition, qualified with its
 /// enclosing type/module if one wraps it. Returns the AST node so the caller
@@ -96,39 +85,122 @@ pub(super) fn walk_to_enclosing_definition<'a>(
     None
 }
 
-/// Find the nearest enclosing definition for `(path, line)` by re-parsing
-/// the file with tree-sitter (cached on `OutlineCache`). AST-correct across
-/// every language tilth supports — replaces parsing the rendered outline
-/// string back into structured data.
+/// Find the nearest enclosing definition for `(path, line)`.
 ///
-/// Returns `None` if the file isn't a code file, the parse fails, or `line`
-/// sits at the top level outside any definition.
-pub fn enclosing_definition_at(
-    path: &Path,
-    line: u32,
-    cache: &OutlineCache,
-) -> Option<EnclosingScope> {
+/// Served from the session's label cache when this file+mtime has already been asked about
+/// that line; otherwise the file is parsed, the answer taken, and **the tree dropped before
+/// returning**. Nothing here retains a tree — see the `cache` module header for the 1.2 GB
+/// that used to buy.
+///
+/// Prefer `warm_labels` when several lines of the same page need answering: this entry point
+/// parses once per *call*, that one parses once per *file*.
+///
+/// Returns `None` if the file isn't a code file, the parse fails, or `line` sits at the top
+/// level outside any definition.
+pub fn enclosing_definition_at(path: &Path, line: u32, cache: &OutlineCache) -> Option<ScopeLabel> {
     if line == 0 {
         return None;
     }
-    let parsed = cache.get_or_parse(path)?;
-    let lines: Vec<&str> = parsed.content.lines().collect();
-    let row = (line - 1) as usize;
-    if row >= lines.len() {
+    let mtime = file_mtime(path)?;
+    if let Some(hit) = cache.cached_label(path, mtime, line) {
+        return hit;
+    }
+    let resolved = resolve_lines(path, &[line])?;
+    let answer = resolved.get(&line).cloned().flatten();
+    cache.store_labels(path, mtime, resolved);
+    answer
+}
+
+/// Resolve the enclosing scope of every line in `targets`, grouped by file, and record the
+/// answers on `cache`.
+///
+/// This is the shape that keeps peak memory flat. A rendered page asks about up to ten lines
+/// (a hundred under `--full`), and answering them one at a time either re-parses a file per
+/// line or — as it did before #67 — keeps every file's tree alive at once. Grouping by path
+/// gives one parse per *distinct file* with exactly **one tree live at any instant**, which
+/// is the best of both and needs no ceiling to tune.
+///
+/// Best-effort by design: an unreadable, oversized or unparseable file simply contributes no
+/// answers, and the formatter renders those matches without an `in …` suffix, exactly as it
+/// did when `get_or_parse` returned `None`.
+pub(crate) fn warm_labels<'a>(
+    targets: impl IntoIterator<Item = (&'a Path, u32)>,
+    cache: &OutlineCache,
+) {
+    let mut by_file: std::collections::HashMap<&Path, Vec<u32>> = std::collections::HashMap::new();
+    for (path, line) in targets {
+        if line == 0 {
+            continue;
+        }
+        by_file.entry(path).or_default().push(line);
+    }
+    for (path, mut lines) in by_file {
+        lines.sort_unstable();
+        lines.dedup();
+        let Some(mtime) = file_mtime(path) else {
+            continue;
+        };
+        // Only the lines this page still needs — a file already answered for these lines
+        // costs nothing.
+        let missing: Vec<u32> = lines
+            .into_iter()
+            .filter(|l| cache.cached_label(path, mtime, *l).is_none())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        if let Some(resolved) = resolve_lines(path, &missing) {
+            cache.store_labels(path, mtime, resolved);
+        }
+    }
+}
+
+/// Parse `path` once and answer every line in `lines`. The tree is dropped when this
+/// returns; nothing it allocates outlives the call.
+///
+/// `None` means the file could not be parsed at all — distinct from a parsed file where a
+/// line has no enclosing definition, which is `Some(map)` with a `None` value for that line.
+/// The difference matters: the second is an answer worth caching, the first is not.
+fn resolve_lines(
+    path: &Path,
+    lines: &[u32],
+) -> Option<std::collections::HashMap<u32, Option<ScopeLabel>>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > OutlineCache::max_parse_bytes() {
         return None;
     }
+    let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+        return None;
+    };
+    let ts_lang = crate::lang::outline::outline_language(lang)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let tree = crate::lang::parse_masked(&content, Some(lang), &ts_lang)?;
+    let src: Vec<&str> = content.lines().collect();
+    let root = tree.root_node();
 
-    let point = tree_sitter::Point { row, column: 0 };
-    let target = parsed
-        .tree
-        .root_node()
-        .descendant_for_point_range(point, point)?;
+    let mut out = std::collections::HashMap::with_capacity(lines.len());
+    for &line in lines {
+        let row = (line - 1) as usize;
+        if row >= src.len() {
+            continue;
+        }
+        let point = tree_sitter::Point { row, column: 0 };
+        let answer = root
+            .descendant_for_point_range(point, point)
+            .and_then(|target| walk_to_enclosing_definition(target, &src, lang))
+            .map(|(def_node, name, _range)| ScopeLabel {
+                kind: kind_label(def_node, &src, lang),
+                name,
+            });
+        out.insert(line, answer);
+    }
+    Some(out)
+}
 
-    let (def_node, name, _range) = walk_to_enclosing_definition(target, &lines, parsed.lang)?;
-    Some(EnclosingScope {
-        kind: kind_label(def_node, &lines, parsed.lang),
-        name,
-    })
+/// A file's mtime, or `None` when it cannot be read — which also means it cannot be cached
+/// against, since mtime is the whole staleness guard.
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// Map a tree-sitter definition node to a short user-facing label. Every kind
@@ -386,5 +458,121 @@ mod tests {
         let scope = enclosing_definition_at(&p, 4, &cache).unwrap();
         assert_eq!(scope.kind, "function");
         assert_eq!(scope.name, "bar");
+    }
+
+    // ── #67: the grouped warm pass ──────────────────────────────────────────
+
+    const THREE_FNS: &str =
+        "fn one() {\n    let a = 1;\n}\nfn two() {\n    let b = 2;\n}\nfn three() {\n    let c = 3;\n}\n";
+
+    /// The memory bound rests on one parse answering every line of a file, so pin the
+    /// observable form of that: after a single `warm_labels`, every requested line is a
+    /// cache hit. If the grouping regressed to one parse per line, the answers would still
+    /// be right — this is the only assertion that would notice.
+    #[test]
+    fn warm_labels_answers_every_line_of_a_file_in_one_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "a.rs", THREE_FNS);
+        let cache = OutlineCache::new();
+        let mtime = file_mtime(&p).unwrap();
+
+        warm_labels(
+            [(p.as_path(), 2u32), (p.as_path(), 5), (p.as_path(), 8)],
+            &cache,
+        );
+
+        for (line, want) in [(2u32, "one"), (5, "two"), (8, "three")] {
+            let hit = cache
+                .cached_label(&p, mtime, line)
+                .unwrap_or_else(|| panic!("line {line} was not answered by the warm pass"));
+            assert_eq!(hit.expect("inside a function").name, want);
+        }
+    }
+
+    /// Two entry points now resolve the same question — the batched `warm_labels` and the
+    /// lazy `enclosing_definition_at`. Two paths to one answer is exactly the shape that
+    /// drifts, so pin that they agree, including on the "top level, no enclosing definition"
+    /// answer where one path caches `None` and the other must not read that as a miss.
+    #[test]
+    fn warmed_and_lazy_resolution_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "a.rs", THREE_FNS);
+        // Line 4 is `fn two()`'s own signature line; line 1 is `fn one()`'s. Both sit inside
+        // a definition. A line at true top level needs a file with one.
+        let q = write(
+            tmp.path(),
+            "b.rs",
+            "const X: u32 = 1;\nfn only() {\n    let a = 1;\n}\n",
+        );
+
+        for (path, lines) in [(&p, vec![1u32, 2, 5, 8]), (&q, vec![1, 3])] {
+            let lazy = OutlineCache::new();
+            let warmed = OutlineCache::new();
+            warm_labels(lines.iter().map(|l| (path.as_path(), *l)), &warmed);
+            for &line in &lines {
+                assert_eq!(
+                    enclosing_definition_at(path, line, &lazy),
+                    enclosing_definition_at(path, line, &warmed),
+                    "paths disagree for {}:{line}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// A file rewritten between two calls must not serve answers from its old contents. The
+    /// warm pass stores against the mtime it read, so this pins the guard across both the
+    /// batched store and the lazy read.
+    #[test]
+    fn a_rewritten_file_is_not_answered_from_stale_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "a.rs",
+            "fn before_edit() {\n    let a = 1;\n}\n",
+        );
+        let cache = OutlineCache::new();
+        warm_labels([(p.as_path(), 2u32)], &cache);
+        assert_eq!(
+            enclosing_definition_at(&p, 2, &cache).unwrap().name,
+            "before_edit"
+        );
+
+        // Rewrite with a different function name. The sleep is what makes the mtime differ
+        // on filesystems with coarse timestamps; the assertion below makes the test fail
+        // loudly rather than pass vacuously if it ever does not.
+        let before = file_mtime(&p).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&p, "fn after_edit() {\n    let a = 1;\n}\n").unwrap();
+        assert_ne!(
+            file_mtime(&p).unwrap(),
+            before,
+            "the rewrite did not change the mtime, so this test would prove nothing"
+        );
+
+        assert_eq!(
+            enclosing_definition_at(&p, 2, &cache).unwrap().name,
+            "after_edit",
+            "the stale answer survived the rewrite"
+        );
+    }
+
+    /// Files the resolver cannot handle must stay silent rather than poisoning the cache
+    /// with a wrong answer — the formatter renders those matches with no `in …` suffix, the
+    /// same as when the old `get_or_parse` returned `None`.
+    #[test]
+    fn unparseable_and_missing_files_contribute_no_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let missing = tmp.path().join("nope.rs");
+        let not_code = write(
+            tmp.path(),
+            "a.txt",
+            "fn looks_like_code() {\n    let a = 1;\n}\n",
+        );
+
+        warm_labels([(missing.as_path(), 2u32), (not_code.as_path(), 2)], &cache);
+        assert_eq!(enclosing_definition_at(&missing, 2, &cache), None);
+        assert_eq!(enclosing_definition_at(&not_code, 2, &cache), None);
     }
 }
