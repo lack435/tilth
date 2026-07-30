@@ -352,15 +352,28 @@ opinionated defaults:
   ordinary 499 KB files, ~1.1 GB line-dense — and is now bounded by
   `lang::parse_budget` instead. See `util::worker_threads` for the
   measurements and #70.
-- **Parse memory**: `TILTH_PARSE_BUDGET_MB` (default 256) caps the
+- **Parse memory**: `TILTH_PARSE_BUDGET_MB` (default 384) caps the
   bytes of tree-sitter tree held concurrently, by reserving an
   estimate per file before parsing and waiting when it would not fit.
-  Inert at the default thread count; at `TILTH_THREADS=32` it holds
-  peak to ~232 MB where it was ~1.1 GB, for ~24% wall on that shape.
-  `0` disables it. Deadlock-free by construction: a file whose
-  estimate exceeds the whole ceiling is still parsed, so a tiny
-  ceiling degrades to serial parsing rather than hanging. See
-  `lang::parse_budget`.
+  The estimate is `source_bytes x 128` — per *byte*, because node
+  count is bounded by token count which is bounded by bytes, so the
+  ratio has a ceiling that holds by construction. A per-*line*
+  estimator shipped first and bounded nothing: bytes-per-line is
+  unbounded, so a minified bundle behind a license banner estimated
+  92 KB against a real 21 MB tree and the budget was inert on exactly
+  the input it existed to bound.
+
+  Inert at the default thread count on every shape measured; at
+  `TILTH_THREADS=32` it holds peak to 110-266 MB where it was
+  442-1093 MB, a 2.6-4.1x reduction for 15-29% wall. `0` disables it.
+  Deadlock-free by construction: a file whose estimate exceeds the
+  whole ceiling is still parsed, so a tiny ceiling degrades to serial
+  parsing rather than hanging. The default is *derived* — the smallest
+  multiple of 64 MiB admitting six worst-case parses — so it is
+  coupled to the thread clamp above and to the walks' 500 KB size
+  gate. See `lang::parse_budget`, and
+  `cargo run --release --example calibrate_parse_budget -- <dir>` to
+  re-derive the estimator constant.
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.
