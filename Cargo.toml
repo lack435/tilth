@@ -45,6 +45,10 @@ tree-sitter-md = "0.5"
 # Search (ripgrep internals)
 grep-regex = "0.1"
 grep-searcher = "0.1"
+# The `Matcher` trait `grep-regex`'s `RegexMatcher` implements. Already in the tree as a
+# transitive dependency of both crates above; named directly so `symbol.rs` can ask one
+# already-compiled matcher whether a single line matches, without a `Searcher` to split lines.
+grep-matcher = "0.1"
 ignore = "0.4"
 globset = "0.4"
 

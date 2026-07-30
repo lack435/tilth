@@ -15,6 +15,8 @@ use crate::lang::detect_file_type;
 use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
 use crate::types::{FileType, Match, SearchResult};
+// `Matcher` is only in scope for `is_match` on a single line — see `DefUsageOverlapCounter`.
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
@@ -179,8 +181,11 @@ pub fn search(
         reason: e.to_string(),
     })?;
 
+    // Both walks share the one compiled `\bquery\b`: the usage walk to find usages, the
+    // definition walk to decide which of its definition lines that walk will also match. Sharing
+    // it is what makes the two agree — see `count_usages_on_definition_lines`.
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, context, glob),
+        || find_definitions(query, &matcher, scope, context, glob),
         || find_usages(query, &matcher, scope, context, glob),
     );
 
@@ -241,23 +246,68 @@ fn assemble(
     // Totals come from what the walks *offered*, not from what retention kept. Deriving them from
     // `merged.len()` is what made a bounded search announce 2.4M matches as 20k.
     //
-    // The dedup above is why this is not simply the sum: a usage on a definition's line is removed,
-    // and a usage that retention clipped may have been one of those. #19 named this and asked for
-    // either a per-file dedup before capping or a documented approximation; this is the latter.
-    // Two consequences of `def_sites` covering only *retained* definitions, both under clipping
-    // only. First, the overlap below is counted over the retained sets, which is all that is
-    // observable. Second — cosmetic but worth naming — a usage sitting on a line whose definition
-    // was clipped away survives the dedup and is displayed as a usage, on a line that is really a
-    // definition. Neither is reachable unless a walk hit its cap.
+    // The dedup above is why this is not simply the sum: a usage on a definition's line is removed.
+    // The overlap therefore has to be subtracted, and it **cannot** be measured here — `def_sites`
+    // covers only *retained* definitions and `usages` only retained usages, so under clipping the
+    // difference above sees only the collisions that survived the bound. It read zero on a fixture
+    // whose every collision was clipped, leaving `total_found` 1.5x the truth; in the limit where
+    // every usage collides it approached 2x (#60). So the count comes from the definition walk,
+    // which saw every collision as it went — see `count_usages_on_definition_lines`.
     //
-    // When neither walk hit its cap, `usages_before_dedup == usage_offered` and these reduce to
-    // exactly the pre-bound values: `total == merged.len()`, `usage_count` unchanged. When a cap did
-    // bite,
-    // `total_found` can exceed the true post-dedup count by at most the number of clipped
-    // def/usage collisions — it over-reports rather than hiding matches, which is the safer
-    // direction for a header whose only job is to tell the reader more exists.
+    // When neither walk hit its cap the two agree exactly, and this reduces to the pre-bound
+    // values: `total == merged.len()`, `usage_count` unchanged.
+    //
+    // Measured on a ~444k-file C++ tree, release, whole rendered output diffed before and after.
+    // Only the header and the "Not shown" line move, and they move together — every match, every
+    // facet heading and every per-facet count is byte-identical:
+    //
+    //   query        matches: before -> after   definitions   walks clipped
+    //   Get              184055 -> 181524            3864     both
+    //   FString          221108 -> 221104              12     both
+    //   Serialize         11682 -> 11682 (same)      3612     neither
+    //   FRotator           6739 -> 6739  (same)        10     neither
+    //
+    // So the correction is exactly the clipped collisions — 2531 of `Get`'s 3864 definitions had
+    // their def-line usage dropped by the bound — and a search below the bound is untouched, which
+    // is the property that must not regress.
+    //
+    // The counting costs nothing measurable, and the measurement that shows it is the one worth
+    // recording, because a naive before/after does not. Two separately-built binaries on `Get`,
+    // interleaved, four reps: 38648-39071 ms against 40058-40572, a consistent ~3.6% that does not
+    // overlap. That reads as a regression and is not one. Gating `observe` behind an env var so the
+    // *same* binary runs both arms: counting on 40075/40193/40132 ms, counting off
+    // 40702/40292/40282 — on is if anything faster, so the work itself is below the noise floor and
+    // the 1.35 s belongs to code layout between two builds. Which is what the mechanism predicts:
+    // one short-string `is_match` per distinct definition line, and `Get` has 3864 of them in a
+    // 39-second search. Report a build-to-build delta as a cost and you are tuning the linker.
+    //
+    // Still true under clipping, and separate from the count: a usage sitting on a line whose
+    // definition was clipped away survives the dedup and is *displayed* as a usage on a line that
+    // is really a definition. Cosmetic, and not fixable from here — suppressing it needs the full
+    // definition-line set at dedup time, which is the unbounded set the retention bound exists to
+    // avoid holding. The number no longer inherits the error.
     let overlap_in_retained = usages_before_dedup - usages_after_dedup;
-    let usage_count = usage_offered.saturating_sub(overlap_in_retained);
+    let overlap_exact = def_tally.usages_on_definition_lines;
+    // Retained ⊆ offered, so an exact count can only be the larger of the two. A violation means
+    // the definition walk under-counted, which would silently put `total_found` back to
+    // approximate — the defect this replaced, not a harmless discrepancy.
+    debug_assert!(
+        overlap_exact >= overlap_in_retained,
+        "exact def/usage overlap ({overlap_exact}) is below the overlap observed in the retained \
+         set ({overlap_in_retained})"
+    );
+    // The other side of the same bound. Every counted collision is a line the usage walk matched in
+    // the same file, so on a tree that is not being written to this cannot fire. It is reachable if
+    // the file changed between the two walks' reads — see `DefUsageOverlapCounter` — and the
+    // `saturating_sub` below is what keeps that a clamp rather than a wrap. Worth asserting because
+    // the pre-#60 arithmetic made it structurally impossible: the overlap was differenced out of the
+    // very set it was subtracted from, so it could not exceed it.
+    debug_assert!(
+        overlap_exact <= usage_offered,
+        "exact def/usage overlap ({overlap_exact}) exceeds the usages offered ({usage_offered}); \
+         the tree changed between the definition and usage walks"
+    );
+    let usage_count = usage_offered.saturating_sub(overlap_exact);
     let total = def_offered + usage_count;
 
     rank::sort(&mut merged, query, scope, context);
@@ -285,9 +335,23 @@ fn assemble(
     //
     // Deriving all five from `merged` reported "2 tests" on a query that found 25. Every number
     // here is now either exact or explicitly unplaced.
+    //
+    // `tests` is the one that needs the dedup subtracted. It is built from what the walks *offered*,
+    // and the collisions the dedup removes are usages that were offered — so a collision on a
+    // definition line inside a test file was counted here while `total_found` had already taken it
+    // out. A single file `a_test.rs` holding `pub fn tgt() -> u32 { 0 }` and `let x = tgt();` showed
+    // it without any clipping at all: a header of 2 matches over facets summing to 3, which is
+    // exactly the "reads as a truncation that did not happen" that `facets::facet_of`'s comment
+    // forbids. It predates the exact overlap and survived it — `overlap_in_retained` was equally
+    // unsubtracted here — so this is the same defect in its last remaining place, not a new one.
+    //
+    // Only the *test* share comes off, not the whole overlap: a collision on a non-test definition
+    // line removes a usage that `facet_of` would have put in `usages_local`/`usages_cross`, and
+    // those two are counted over the retained set, where the dedup already ran.
     totals.definitions = def_tally.definitions;
     totals.implementations = def_tally.implementations;
-    totals.tests = usage_tally.tests + def_tally.tests;
+    totals.tests = (usage_tally.tests + def_tally.tests)
+        .saturating_sub(def_tally.usages_on_test_definition_lines);
 
     merged.truncate(max_matches);
 
@@ -384,7 +448,7 @@ pub fn search_multi(
         })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions_multi(&unique, scope, context, glob),
+        || find_definitions_multi(&unique, &matchers, scope, context, glob),
         || find_usages_multi(&unique, &matchers, scope, context, glob),
     );
     // `finish` pairs each target's retained matches with its exact offered count, so the batched
@@ -444,6 +508,97 @@ fn clone_result(r: &SearchResult) -> SearchResult {
     }
 }
 
+/// How many of one file's definition lines the usage walk also reports a match on.
+///
+/// Counts, as definitions stream past, how many of their lines the usage walk also matches.
+///
+/// That total is the exact number of usages `assemble`'s dedup will remove, and counting it during
+/// the walk is the whole of #60: once retention clips, the overlap is no longer observable from the
+/// retained sets, and an overlap differenced out of them omits every clipped collision.
+///
+/// **Streamed, not collected.** An earlier version scanned the whole file with a `Searcher` and
+/// intersected the matching lines against a `Vec` of definition lines. Both halves of that are the
+/// per-file term #59 removed — one allocation proportional to a file's definition count, times walk
+/// threads — and it rescanned an entire file to ask about two lines. This holds four words of state
+/// and asks the matcher one question per definition line.
+///
+/// **Asks the usage walk's own matcher.** `matcher` is the very `RegexMatcher` the usage walk
+/// searches with, so agreement is by construction rather than by re-deriving what a Unicode `\b`
+/// means — the trap `search_multi`'s note warns about. The question is asked of `Match::text`,
+/// which `types::match_text` has reduced from the line the definition sits on: a leading BOM and
+/// trailing whitespace are gone, and neither can change whether `\bquery\b` matches, since both are
+/// non-word and `\b` is decided by the characters flanking the word.
+///
+/// **Distinct lines, not definition matches.** `def_sites` is a set keyed on `(path, line)`, so two
+/// definitions sharing a start line — overloads whose spans differ, which `SameSpanDedupe`
+/// therefore keeps both of — remove one usage between them, not two. Deduping against the previous
+/// line alone is sufficient because emission is **non-decreasing in line**: the tree-sitter walk is
+/// pre-order, so a parent precedes its children and siblings follow source order, and the markdown
+/// and heuristic emitters scan lines in order. Same-line definitions are therefore contiguous.
+/// `observe` asserts the monotonicity in debug rather than trusting it.
+///
+/// **What the file gates cannot make it over-count.** The definition walk's gates are strictly the
+/// stricter of the two — it additionally needs a successful `read_to_string` and a `memmem` hit —
+/// so any file that produced a definition is a file the usage walk also searched. If that stopped
+/// holding, this would over-count and `total_found` could *under*-report, the one direction a
+/// "more exists than shown" header must never take.
+///
+/// **What no gate comparison covers: the two walks read each file separately.** They run under
+/// `rayon::join`, so a file the definition walk read seconds ago may differ by the time the usage
+/// walk reaches it — an agent editing the tree it is searching is ordinary, not exotic. Delete the
+/// definition in between and this counts a collision the usage walk never offered. `assemble` clamps
+/// rather than wrapping and asserts the bound in debug; the honest claim is exactness over a tree
+/// that holds still for the length of one search, not exactness unconditionally.
+struct DefUsageOverlapCounter<'a> {
+    matcher: &'a RegexMatcher,
+    /// Last line observed, for the contiguity dedup described above.
+    last_line: Option<u32>,
+    total: usize,
+    /// The subset whose line is in the `Test` facet. See
+    /// `ExactTallies::usages_on_test_definition_lines` for why the split is needed.
+    in_tests: usize,
+}
+
+impl<'a> DefUsageOverlapCounter<'a> {
+    fn new(matcher: &'a RegexMatcher) -> Self {
+        Self {
+            matcher,
+            last_line: None,
+            total: 0,
+            in_tests: 0,
+        }
+    }
+
+    /// Offer one definition, before it is moved into the retention sink.
+    fn observe(&mut self, m: &Match) {
+        debug_assert!(
+            self.last_line.is_none_or(|prev| m.line >= prev),
+            "definitions must be emitted in non-decreasing line order for the dedup below to be \
+             exact: {} followed {:?}",
+            m.line,
+            self.last_line
+        );
+        if self.last_line == Some(m.line) {
+            return;
+        }
+        self.last_line = Some(m.line);
+        // An unreadable pattern is not a reason to abort a walk that is otherwise correct; an
+        // uncounted collision only puts this one file's total back to the pre-#60 approximation.
+        if self.matcher.is_match(m.text.as_bytes()).unwrap_or(false) {
+            self.total += 1;
+            if super::facets::is_test_match_for_totals(m) {
+                self.in_tests += 1;
+            }
+        }
+    }
+
+    /// `(total, in_tests)` for this file, in the order
+    /// `BoundedRetain::add_usages_on_definition_lines` takes them.
+    fn totals(&self) -> (usize, usize) {
+        (self.total, self.in_tests)
+    }
+}
+
 /// Find definitions using tree-sitter structural detection.
 /// For each file containing the query string, parse with tree-sitter and walk
 /// definition nodes to see if any declare the queried symbol.
@@ -455,8 +610,12 @@ fn clone_result(r: &SearchResult) -> SearchResult {
 /// The walk completes. It is not cut short on a match count — see the note on
 /// determinism at the top of this file. Per-file work is still bounded by the
 /// size gate and the `memmem` needle check below.
+///
+/// `matcher` is the usage walk's `\bquery\b`, used only to count the def/usage overlap — see
+/// `count_usages_on_definition_lines`. It does not decide which definitions are found.
 fn find_definitions(
     query: &str,
+    matcher: &RegexMatcher,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
@@ -570,6 +729,10 @@ fn find_definitions(
             // `file_defs.is_empty() && ts_language.is_none()`, and the first half of that was
             // implied by the second — with no grammar the tree-sitter arm produced nothing at
             // all. A grammar that parses to nothing still suppresses the fallback, as before.
+            // Counts the def/usage overlap as definitions go past, since `offer.push` moves each
+            // one. Per file, so the line dedup cannot carry across files. See
+            // `DefUsageOverlapCounter`.
+            let mut overlap = DefUsageOverlapCounter::new(matcher);
             if let Some(ref ts_lang) = ts_language {
                 stream_defs_treesitter(
                     path,
@@ -579,17 +742,22 @@ fn find_definitions(
                     &content,
                     file_lines,
                     mtime,
-                    &mut |m| offer.push(m, &mut scorer),
+                    &mut |m| {
+                        overlap.observe(&m);
+                        offer.push(m, &mut scorer);
+                    },
                 );
             } else {
                 match file_type {
                     FileType::Code(_) => {
                         stream_defs_heuristic(path, query, &content, file_lines, mtime, &mut |m| {
+                            overlap.observe(&m);
                             offer.push(m, &mut scorer);
                         });
                     }
                     FileType::Markdown => {
                         stream_defs_markdown(path, query, &content, file_lines, mtime, &mut |m| {
+                            overlap.observe(&m);
                             offer.push(m, &mut scorer);
                         });
                     }
@@ -598,6 +766,8 @@ fn find_definitions(
             }
 
             offer.finish(&mut scorer);
+            let (collisions, in_tests) = overlap.totals();
+            matches.add_usages_on_definition_lines(collisions, in_tests);
 
             ignore::WalkState::Continue
         })
@@ -623,6 +793,7 @@ fn find_definitions(
 /// file and `retain::FileOffer`.
 fn find_definitions_multi(
     queries: &[&str],
+    matchers: &[RegexMatcher],
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
@@ -727,6 +898,9 @@ fn find_definitions_multi(
                     continue;
                 };
                 let mut offer = super::retain::FileOffer::new(bucket);
+                // Per target, with that target's own matcher — the overlap is as query-specific as
+                // the definitions it is counted over. Per file too, like the single-query walk.
+                let mut overlap = DefUsageOverlapCounter::new(&matchers[i]);
                 // Same per-file-type fallback dispatch as the single-query walk; see the
                 // long comment there for why each file kind is handled the way it is, and for
                 // why the arms are exclusive.
@@ -739,7 +913,10 @@ fn find_definitions_multi(
                         &lines,
                         file_lines,
                         mtime,
-                        &mut |m| offer.push(m, &mut scorers[i]),
+                        &mut |m| {
+                            overlap.observe(&m);
+                            offer.push(m, &mut scorers[i]);
+                        },
                     ),
                     None if ts_language.is_none() => match file_type {
                         FileType::Code(_) => stream_defs_heuristic(
@@ -748,7 +925,10 @@ fn find_definitions_multi(
                             &content,
                             file_lines,
                             mtime,
-                            &mut |m| offer.push(m, &mut scorers[i]),
+                            &mut |m| {
+                                overlap.observe(&m);
+                                offer.push(m, &mut scorers[i]);
+                            },
                         ),
                         FileType::Markdown => stream_defs_markdown(
                             path,
@@ -756,7 +936,10 @@ fn find_definitions_multi(
                             &content,
                             file_lines,
                             mtime,
-                            &mut |m| offer.push(m, &mut scorers[i]),
+                            &mut |m| {
+                                overlap.observe(&m);
+                                offer.push(m, &mut scorers[i]);
+                            },
                         ),
                         _ => {}
                     },
@@ -765,6 +948,8 @@ fn find_definitions_multi(
                     None => {}
                 }
                 offer.finish(&mut scorers[i]);
+                let (collisions, in_tests) = overlap.totals();
+                matches.add_usages_on_definition_lines(i, collisions, in_tests);
             }
 
             ignore::WalkState::Continue
