@@ -6,8 +6,8 @@ use std::time::SystemTime;
 use super::file_metadata;
 use crate::lang::treesitter::{
     definition_weight_for, elixir_definition_weight, extract_definition_name,
-    extract_elixir_definition_name, extract_impl_trait, extract_impl_type,
-    extract_implemented_interfaces, is_definition_node, is_elixir_definition,
+    extract_definition_names, extract_elixir_definition_name, extract_impl_trait,
+    extract_impl_type, extract_implemented_interfaces, is_definition_node, is_elixir_definition,
 };
 
 use crate::error::TilthError;
@@ -1268,9 +1268,17 @@ fn walk_for_definitions(
     let kind = node.kind();
 
     if is_definition_node(node, lang) {
-        // Check if this node defines the queried symbol
-        if let Some(name) = extract_definition_name(node, lines) {
-            if name == query {
+        // Check if this node defines the queried symbol.
+        //
+        // *Names*, plural: one C/C++ declaration can introduce several — `int mWidth,
+        // mHeight;` — and matching only the first left every later name findable as a usage
+        // but never as a definition (#81). Still at most one `Match` per node, since the
+        // node is the definition site whichever of its declarators the query named.
+        if extract_definition_names(node, lines)
+            .iter()
+            .any(|name| name == query)
+        {
+            {
                 let line_num = node.start_position().row as u32 + 1;
                 let line_text = lines
                     .get(node.start_position().row)

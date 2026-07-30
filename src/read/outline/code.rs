@@ -729,6 +729,209 @@ using           uint16_t = UINT16;
         );
     }
 
+    /// #81: one C/C++ declaration can introduce several names, and the outline rendered only
+    /// the first. Class members are the shape that matters — `int mWidth, mHeight;` is
+    /// ordinary style, and on two real trees this cost 266 and 97 105 names.
+    ///
+    /// `mScaleX` and `only` are controls: single-declarator forms that always worked and must
+    /// be untouched.
+    #[test]
+    fn cpp_outline_names_every_declarator_of_a_declaration() {
+        let rendered = outline(
+            "\
+typedef int A, B, C;
+typedef void (*CbA)(int), (*CbB)(int);
+int gA, gB;
+static int sA = 1, sB = 2;
+int *p, q;
+int only;
+class Widget
+{
+private:
+    int mWidth, mHeight;
+    float mScaleX;
+};
+",
+            Lang::Cpp,
+            1000,
+        );
+        for want in [
+            "type A",
+            "type B",
+            "type C",
+            "type CbA",
+            "type CbB",
+            "let gA",
+            "let gB",
+            "let sA",
+            "let sB",
+            "let p",
+            "let q",
+            "let only",
+            "prop mWidth",
+            "prop mHeight",
+            "prop mScaleX",
+        ] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+    }
+
+    /// A declaration can introduce declarators of *different* kinds — `int f(), x;` declares a
+    /// function and a variable — so the kind has to come from each declarator rather than from
+    /// the declaration. Asking the node would label both the same, which is the confidently
+    /// mislabelled entry #55 and #58 both recorded.
+    #[test]
+    fn cpp_outline_kinds_come_from_each_declarator_not_the_declaration() {
+        let rendered = outline("int f(), x;\nstruct S { int m(), n; };\n", Lang::Cpp, 1000);
+        for want in ["fn f", "let x", "fn m", "prop n"] {
+            assert!(rendered.contains(want), "missing {want:?}:\n{rendered}");
+        }
+    }
+
+    /// The shapes where the primary name is **not** the first declarator, which is where the
+    /// first version of #81 broke things rather than fixing them.
+    ///
+    /// `node_to_entry` renders the *type* for a declaration whose `type` is a bodied
+    /// specifier, so "append the declarators after the first" emitted the second instance and
+    /// silently not the first — worse than emitting neither, which is what these produced
+    /// before. Each row must match the pre-#81 outline exactly.
+    #[test]
+    fn a_type_with_instance_declarators_gains_no_entries() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "struct Config { int x; } gConfigA, gConfigB;",
+                &["struct Config", "prop x"],
+                &["gConfigA", "gConfigB"],
+            ),
+            (
+                "enum EMode { MA, MB } gMode1, gMode2;",
+                &["enum EMode"],
+                &["gMode1", "gMode2"],
+            ),
+            (
+                "struct Outer { struct Inner { int y; } a, b; };",
+                &["struct Outer", "struct Inner"],
+                &["prop a", "prop b"],
+            ),
+        ];
+        for (src, want, unwanted) in cases {
+            let owned = format!("{src}\n");
+            let rendered = outline(&owned, Lang::Cpp, 1000);
+            for w in *want {
+                assert!(
+                    rendered.contains(w),
+                    "missing {w:?} for {src:?}:\n{rendered}"
+                );
+            }
+            for u in *unwanted {
+                assert!(
+                    !rendered.contains(u),
+                    "{u:?} should not be an entry for {src:?} — the primary name is the type, \
+                     not a declarator, so no extras are safe here:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    /// A declaration cannot legitimately introduce one name twice, so a repeat is a misparse
+    /// artifact. Macro-annotated enumerators are the shape that produces them: `UMETA(…)`
+    /// after each enumerator makes the whole list parse as one `field_declaration` carrying a
+    /// `function_declarator` per enumerator, every one named `UMETA`.
+    ///
+    /// Without dedup the outline gained one identical `fn UMETA` per enumerator — same name,
+    /// kind and range. Pinned at exactly one, which is what the pre-#81 outline showed.
+    #[test]
+    fn a_macro_misparsed_enumerator_list_is_not_multiplied() {
+        let rendered = outline(
+            "\
+UENUM(BlueprintType)
+enum class EAmmoType : uint8
+{
+    EPistol UMETA(DisplayName = \"Pistol\"),
+    ERifle  UMETA(DisplayName = \"Rifle\"),
+    EGrenade UMETA(DisplayName = \"Grenade\")
+};
+",
+            Lang::Cpp,
+            1000,
+        );
+        // Counting entries, not occurrences of the string: the entry carries a signature line
+        // that also contains `UMETA`, so a naive substring count is 2 even when correct.
+        assert_eq!(
+            rendered.matches("fn UMETA").count(),
+            1,
+            "the misparse artifact must not be multiplied by enumerator count:\n{rendered}"
+        );
+    }
+
+    /// The parity assertion, and the reason this is not just "the second name appears": the
+    /// outline and `tilth_search` reach names through different entry points —
+    /// `node_to_entries` and `extract_definition_names` — and a change to one has drifted from
+    /// the other in #63, #68 and #75. Pin that every name one surface knows, the other does
+    /// too.
+    #[test]
+    fn outline_and_definition_names_agree_on_multi_declarator_declarations() {
+        fn collect(entries: &[crate::types::OutlineEntry], out: &mut Vec<String>) {
+            for e in entries {
+                out.push(e.name.clone());
+                collect(&e.children, out);
+            }
+        }
+
+        use crate::lang::treesitter::extract_definition_names;
+        let src = "\
+typedef int A, B, C;
+int gA, gB;
+static int sA = 1, sB = 2;
+int *p, q;
+int f(), x;
+struct S { int mA, mB; float mC; };
+";
+        let language = crate::lang::outline::outline_language(Lang::Cpp).expect("grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("grammar loads");
+        let tree = parser.parse(src, None).expect("parse");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Every name `extract_definition_names` reports, from every declaration node.
+        //
+        // Note this is *not* the same as "every name `tilth_search` reports as a definition":
+        // an ordinary C/C++ `declaration` is deliberately not a definition node (see
+        // `is_definition_node`), so `gA`/`gB` and `sA`/`sB` below resolve as usages both
+        // before and after #81. What is asserted here is that the two *name resolvers* agree,
+        // which is the drift that has actually bitten in #63, #68 and #75; the `declaration`
+        // gate is a separate, pre-existing decision.
+        let mut from_names: Vec<String> = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        let mut cursor = tree.root_node().walk();
+        while let Some(n) = stack.pop() {
+            if matches!(
+                n.kind(),
+                "field_declaration" | "declaration" | "type_definition"
+            ) {
+                from_names.extend(extract_definition_names(n, &lines));
+            }
+            stack.extend(n.children(&mut cursor));
+        }
+        from_names.sort();
+
+        // Every name the outline renders, flattened over nesting.
+        let mut from_outline = Vec::new();
+        collect(
+            &crate::lang::outline::get_outline_entries(src, Lang::Cpp),
+            &mut from_outline,
+        );
+        // The struct itself is an outline entry with no declarator, so it has no counterpart
+        // in the declaration-node walk above.
+        from_outline.retain(|n| n != "S");
+        from_outline.sort();
+
+        assert_eq!(
+            from_outline, from_names,
+            "the outline and the definition walk disagree about which names exist"
+        );
+    }
+
     /// #58: the two declarator shapes that stayed `<anonymous>` after #55 — explicit
     /// template specialisations and conversion operators. End-to-end through the rendered
     /// outline, since that is where the defect was visible.
