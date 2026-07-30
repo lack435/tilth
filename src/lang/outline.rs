@@ -1,8 +1,8 @@
 use crate::lang::treesitter::{
     c_declarator_name, c_declarators, cpp_misparsed_class_name, declarator_chain_has_function,
     declarator_declares_function, enclosing_misparsed_class_name, is_bodied_specifier,
-    is_cpp_macro_invocation, is_named_bodied_specifier, misparsed_member_name, node_text_simple,
-    SPECIFIER_KINDS,
+    is_cpp_macro_invocation, is_named_bodied_specifier, misparsed_member_name,
+    multi_declarator_names, node_text_simple, SPECIFIER_KINDS,
 };
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
@@ -140,14 +140,23 @@ fn is_preproc_conditional(kind: &str) -> bool {
 ///
 /// One C/C++ declaration can name several things — `int mWidth, mHeight;`,
 /// `typedef int A, B, C;` — and `node_to_entry` returns a single `OutlineEntry` by
-/// construction, so every name after the first was missing from the outline. Recovered 2 and
-/// 133 entries across two real C++ trees (2 948 and 4 000 files), dominated by the idiomatic
-/// `typedef struct { … } FOO, *PFOO;` where the pointer alias was always the lost one.
+/// construction, so every name after the first was missing from the outline.
 ///
 /// A wrapper rather than a new return type for `node_to_entry` itself: that function has
-/// eight call sites, four of which recurse through wrappers (`template_declaration`,
-/// `export_statement`, a `field_declaration` holding a nested class) where the multi-name
-/// case cannot arise. Widening all of them would be churn without meaning.
+/// eight call sites, and the two that *collect* entries — `walk_top_level` and
+/// `collect_member` — are wired here. The other four return a single inner entry from a
+/// wrapper (`template_declaration`, `export_statement`, a `field_declaration` or
+/// `declaration` whose `type` is a bodied specifier), and by definition can only pass one
+/// entry upward. `template <class T> int a, b;` therefore still outlines `a` alone; it is
+/// ill-formed C++ and left as-is rather than reshaping the wrapper contract.
+///
+/// The name list comes from `multi_declarator_names`, which is also what the search side
+/// uses — one implementation of "which names does this declaration introduce", so the two
+/// surfaces cannot answer it differently. It returns `None`, and this returns the single
+/// entry unchanged, whenever the primary name did not come from the first declarator.
+/// `struct Config { int x; } gConfigA, gConfigB;` is why: `node_to_entry` renders the
+/// *type* there, so appending "the declarators after the first" produced `gConfigB` and
+/// silently not `gConfigA` — worse than the previous behaviour, which emitted neither.
 fn node_to_entries(
     node: tree_sitter::Node,
     lines: &[&str],
@@ -160,31 +169,35 @@ fn node_to_entries(
     if !matches!(lang, Lang::C | Lang::Cpp) {
         return vec![first];
     }
-    let declarators = c_declarators(node);
-    if declarators.len() < 2 {
+    let Some(names) = multi_declarator_names(node, lines, &first.name) else {
         return vec![first];
-    }
-    let mut out = Vec::with_capacity(declarators.len());
-    out.push(first);
-    // Skip the first: `node_to_entry` already rendered it, with all the special-casing that
-    // arm carries (macro invocations, nested types, misparsed class bodies). The extras are
-    // the same declaration seen through a different declarator, so they share its range and
-    // differ only in name and — for `int f(), x;` — in kind.
-    for d in declarators.iter().skip(1) {
-        let Some(name) = c_declarator_name(*d, lines) else {
-            continue;
-        };
-        let kind = declarator_kind(node, *d, lines);
+    };
+    let declarators = c_declarators(node);
+    let mut out = Vec::with_capacity(names.len());
+    // Skip the first name: `node_to_entry` already rendered it, with all the special-casing
+    // its arm carries (macro invocations, nested types, misparsed class bodies).
+    for name in names.into_iter().skip(1) {
+        // Pair the name back to its declarator so the kind is decided per declarator. The
+        // lookup is by resolved name because `multi_declarator_names` may have deduplicated.
+        let kind = declarators
+            .iter()
+            .find(|d| c_declarator_name(**d, lines).as_deref() == Some(name.as_str()))
+            .map_or(OutlineKind::Variable, |d| declarator_kind(node, *d, lines));
         out.push(OutlineEntry {
             kind,
             name,
             start_line: node.start_position().row as u32 + 1,
             end_line: node.end_position().row as u32 + 1,
+            // Extras carry no signature or doc. `int x, f();` therefore renders `fn f`
+            // without the signature line that `int f();` alone would get — the signature is
+            // extracted from the whole node and would repeat the entire declaration under
+            // each name.
             signature: None,
             doc: None,
             children: Vec::new(),
         });
     }
+    out.insert(0, first);
     out
 }
 

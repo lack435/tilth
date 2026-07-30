@@ -788,6 +788,82 @@ private:
         }
     }
 
+    /// The shapes where the primary name is **not** the first declarator, which is where the
+    /// first version of #81 broke things rather than fixing them.
+    ///
+    /// `node_to_entry` renders the *type* for a declaration whose `type` is a bodied
+    /// specifier, so "append the declarators after the first" emitted the second instance and
+    /// silently not the first — worse than emitting neither, which is what these produced
+    /// before. Each row must match the pre-#81 outline exactly.
+    #[test]
+    fn a_type_with_instance_declarators_gains_no_entries() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "struct Config { int x; } gConfigA, gConfigB;",
+                &["struct Config", "prop x"],
+                &["gConfigA", "gConfigB"],
+            ),
+            (
+                "enum EMode { MA, MB } gMode1, gMode2;",
+                &["enum EMode"],
+                &["gMode1", "gMode2"],
+            ),
+            (
+                "struct Outer { struct Inner { int y; } a, b; };",
+                &["struct Outer", "struct Inner"],
+                &["prop a", "prop b"],
+            ),
+        ];
+        for (src, want, unwanted) in cases {
+            let owned = format!("{src}\n");
+            let rendered = outline(&owned, Lang::Cpp, 1000);
+            for w in *want {
+                assert!(
+                    rendered.contains(w),
+                    "missing {w:?} for {src:?}:\n{rendered}"
+                );
+            }
+            for u in *unwanted {
+                assert!(
+                    !rendered.contains(u),
+                    "{u:?} should not be an entry for {src:?} — the primary name is the type, \
+                     not a declarator, so no extras are safe here:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    /// A declaration cannot legitimately introduce one name twice, so a repeat is a misparse
+    /// artifact. Macro-annotated enumerators are the shape that produces them: `UMETA(…)`
+    /// after each enumerator makes the whole list parse as one `field_declaration` carrying a
+    /// `function_declarator` per enumerator, every one named `UMETA`.
+    ///
+    /// Without dedup the outline gained one identical `fn UMETA` per enumerator — same name,
+    /// kind and range. Pinned at exactly one, which is what the pre-#81 outline showed.
+    #[test]
+    fn a_macro_misparsed_enumerator_list_is_not_multiplied() {
+        let rendered = outline(
+            "\
+UENUM(BlueprintType)
+enum class EAmmoType : uint8
+{
+    EPistol UMETA(DisplayName = \"Pistol\"),
+    ERifle  UMETA(DisplayName = \"Rifle\"),
+    EGrenade UMETA(DisplayName = \"Grenade\")
+};
+",
+            Lang::Cpp,
+            1000,
+        );
+        // Counting entries, not occurrences of the string: the entry carries a signature line
+        // that also contains `UMETA`, so a naive substring count is 2 even when correct.
+        assert_eq!(
+            rendered.matches("fn UMETA").count(),
+            1,
+            "the misparse artifact must not be multiplied by enumerator count:\n{rendered}"
+        );
+    }
+
     /// The parity assertion, and the reason this is not just "the second name appears": the
     /// outline and `tilth_search` reach names through different entry points —
     /// `node_to_entries` and `extract_definition_names` — and a change to one has drifted from
@@ -817,7 +893,14 @@ struct S { int mA, mB; float mC; };
         let tree = parser.parse(src, None).expect("parse");
         let lines: Vec<&str> = src.lines().collect();
 
-        // Every name the definition walk would match on, from every declaration node.
+        // Every name `extract_definition_names` reports, from every declaration node.
+        //
+        // Note this is *not* the same as "every name `tilth_search` reports as a definition":
+        // an ordinary C/C++ `declaration` is deliberately not a definition node (see
+        // `is_definition_node`), so `gA`/`gB` and `sA`/`sB` below resolve as usages both
+        // before and after #81. What is asserted here is that the two *name resolvers* agree,
+        // which is the drift that has actually bitten in #63, #68 and #75; the `declaration`
+        // gate is a separate, pre-existing decision.
         let mut from_names: Vec<String> = Vec::new();
         let mut stack = vec![tree.root_node()];
         let mut cursor = tree.root_node().walk();
