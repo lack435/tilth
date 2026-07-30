@@ -168,15 +168,10 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
         }
     }
 
-    let threads = std::env::var("TILTH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
-        });
-
+    // Thread count and the reasons for its ceiling — CPU *and* the per-thread tree-sitter tree —
+    // live on `util::worker_threads`.
     let mut builder = base_walk_builder(scope);
-    builder.threads(threads);
+    builder.threads(crate::util::worker_threads());
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
