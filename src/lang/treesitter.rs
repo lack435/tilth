@@ -123,14 +123,15 @@ pub(crate) fn is_named_bodied_specifier(node: tree_sitter::Node) -> bool {
 /// `extract_definition_name`'s gate rejected the chain and fell through to the raw
 /// declarator text.
 ///
-/// The template-specialisation kinds (`template_function`, `template_method`) are
-/// deliberately *not* here. `node-types.json` makes them members of the `_declarator` and
-/// `_field_declarator` supertypes, so they *can* be a definition node's own `declarator`
-/// — but only for `void Apply<int>(int);`, a declarator carrying template arguments with
-/// no `template <>` clause of its own. In that shape the chain above them is a
-/// `function_declarator` regardless, so the gate already admits it and
-/// `c_declarator_name`'s own arm does the naming. Listing them here would widen the gate
-/// without reaching anything it does not already reach.
+/// `template_function` and `template_method` are here for a subtler reason than the rest:
+/// not to *reach* a name, but to keep the two walks from disagreeing about one. They are
+/// members of the `_declarator` and `_field_declarator` supertypes, so a node's own
+/// `declarator` can be one — `int val<int>;` inside a class body is a `field_declaration`
+/// whose declarator is a bare `template_method`. Every function spelling puts a
+/// `function_declarator` above them, so the gate already admitted those; this data
+/// spelling is the case it did not. Left out, `extract_definition_name` fell through to
+/// the generic probe and named it `val<int>` from raw text while the outline's
+/// `c_declarator_name` said `val` — the same symbol under two names.
 const C_DECLARATOR_KINDS: &[&str] = &[
     "function_declarator",
     "pointer_declarator",
@@ -141,6 +142,8 @@ const C_DECLARATOR_KINDS: &[&str] = &[
     "init_declarator",
     "qualified_identifier",
     "operator_cast",
+    "template_function",
+    "template_method",
 ];
 
 /// C/C++ *abstract* declarator kinds — a declarator with no name in it.
@@ -343,7 +346,24 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
 /// are excluded; `explicit` is excluded too, since it is a sibling of `operator_cast`
 /// rather than part of it. A conversion operator split across lines yields `None` rather
 /// than the first line's fragment: a partial spelling would be a name no search could
-/// match, which is worse than the `<anonymous>` it replaces.
+/// match, which is worse than the `<anonymous>` it replaces. `extract_definition_name`
+/// has to opt out of its generic fallback for that `None` to survive — see
+/// `declarator_names_a_conversion`.
+///
+/// Two consequences of "verbatim" that are deliberate, because the alternative costs
+/// more than it buys:
+///
+///   * Interior spacing and comments are kept — `operator /*x*/ bool`,
+///     `operator   bool`. Normalising them to `operator bool` would produce a name that
+///     is *not* a substring of the source, and the prefilter above would then skip the
+///     very file that defines it. An odd name that is findable beats a tidy one that is
+///     not, and the raw-text fallback this replaces was worse on the same input.
+///   * A conversion to a function pointer cuts at the wrong paren:
+///     `operator int(*)()` names `operator int(*)`, because the outer
+///     `abstract_function_declarator` carries both the inner parenthesised declarator
+///     and the `parameters` this looks for. Still a substring, so still findable; the
+///     name is just short. Spelling that type without a typedef is rare enough not to
+///     justify a second disambiguation rule.
 fn operator_cast_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let params = abstract_parameter_list(node)?;
     let row = node.start_position().row;
@@ -356,6 +376,30 @@ fn operator_cast_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String>
     // in a type name would otherwise panic on a non-boundary slice.
     let text = lines[row].get(start..end)?.trim_end();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+/// True when a declarator chain declares a conversion operator.
+///
+/// Only two shapes reach one, and `node-types.json` is what bounds the list: `operator_cast`
+/// appears exactly as `declaration`'s and `function_definition`'s `declarator`, and as a
+/// `qualified_identifier`'s `name`. No pointer, reference or array layer can sit above it,
+/// so the walk only has to step through qualifiers.
+fn declarator_names_a_conversion(node: tree_sitter::Node) -> bool {
+    let mut current = node;
+    for _ in 0..MAX_DECLARATOR_DEPTH {
+        match current.kind() {
+            "operator_cast" => return true,
+            // `A::B::operator bool` nests qualifiers, and the depth is input-controlled
+            // for the same reason `c_declarator_name` is bounded — `outline::generate` is
+            // a fuzz target.
+            "qualified_identifier" => match current.child_by_field_name("name") {
+                Some(n) => current = n,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The `parameter_list` of a conversion operator, through the abstract declarator chain
@@ -815,6 +859,13 @@ fn declarator_chain_has_kind(node: tree_sitter::Node, kind: &str) -> bool {
 /// `prop operator bool` — the same trap #55 recorded for reference-returning members,
 /// where naming a member without also teaching this walk what it is produces a
 /// confidently mislabelled entry instead of a missing one.
+///
+/// It catches the *unqualified* spelling only, which is the one that occurs. This walk
+/// steps with `inner_declarator`, which does not descend a `qualified_identifier` — so a
+/// hypothetical `Thing::operator bool();` answers "not a function" and the qualified-data
+/// rule in `is_definition_node` reads it as data. You cannot redeclare a member outside
+/// its class, so that spelling is ill-formed C++; the valid out-of-line form is a
+/// `function_definition`, which the outline classifies without consulting this walk.
 pub(crate) fn declarator_chain_has_function(node: tree_sitter::Node) -> bool {
     declarator_chain_has_kind(node, "function_declarator")
         || declarator_chain_has_kind(node, "operator_cast")
@@ -843,6 +894,23 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         if C_DECLARATOR_KINDS.contains(&declarator.kind()) {
             if let Some(name) = c_declarator_name(declarator, lines) {
                 return Some(name);
+            }
+            // A conversion operator's name is `operator_cast_name`'s to decide, and its
+            // `None` is a decision rather than a failure to look — it means the spelling
+            // is not on one line, so no contiguous substring of the source names it.
+            // Falling through to the generic probe would overrule that with
+            // `node_text_simple`, which for a multi-row node returns the *first line's
+            // fragment*: `operator TMap<FString,` for a clang-format-wrapped conversion,
+            // or a bare `operator` for the degenerate case.
+            //
+            // That is worse than it sounds, because `is_definition_node` now registers
+            // an in-class conversion-operator prototype. Every wrapped conversion in a
+            // tree would collapse onto one fabricated symbol, become an exported symbol
+            // for `tilth_deps`, and disagree with the outline — which drops the member,
+            // since `c_declarator_child_name` bails on the same `None`. Two walks
+            // disagreeing about one member is the failure #55 exists to prevent.
+            if declarator_names_a_conversion(declarator) {
+                return None;
             }
         }
     }
@@ -2368,13 +2436,78 @@ mod tests {
     /// does when the spelling is not on one line. It answers `None`: a name search could
     /// never match `"operator"` alone, so half a spelling is worse than the `<anonymous>`
     /// it would replace.
+    ///
+    /// Asserted on `extract_definition_name`, **not** on `c_declarator_name`. The walk
+    /// answered `None` all along; what overruled it was the generic `declarator` probe in
+    /// `extract_definition_name`, whose `node_text_simple` returns a multi-row node's
+    /// *first line*. So the version of this test that checked the walk passed while the
+    /// observable name was `"operator TMap<FString,"` — the same one-layer-up gap
+    /// 20c34f2 recorded, where the declaration arms consult the chain only after
+    /// resolving a name.
+    ///
+    /// The wrapped-generic case is the realistic one: clang-format breaks exactly there.
     #[test]
     fn multiline_conversion_operator_yields_no_name() {
-        let src = "struct S { operator\n  Holder&() { return H; } };\n";
-        let tree = parse(src, Lang::Cpp);
-        let lines: Vec<&str> = src.lines().collect();
-        let node = find_by_kind(tree.root_node(), "operator_cast");
-        assert_eq!(c_declarator_name(node, &lines), None);
+        let cases = [
+            "struct S { operator\n  Holder&() { return H; } };\n",
+            "struct S { operator\n  bool(); };\n",
+            "class Holder\n{\npublic:\n    operator TMap<FString,\n                  TArray<int>>() const;\n};\n",
+        ];
+        for src in cases {
+            let tree = parse(src, Lang::Cpp);
+            let lines: Vec<&str> = src.lines().collect();
+            let cast = find_by_kind(tree.root_node(), "operator_cast");
+            assert_eq!(c_declarator_name(cast, &lines), None, "{src:?}");
+            let owner = cast.parent().expect("a declaration or definition");
+            assert_eq!(
+                extract_definition_name(owner, &lines),
+                None,
+                "{src:?} must not be named from the first line's fragment (node kind {})",
+                owner.kind()
+            );
+        }
+    }
+
+    /// The two walks must agree on what a symbol is *called*, not just on whether it has
+    /// a name. `extract_definition_name` gates on `C_DECLARATOR_KINDS` before consulting
+    /// `c_declarator_name`, so a kind the walk can name but the gate does not list gets
+    /// named twice: once correctly by the outline, once from raw text by the generic
+    /// probe.
+    ///
+    /// `int val<int>;` is the shape that exposed it — a `field_declaration` whose
+    /// declarator is a bare `template_method`, with no `function_declarator` above it to
+    /// carry the gate. It rendered `prop val` in the outline while symbol search knew it
+    /// only as `val<int>`.
+    #[test]
+    fn both_name_paths_agree_on_templated_declarators() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("struct S { int val<int>; };", "field_declaration", "val"),
+            (
+                "struct S { template <> int val<int>; };",
+                "declaration",
+                "val",
+            ),
+            // Valid C++, reached through `qualified_identifier` and `init_declarator`.
+            ("template <> int Cls::val<int>;", "declaration", "val"),
+            ("template <> int val<int> = 0;", "declaration", "val"),
+        ];
+        for (src, kind, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            let declarator = node.child_by_field_name("declarator").expect("declarator");
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "wrong name for {src:?}"
+            );
+            assert_eq!(
+                c_declarator_name(declarator, &lines).as_deref(),
+                Some(*expected),
+                "the two name paths disagree for {src:?}"
+            );
+        }
     }
 
     /// A comment is a tree-sitter *extra*: it is a **named** child and can be the
