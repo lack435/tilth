@@ -1526,7 +1526,10 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
         return Vec::new();
     };
 
-    let Some(tree) = crate::lang::parse_masked(content, Some(lang), &ts_lang) else {
+    // Budgeted: `diff` builds overlays with `par_iter`, calling this twice per changed file
+    // (old and new content), so this is a walk-time transient tree like the search paths (#70).
+    let Some(tree) = crate::lang::parse_budget::parse_budgeted(content, Some(lang), &ts_lang)
+    else {
         return Vec::new();
     };
 

@@ -436,7 +436,9 @@ fn compute_structural_hash(source: &str, symbol_name: &str, lang: Lang) -> u64 {
         return hash_string(source);
     };
 
-    let Some(tree) = crate::lang::parse_masked(source, Some(lang), &ts_lang) else {
+    // Budgeted for the same reason as `get_outline_entries`: reached from `compute_overlay`,
+    // which `diff` runs under `par_iter` (#70).
+    let Some(tree) = crate::lang::parse_budget::parse_budgeted(source, Some(lang), &ts_lang) else {
         return hash_string(source);
     };
 

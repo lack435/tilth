@@ -116,7 +116,8 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
         None
     };
 
-    let Some(tree) = crate::lang::parse_masked(content, Some(lang), &ts_lang) else {
+    let Some(tree) = crate::lang::parse_budget::parse_budgeted(content, Some(lang), &ts_lang)
+    else {
         return Vec::new();
     };
 

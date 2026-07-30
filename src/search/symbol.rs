@@ -950,8 +950,8 @@ fn parse_tree(
     ts_lang: &tree_sitter::Language,
     content: &str,
     lang: Option<crate::types::Lang>,
-) -> Option<tree_sitter::Tree> {
-    crate::lang::parse_masked(content, lang, ts_lang)
+) -> Option<crate::lang::parse_budget::BudgetedTree> {
+    crate::lang::parse_budget::parse_budgeted(content, lang, ts_lang)
 }
 
 /// One query's definitions from an already-parsed tree.
