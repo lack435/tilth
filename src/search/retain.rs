@@ -304,9 +304,31 @@ pub(crate) struct ExactTallies {
     pub(crate) tests: usize,
     /// Non-test usages. Their local/cross split is the only part retention can lose.
     pub(crate) usages: usize,
+    /// Definition lines that the usage walk's own matcher also matches — the exact number of
+    /// usages `symbol::assemble`'s def/usage dedup will remove.
+    ///
+    /// **Not a match count, and deliberately outside `total()`.** Every other field counts
+    /// matches this sink was offered; this one counts a property of them, so folding it in would
+    /// break the "tallies account for every offered match" assertion in `finish`. Only the
+    /// definition walk populates it — the usage walk cannot see a definition — so it is 0 on a
+    /// usage sink and reading it from one is meaningless rather than merely zero.
+    ///
+    /// Counted during the walk because retention is what makes it unobservable afterwards: the
+    /// overlap over the *retained* usages omits every collision the bound clipped, and
+    /// `total_found` then over-reports by exactly that many (#60).
+    pub(crate) usages_on_definition_lines: usize,
+    /// The subset of `usages_on_definition_lines` whose definition line sits in the `Test` facet.
+    ///
+    /// `facets::facet_of` routes a usage in a test file to `Test`, so a removed collision has to
+    /// come off *that* count and not off a usage bucket. Without the split, `totals.tests` reports a
+    /// match `total_found` has already subtracted and the facets sum past the header.
+    pub(crate) usages_on_test_definition_lines: usize,
 }
 
 impl ExactTallies {
+    /// Matches offered, which is what `total_found` is built from.
+    ///
+    /// `usages_on_definition_lines` is excluded — see its doc comment.
     pub(crate) fn total(self) -> usize {
         self.definitions + self.implementations + self.tests + self.usages
     }
@@ -332,6 +354,12 @@ pub(crate) struct BoundedRetain {
     t_impls: AtomicUsize,
     t_tests: AtomicUsize,
     t_usages: AtomicUsize,
+    /// See `ExactTallies::usages_on_definition_lines`. Fed by `add_usages_on_definition_lines`
+    /// rather than derived from the matches, because deciding it needs the line each definition
+    /// sits on and only the definition walk has that.
+    t_usage_collisions: AtomicUsize,
+    /// See `ExactTallies::usages_on_test_definition_lines`.
+    t_usage_collisions_in_tests: AtomicUsize,
 }
 
 impl BoundedRetain {
@@ -344,6 +372,30 @@ impl BoundedRetain {
             t_impls: AtomicUsize::new(0),
             t_tests: AtomicUsize::new(0),
             t_usages: AtomicUsize::new(0),
+            t_usage_collisions: AtomicUsize::new(0),
+            t_usage_collisions_in_tests: AtomicUsize::new(0),
+        }
+    }
+
+    /// Add one file's count of definition lines a usage match also lands on, and how many of those
+    /// lines belong to the `Test` facet.
+    ///
+    /// Separate from the offer path because the count is not derivable from the matches: it needs
+    /// the line each definition sits on. Report-only and `Relaxed`, exactly like `offered` —
+    /// nothing reads either counter to decide what to retain, and both are read after the walk has
+    /// joined, so they need no joint atomicity.
+    pub(crate) fn add_usages_on_definition_lines(&self, n: usize, in_tests: usize) {
+        debug_assert!(
+            in_tests <= n,
+            "test subset ({in_tests}) exceeds the total ({n})"
+        );
+        if n > 0 {
+            self.t_usage_collisions
+                .fetch_add(n, AtomicOrdering::Relaxed);
+        }
+        if in_tests > 0 {
+            self.t_usage_collisions_in_tests
+                .fetch_add(in_tests, AtomicOrdering::Relaxed);
         }
     }
 
@@ -462,6 +514,10 @@ impl BoundedRetain {
             implementations: self.t_impls.load(AtomicOrdering::Relaxed),
             tests: self.t_tests.load(AtomicOrdering::Relaxed),
             usages: self.t_usages.load(AtomicOrdering::Relaxed),
+            usages_on_definition_lines: self.t_usage_collisions.load(AtomicOrdering::Relaxed),
+            usages_on_test_definition_lines: self
+                .t_usage_collisions_in_tests
+                .load(AtomicOrdering::Relaxed),
         }
     }
 
@@ -635,6 +691,16 @@ impl BoundedRetainSet {
     pub(crate) fn bucket(&self, i: usize) -> Option<&BoundedRetain> {
         debug_assert!(i < self.buckets.len(), "target index {i} out of range");
         self.buckets.get(i)
+    }
+
+    /// `BoundedRetain::add_usages_on_definition_lines` for target `i`. Out-of-range `i` is ignored
+    /// rather than panicking, for the same reason `bucket` returns an `Option`: a mismatch is a bug
+    /// in the caller, not a reason to abort a walk returning correct results for every other target.
+    pub(crate) fn add_usages_on_definition_lines(&self, i: usize, n: usize, in_tests: usize) {
+        debug_assert!(i < self.buckets.len(), "target index {i} out of range");
+        if let Some(b) = self.buckets.get(i) {
+            b.add_usages_on_definition_lines(n, in_tests);
+        }
     }
 
     /// Per-target retained matches paired with each target's exact offered count.

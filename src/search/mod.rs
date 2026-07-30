@@ -1959,9 +1959,17 @@ mod tests {
 
     /// One definition plus many usages per file, enough usages in total to clip.
     ///
-    /// Returns `(definitions, usages)` as ground truth. Every usage is on its own line and none
-    /// shares a line with the definition, so the def/usage dedup removes nothing and the true
-    /// post-dedup total is simply the sum.
+    /// Returns `(definitions, usages)` as ground truth: the definitions, and the usages that
+    /// survive `assemble`'s def/usage dedup.
+    ///
+    /// The dedup is **not** a no-op here, though an earlier version of this comment claimed it
+    /// was. The definition line contains `sym_target` as a whole word, so the usage walk's
+    /// `\bsym_target\b` matches it too: the usage walk offers 601 matches per file, one of which
+    /// sits on the definition's line and is removed. The returned count is the post-dedup 600.
+    ///
+    /// What the fixture genuinely cannot exercise is a *clipped* collision — 40 collisions against
+    /// a `20_000` cap are all retained, so an overlap counted over the retained set is exact by
+    /// luck. See `write_symbol_collision_fixture` for the shape that separates the two.
     fn write_symbol_retention_fixture(root: &Path) -> (usize, usize) {
         for f in 0..SYM_RETENTION_FILES {
             let mut body = String::from(
@@ -2067,6 +2075,291 @@ mod tests {
             out.contains(&format!("{} matches", result.total_found)),
             "rendered header lost the true total:
 {out}"
+        );
+    }
+
+    /// Files for the colliding fixture below. Both tiers must exceed `retain::MAX_RETAINED`
+    /// (`20_000`) on their own: the shallow tier so it fills the usage sink and leaves no room for
+    /// a single deep match, the deep tier so the *definition* walk clips as well.
+    const COLLIDE_FILES_PER_TIER: usize = 40;
+    const COLLIDE_LINES_PER_FILE: usize = 600;
+
+    /// Text of a colliding line: a definition whose own line the usage matcher also matches.
+    const COLLIDE_DEF_LINE: &str = "pub fn col_target() -> u32 { 0 }";
+
+    /// Depth of the colliding tier. `scope_proximity` charges 20 points per path component and
+    /// saturates at 0, so ten directories plus a filename puts the whole tier at the floor — 180
+    /// points below the shallow tier, which is what has to outweigh the boosts the colliding text
+    /// earns for looking like an exported function (see the guard in the test).
+    const COLLIDE_DEPTH: usize = 10;
+
+    /// Every deep line is **both** a definition and a usage-regex match; every shallow line is a
+    /// plain usage. Returns `(definitions, post_dedup_usages)` as ground truth.
+    ///
+    /// This is the fixture shape `write_symbol_retention_fixture` cannot produce. There, one
+    /// definition sits at the top of each file and its own line does collide — but 40 collisions
+    /// against a `20_000` cap are all retained, so an overlap counted over the retained set happens
+    /// to be exact and the bug is invisible. Here the colliding lines are buried deep enough to
+    /// lose the retention race outright: the shallow tier alone exceeds the cap, so **not one**
+    /// collision survives into the retained set and an overlap counted there reads zero.
+    ///
+    /// The deep lines are syntactically repeated `pub fn col_target()` definitions. Rust would
+    /// reject the duplicate names; tree-sitter does not care, and a definition per line is what
+    /// makes the collision count equal the line count.
+    fn write_symbol_collision_fixture(root: &Path) -> (usize, usize) {
+        // Deep tier: a definition on every line, so the usage walk matches every one of them too.
+        let mut deep_dir = root.to_path_buf();
+        for i in 0..COLLIDE_DEPTH {
+            deep_dir.push(format!("n{i}"));
+        }
+        std::fs::create_dir_all(&deep_dir).unwrap();
+        let defs_body = format!("{COLLIDE_DEF_LINE}\n").repeat(COLLIDE_LINES_PER_FILE);
+        for f in 0..COLLIDE_FILES_PER_TIER {
+            std::fs::write(deep_dir.join(format!("d{f:03}.rs")), &defs_body).unwrap();
+        }
+
+        // Shallow tier: plain usages, none on a definition's line.
+        for f in 0..COLLIDE_FILES_PER_TIER {
+            let mut body = String::new();
+            for i in 0..COLLIDE_LINES_PER_FILE {
+                let _ = writeln!(body, "{}", shallow_usage_line(i));
+            }
+            std::fs::write(root.join(format!("u{f:03}.rs")), &body).unwrap();
+        }
+
+        let per_tier = COLLIDE_FILES_PER_TIER * COLLIDE_LINES_PER_FILE;
+        (per_tier, per_tier)
+    }
+
+    fn shallow_usage_line(i: usize) -> String {
+        format!("    let v{i} = col_target();")
+    }
+
+    /// A `Match` shaped like what the usage walk produces for `text` in `path`, for scoring the
+    /// fixture's two tiers against each other.
+    fn collide_usage_match(path: &Path, line: u32, text: &str) -> Match {
+        Match {
+            path: path.to_path_buf(),
+            line,
+            text: crate::types::match_text(text),
+            is_definition: false,
+            exact: text.contains("col_target"),
+            file_lines: COLLIDE_LINES_PER_FILE as u32,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            def_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        }
+    }
+
+    /// `total_found` must stay exact when retention clips away the def/usage collisions (#60).
+    ///
+    /// The dedup in `assemble` removes usages that sit on a definition's line. Deriving the
+    /// overlap from the *retained* usages counts only the collisions that survived the bound, so
+    /// every clipped collision is left in the total — over-reporting by that many. On this fixture
+    /// no collision survives at all, so the whole overlap goes unsubtracted and the header claims
+    /// `72_000` matches where `48_000` exist.
+    ///
+    /// The direction matters as much as the magnitude: `total_found` must never *under*-report,
+    /// because a header whose only job is to say "more exists than shown" becomes actively
+    /// misleading if it undershoots. Asserted separately below so an over-correction fails
+    /// distinctly from an under-correction.
+    #[test]
+    fn symbol_totals_stay_exact_when_retention_clips_every_def_usage_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (defs, usages) = write_symbol_collision_fixture(dir.path());
+        for (label, n) in [("definitions", defs), ("usages", usages)] {
+            assert!(
+                n > crate::search::retain::MAX_RETAINED,
+                "{label} tier must exceed MAX_RETAINED or its walk never clips ({n})"
+            );
+        }
+
+        // Guard the fixture's load-bearing property, which the assertions below cannot see.
+        //
+        // They pass whether or not the collisions were clipped — an exact overlap is exact either
+        // way — so once fixed, nothing here would notice the fixture going weak. And it easily
+        // could: the colliding text is `pub fn ...`, which earns 70 points of
+        // `query_intent_boost` and 60 of `exported_api_boost` for looking like an exported
+        // function. A first version buried the tier only five levels deep, which is 100 points of
+        // `scope_proximity`, so the colliding tier *won* the retention race by 30 and 20_000 of
+        // the 24_000 collisions were retained — leaving the over-report at 4_000 instead of the
+        // whole 24_000. Same three fixture requirements #51 learned: the weak version still failed
+        // the test, which is exactly why it went unnoticed.
+        let mut scorer = rank::Scorer::new("col_target", dir.path(), None);
+        let deep = {
+            let mut p = dir.path().to_path_buf();
+            for i in 0..COLLIDE_DEPTH {
+                p.push(format!("n{i}"));
+            }
+            p.push("d000.rs");
+            collide_usage_match(&p, 1, COLLIDE_DEF_LINE)
+        };
+        let shallow = collide_usage_match(&dir.path().join("u000.rs"), 1, &shallow_usage_line(0));
+        assert!(
+            scorer.selection_score(&shallow) > scorer.selection_score(&deep),
+            "the colliding tier outscores the plain-usage tier ({} vs {}), so its collisions win \
+             the retention race and survive into the retained set — the fixture no longer \
+             exercises a clipped collision",
+            scorer.selection_score(&deep),
+            scorer.selection_score(&shallow)
+        );
+
+        let result = symbol::search("col_target", dir.path(), None, None, false).unwrap();
+
+        assert_eq!(
+            result.definitions, defs,
+            "definitions must be the true count, not what retention kept"
+        );
+        assert_eq!(
+            result.usages, usages,
+            "usages must exclude every collision, not only the ones retention kept"
+        );
+        assert_eq!(
+            result.total_found,
+            defs + usages,
+            "total_found must be the true post-dedup total"
+        );
+
+        // Retention must actually have clipped, or the assertions above hold for the trivial reason
+        // that nothing was dropped. `result.matches` cannot show this — `assemble` truncates it to
+        // the ten-match display cap long before the caller sees it, so asserting `len() <=
+        // MAX_RETAINED` on it is vacuous. What does show it is the remainder: it is non-zero only
+        // when the facets, counted over the retained set, cannot reach `total_found`.
+        let remainder =
+            crate::search::facets::unattributed_remainder(result.total_found, &result.facet_totals);
+        assert!(
+            remainder > 0,
+            "fixture did not clip, so the exact-overlap path is untested"
+        );
+
+        // Header and per-facet totals must agree: the header's `definitions` covers both
+        // definition facets, so it has to equal their sum exactly. A facet total derived from the
+        // retained set would read 20_000 here against a header of 40_000.
+        assert_eq!(
+            result.facet_totals.definitions + result.facet_totals.implementations,
+            result.definitions,
+            "per-facet definition totals disagree with the header, which reads as a truncation \
+             that did not happen"
+        );
+
+        // And every match is still accounted for somewhere.
+        let facet_sum = result.facet_totals.definitions
+            + result.facet_totals.implementations
+            + result.facet_totals.tests
+            + result.facet_totals.usages_local
+            + result.facet_totals.usages_cross;
+        assert_eq!(
+            facet_sum + remainder,
+            result.total_found,
+            "facets ({facet_sum}) + remainder ({remainder}) != total_found ({})",
+            result.total_found
+        );
+
+        // The rendered heading is the surface the issue reported: a `shown/total` pair whose total
+        // came from the retained set read `10/20000` under a header saying 24000, which
+        // `facets::facet_of`'s own comment says must never happen. Asserted on the rendering rather
+        // than only on `FacetTotals`, because the pair is what a reader actually compares.
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let out = format_search_result(&result, &cache, None, &bloom, 0, None).unwrap();
+        assert!(
+            out.contains(&format!("## Definitions (10/{defs})")),
+            "definition facet heading does not carry the true total ({defs}):
+{out}"
+        );
+    }
+
+    /// A deduped collision in a test file must come off the `tests` facet, not just off the header.
+    ///
+    /// `totals.tests` is built from what the walks offered, and the def/usage dedup removes offered
+    /// usages — so a definition line inside a test file was counted by `tests` after `total_found`
+    /// had already subtracted it, and the facets summed past the header. Two lines are enough; no
+    /// clipping is needed, which is why this is a plain arithmetic bug rather than a bound artifact.
+    ///
+    /// Asserted as the partition rather than only as `tests == 1`, because the property the renderer
+    /// depends on is that the facets and the remainder account for `total_found` exactly once —
+    /// `facets::facet_of`'s own comment calls a drift here a truncation that did not happen.
+    #[test]
+    fn a_deduped_collision_in_a_test_file_leaves_the_facets_summing_to_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        // `_test.` in the name, not a `tests/` directory: `is_test_match`'s directory checks use
+        // forward slashes and never fire on Windows paths.
+        std::fs::write(
+            dir.path().join("a_test.rs"),
+            "pub fn tgt() -> u32 { 0 }\nlet x = tgt();\n",
+        )
+        .unwrap();
+
+        let result = symbol::search("tgt", dir.path(), None, None, false).unwrap();
+
+        // Ground truth: two matching lines, line 1 is the definition, line 2 the usage. The usage
+        // walk matches both; the dedup drops its line-1 match.
+        assert_eq!(result.definitions, 1, "one definition");
+        assert_eq!(result.usages, 1, "one usage survives the dedup");
+        assert_eq!(result.total_found, 2, "two matches post-dedup");
+        assert_eq!(
+            result.facet_totals.tests, 1,
+            "the tests facet must not count the usage the dedup removed"
+        );
+
+        let remainder =
+            crate::search::facets::unattributed_remainder(result.total_found, &result.facet_totals);
+        let facet_sum = result.facet_totals.definitions
+            + result.facet_totals.implementations
+            + result.facet_totals.tests
+            + result.facet_totals.usages_local
+            + result.facet_totals.usages_cross;
+        assert_eq!(
+            facet_sum + remainder,
+            result.total_found,
+            "facets ({facet_sum}) + remainder ({remainder}) != total_found ({}) — the header \
+             contradicts its own body",
+            result.total_found
+        );
+        assert_eq!(
+            remainder, 0,
+            "nothing clipped in a two-line fixture, so nothing may be unattributed"
+        );
+    }
+
+    /// The 2x limit: when **every** usage collides with a definition, the true usage count is zero.
+    ///
+    /// The acceptance case #60 names directly, and the extreme of the same defect. Every line here
+    /// is a definition, so every one of the usage walk's matches is removed by the dedup — but
+    /// retention keeps `20_000` of them, so an overlap counted over the retained set subtracts only
+    /// those and reports `4_000` usages that do not exist.
+    ///
+    /// Distinct from the mixed fixture above: there the clipped collisions were the *whole*
+    /// overlap, here they are only part of it, so the two fail to different mistakes — dropping the
+    /// exact count entirely, versus subtracting it in the wrong place.
+    #[test]
+    fn symbol_usage_count_is_zero_when_every_usage_collides_with_a_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let defs_body = format!("{COLLIDE_DEF_LINE}\n").repeat(COLLIDE_LINES_PER_FILE);
+        for f in 0..COLLIDE_FILES_PER_TIER {
+            std::fs::write(dir.path().join(format!("d{f:03}.rs")), &defs_body).unwrap();
+        }
+        let defs = COLLIDE_FILES_PER_TIER * COLLIDE_LINES_PER_FILE;
+        assert!(
+            defs > crate::search::retain::MAX_RETAINED,
+            "fixture must exceed MAX_RETAINED or neither walk clips ({defs})"
+        );
+
+        let result = symbol::search("col_target", dir.path(), None, None, false).unwrap();
+
+        assert_eq!(
+            result.usages, 0,
+            "every usage sits on a definition's line, so none survives the dedup"
+        );
+        assert_eq!(
+            result.definitions, defs,
+            "definitions must be the true count, not what retention kept"
+        );
+        assert_eq!(
+            result.total_found, defs,
+            "total_found must be the definitions alone"
         );
     }
 
