@@ -255,7 +255,19 @@ const SURFACES: &[Surface] = &[
         tool: "tilth_diff",
         edit_mode: false,
         view: None,
-        expect: Bom::Strips,
+        // NOT `Strips`, though a patch clearly carries source lines. The Patch source reads no
+        // working tree — `get_old_content`/`get_new_content` both return an empty string for it
+        // (`diff/overlay.rs`), so `compute_overlay` parses **zero symbols** and the render is
+        // metadata only (`## lib.rs (0 symbols)`); the patch's BOM'd content line never reaches the
+        // output. A `Strips` byte-identical check would therefore be `X == X` — the fake-coverage
+        // class this module exists to kill. And even in principle it could not strip a line-start
+        // BOM: a unified-diff content line is prefixed by a `+`/`-`/space marker, so any BOM in it is
+        // mid-line, which #64's non-goals exclude. Declared `NoFileText`, like `diff:log`.
+        expect: Bom::NoFileText(
+            "the Patch source reads no working tree (empty old/new content in overlay.rs), so the \
+             structural diff renders 0 symbols and no file-derived line; a patch's BOM is mid-line \
+             anyway, excluded by #64",
+        ),
     },
     Surface {
         label: "diff:log",
@@ -448,6 +460,17 @@ const SITES_NOT_CAUGHT: &[(&str, &str)] = &[
     (
         "src/search/symbol.rs / src/search/mod.rs (markdown heading defs)",
         "reached only when a heading def wins ranking over the code def of the same name",
+    ),
+    (
+        "src/search/deps.rs",
+        "the `deps` row renders real symbol text, so it is a `Strips` row, not `NoFileText` like \
+         `diff:patch` — but the current fixture routes no BOM through a line whose extraction the \
+         render reproduces. It targets `consumer.rs`, whose edges derive from `use lib::bom_target` \
+         on the BOM-free line 2 and from callee resolution, not from the BOM'd line 1 (`mod lib;`). \
+         Confirmed by mutation: no-op'ing `trim_start_bom_aware` (the import-detection strip) leaves \
+         the row green. Falsifying it would mean targeting a file whose exported symbol is *defined* \
+         on the BOM'd line — but `analyze_deps` hands unstripped content to `get_outline_entries`, so \
+         that would test tree-sitter's BOM tolerance, not a strip site. Its own follow-up, like grok.",
     ),
 ];
 
