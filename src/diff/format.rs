@@ -484,7 +484,14 @@ fn write_diff_lines(out: &mut String, lines: &[DiffLine], base_line: u32) {
             DiffLineKind::Removed => '-',
             DiffLineKind::Context => ' ',
         };
-        let _ = writeln!(out, "  {prefix}{new_line:>4}| {}", dl.content);
+        // Strip a leading BOM from the rendered content (#64). This is the file-detail /
+        // function-detail body: a display line addressed by a plain `{line}|` number, not a
+        // `{line}:{hash}|` edit anchor, so nothing hashes it and the BOM is a glyph the reader did
+        // not ask for. A definition on line 1 of a BOM'd file otherwise printed `  1| \u{feff}pub fn
+        // …` here — the same leak class as search:content, in the one diff path that reprints raw
+        // source lines. Pinned by `diff:files` (scoped) in `bom_surfaces`.
+        let content = crate::lang::outline::strip_bom(&dl.content);
+        let _ = writeln!(out, "  {prefix}{new_line:>4}| {content}");
         match dl.kind {
             DiffLineKind::Added | DiffLineKind::Context => new_line += 1,
             DiffLineKind::Removed => {} // old-file line — don't advance new counter

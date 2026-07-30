@@ -241,8 +241,11 @@ const SURFACES: &[Surface] = &[
         ),
     },
     // ---- diff: one row per source `resolve_source` can return. Five were unnamed in the first
-    // version. `patch` and `log` render no file-derived text at all; the file pair does, via the
-    // symbol names it parses out of both sides, which is what makes it the falsifiable row.
+    // version. `patch` and `log` render no file-derived content; the file pair does — but only in its
+    // **file-detail** render, which reprints raw source lines. Its *overview* render (symbol names +
+    // counts) cannot carry a BOM, because a name is a tree-sitter identifier node and the file's BOM
+    // leads the line before it. So `diff:files` is scoped (see `args_for`) to reach the detail path,
+    // which is the falsifiable one; a second review caught that the unscoped row was fake coverage.
     Surface {
         label: "diff:files",
         tool: "tilth_diff",
@@ -427,8 +430,10 @@ const SITES_CAUGHT: &[(&str, &str)] = &[
     ),
     ("src/read/outline/mod.rs", "read:auto/outline"),
     (
-        "src/diff/overlay.rs",
-        "diff:files, via the symbol names it parses from both sides",
+        "src/diff/format.rs (write_diff_lines)",
+        "diff:files, scoped to file detail — the raw `  1| …` source lines it reprints. The overview \
+         path renders only tree-sitter identifier names, which never carry the file's leading BOM, so \
+         the row must be scoped to reach a strip site at all",
     ),
     (
         "src/mcp/tools/write.rs (render_text_diff)",
@@ -505,7 +510,26 @@ fn args_for(label: &str, root: &Path) -> Value {
         "grok" => json!({"target": "bom_target", "scope": scope}),
         "deps" => json!({"path": p("consumer.rs"), "scope": scope}),
         "files" => json!({"pattern": "*.rs", "scope": scope}),
-        "diff:files" => json!({"a": p("before.rs"), "b": p("after.rs")}),
+        // `scope` renders the **file detail**, not the overview. Without it the file-pair diff goes
+        // through `format_overview`, which prints only symbol names and counts — and a symbol name is
+        // a tree-sitter identifier node, so the file's leading BOM (which sits before `pub`) is never
+        // part of it. That overview render is byte-identical BOM-vs-plain no matter what any strip
+        // does: fake coverage, the same trap the first review pulled out of `diff:patch`. The scoped
+        // detail path (`format_file_detail` -> `write_diff_lines`) is the one diff path that reprints
+        // raw source lines (`  1| pub fn …`), so it is the only one a leading BOM can actually leak
+        // through — and it did, until the strip added alongside this. `after.rs` matches the overlay
+        // by `ends_with`, so no absolute-path spelling is involved.
+        //
+        // Forward-slash `a`/`b`: `git diff --no-index` mangles a backslash absolute path on Windows —
+        // it fails to strip its own `a/`/`b/` prefixes and emits one garbled 0-symbol overlay, which
+        // both hides the detail and defeats the `after.rs` scope match. Forward slashes parse cleanly
+        // there and are already native on Linux. `render()` knows the forward-slash spelling of the
+        // root so the header still normalises to `<ROOT>`.
+        "diff:files" => json!({
+            "a": p("before.rs").replace('\\', "/"),
+            "b": p("after.rs").replace('\\', "/"),
+            "scope": "after.rs"
+        }),
         "diff:patch" => json!({"patch": p("change.patch")}),
         // `-1` (= `--max-count=1`) is the one bounded, depth-agnostic spelling. It must be bounded:
         // a bare `HEAD` enumerates every ancestor, and `diff_log` shells a `git diff` + tree-sitter
@@ -725,21 +749,20 @@ fn render(surface: &Surface, root: &Path) -> String {
     let out = dispatch_tool(surface.tool, &args, &services)
         .unwrap_or_else(|e| panic!("surface `{}` failed: {e}", surface.label));
     let s = root.to_string_lossy().to_string();
-    // The diff surfaces render a file-pair path in a spelling that is NOT the raw root, and it
-    // differs by platform — so `<ROOT>` substitution has to cover every spelling or the two tempdir
-    // names leak into the file-detail line and `diff:files` fails as a false leak. The plain `&s`
-    // replace handles the header on both platforms (it prints the absolute path via `a.display()`);
-    // the extra spellings catch the `## <path> (N symbols)` line, which comes from `git diff`:
-    //   * Windows: the verbatim `\\?\` prefix, and the path with its separators doubled.
-    //   * Linux: git's `a/`/`b/` convention strips the leading `/`, so `/tmp/.tmpXXX` renders as
-    //     `tmp/.tmpXXX`. Missing this passed locally on Windows but failed on CI (Linux), comparing
-    //     two different tempdirs. The trailing replace catches it; on Windows the stripped form
-    //     equals `&s` (no leading separator), so it is a harmless second pass.
+    let fwd = s.replace('\\', "/");
+    // The diff surfaces render a path in a spelling that is neither the OS-native root nor stable
+    // across platforms, so `<ROOT>` substitution has to cover every spelling or two tempdir names
+    // leak into `diff:files` and it fails as a false leak. Native tools (read, write, search) print
+    // the OS path (`&s` — backslashes on Windows, forward slashes on Linux). `git` prints forward
+    // slashes on both, and on Linux its `a/`/`b/` convention also strips the leading `/`, so
+    // `/tmp/.tmpXXX` comes back as `tmp/.tmpXXX` (that one passed on Windows but failed CI). The
+    // verbatim `\\?\` and doubled-backslash forms are older Windows spellings, kept as no-ops.
     let out = out
         .replace(&format!("\\\\?\\{s}"), "<ROOT>")
         .replace(&s.replace('\\', "\\\\"), "<ROOT>")
         .replace(&s, "<ROOT>")
-        .replace(s.trim_start_matches(['/', '\\']), "<ROOT>");
+        .replace(&fwd, "<ROOT>")
+        .replace(fwd.trim_start_matches('/'), "<ROOT>");
     normalise_header_token_estimate(&out)
 }
 
