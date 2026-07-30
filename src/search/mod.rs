@@ -676,7 +676,7 @@ fn format_single_match(
             if let Ok(content) = fs::read_to_string(&m.path) {
                 let lines: Vec<&str> = content.lines().collect();
                 // def_range is `(heading_line, section_end)` in 1-indexed
-                // inclusive form (see `find_defs_markdown_buf`). The body
+                // inclusive form (see `stream_defs_markdown`). The body
                 // starts at the line *after* the heading. In 0-indexed
                 // half-open form: `[heading_line_1 .. section_end_1)`.
                 let body_start = heading_line_1 as usize;
@@ -1568,7 +1568,7 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
         return None;
     }
     let raw = std::fs::read_to_string(path).ok()?;
-    // BOM-stripped before parsing, to match the read side and `find_defs_markdown_buf` — see
+    // BOM-stripped before parsing, to match the read side and `stream_defs_markdown` — see
     // that function for why the two sides disagreeing mattered (#51).
     let content = crate::lang::outline::strip_bom(&raw);
     let tree = crate::lang::outline::parse_markdown(content)?;
@@ -1900,11 +1900,21 @@ mod tests {
         );
     }
 
-    /// Matches in the retention fixture below, chosen to exceed `content::MAX_RETAINED` (500)
-    /// by a wide margin — the bound is invisible below it.
+    /// Matches in the retention fixture below, sized against two separate bounds.
+    ///
+    /// `RETENTION_SHALLOW_FILES * RETENTION_MATCHES_PER_FILE` must exceed
+    /// `retain::MAX_RETAINED` on its own — see `write_retention_fixture` for why the *shallow
+    /// tier alone* is the number that matters. These constants said 10 × 60 for a while, sized
+    /// against a `MAX_RETAINED` of 500; the bound was later raised to 20 000 and the fixture was
+    /// not, so `content_counts_stay_exact_totals_past_the_retention_bound` stopped reaching the
+    /// bound its name is about and its guard still read `> 500`. Both now reference the constant.
+    ///
+    /// `RETENTION_MATCHES_PER_FILE` must also exceed `retain::OFFER_CHUNK`, so a single file
+    /// flushes mid-search and the streaming offer path (#59) is exercised rather than merely
+    /// compiled. Both are asserted in the tests, not just stated here.
     const RETENTION_SHALLOW_FILES: usize = 10;
     const RETENTION_DEEP_FILES: usize = 40;
-    const RETENTION_MATCHES_PER_FILE: usize = 60;
+    const RETENTION_MATCHES_PER_FILE: usize = 2_100;
 
     /// Write files containing `needle` on every line, in two tiers that **score differently**.
     ///
@@ -1938,8 +1948,14 @@ mod tests {
     }
 
     /// Files needed to push symbol retention past `retain::MAX_RETAINED` (20_000).
-    const SYM_RETENTION_FILES: usize = 40;
-    const SYM_RETENTION_USAGES_PER_FILE: usize = 600;
+    ///
+    /// Per file rather than in total is deliberate: `SYM_RETENTION_USAGES_PER_FILE` also exceeds
+    /// `retain::OFFER_CHUNK`, so each file flushes mid-search and the tail is a partial chunk.
+    /// At 40 × 600 the total cleared `MAX_RETAINED` but no file ever filled a chunk, so deleting
+    /// `FileOffer::finish`'s flush would have failed nothing here. Both bounds are asserted in
+    /// the test.
+    const SYM_RETENTION_FILES: usize = 20;
+    const SYM_RETENTION_USAGES_PER_FILE: usize = 1_100;
 
     /// One definition plus many usages per file, enough usages in total to clip.
     ///
@@ -1979,6 +1995,15 @@ mod tests {
         assert!(
             usages > crate::search::retain::MAX_RETAINED,
             "fixture must exceed MAX_RETAINED or the bound is untested ({usages})"
+        );
+        assert!(
+            SYM_RETENTION_USAGES_PER_FILE > crate::search::retain::OFFER_CHUNK,
+            "no single file fills a chunk, so the streaming offer path is untested"
+        );
+        assert_ne!(
+            SYM_RETENTION_USAGES_PER_FILE % crate::search::retain::OFFER_CHUNK,
+            0,
+            "usages per file divide evenly into chunks, so the partial-tail flush is untested"
         );
 
         let cache = OutlineCache::new();
@@ -2056,8 +2081,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let expected = write_retention_fixture(dir.path());
         assert!(
-            expected > 500,
+            expected > crate::search::retain::MAX_RETAINED,
             "fixture must exceed MAX_RETAINED or the bound is untested ({expected})"
+        );
+        assert!(
+            RETENTION_SHALLOW_FILES * RETENTION_MATCHES_PER_FILE
+                > crate::search::retain::MAX_RETAINED,
+            "the shallow tier alone must exceed MAX_RETAINED, or the selection assertion below \
+             passes for the trivial reason that nothing was dropped"
+        );
+        assert!(
+            RETENTION_MATCHES_PER_FILE > crate::search::retain::OFFER_CHUNK,
+            "no single file fills a chunk, so the streaming offer path is untested"
+        );
+        assert_ne!(
+            RETENTION_MATCHES_PER_FILE % crate::search::retain::OFFER_CHUNK,
+            0,
+            "matches per file divide evenly into chunks, so the partial-tail flush is untested"
         );
 
         let result = search_content_raw("needle", dir.path(), None).unwrap();
@@ -2915,7 +2955,7 @@ mod tests {
         )
         .unwrap();
 
-        // Mimic the `Match` `find_defs_markdown_buf` would produce for a
+        // Mimic the `Match` `stream_defs_markdown` would produce for a
         // markdown-heading def: weight 30, def_range covers the section span.
         let m = Match {
             path: p.clone(),
@@ -3344,7 +3384,7 @@ mod tests {
     /// Search and the read side must agree about a doubled-BOM markdown file's first heading.
     ///
     /// The last piece of the split #42 opened. `read::outline::generate`, `resolve_heading`
-    /// and `suggest_headings` all strip a BOM before parsing; `find_defs_markdown_buf` and
+    /// and `suggest_headings` all strip a BOM before parsing; `stream_defs_markdown` and
     /// `markdown_enclosing_scope` did not. tree-sitter-md skips one BOM by itself, so a single
     /// BOM never diverged — but behind **two** it parses the first heading as a paragraph, and
     /// after #42 the outline advertised that heading and the section resolver accepted it while
@@ -3357,7 +3397,7 @@ mod tests {
     /// (`[definition]`) rather than calling the read side and comparing. A read-side regression
     /// would leave it green — the read side is pinned separately by
     /// `read::tests::the_outline_and_the_heading_resolver_agree_on_a_bom_file`. It also covers
-    /// only `find_defs_markdown_buf`; the other half of that fix,
+    /// only `stream_defs_markdown`; the other half of that fix,
     /// `markdown_enclosing_scope`, is pinned by
     /// `a_doubled_bom_does_not_lose_the_markdown_scope_label`.
     #[test]
@@ -3394,7 +3434,7 @@ mod tests {
     ///
     /// `markdown_enclosing_scope` is the other half of the markdown fix, and
     /// `search_and_the_read_side_agree_on_a_doubled_bom_markdown_heading` does not reach it —
-    /// that one pins `find_defs_markdown_buf` only, so reverting this strip left the suite
+    /// that one pins `stream_defs_markdown` only, so reverting this strip left the suite
     /// green while I claimed both were covered.
     ///
     /// The query has to match a *usage* inside a section rather than the heading itself, since
@@ -3444,7 +3484,7 @@ mod tests {
     ///     *and* four ranking terms mis-scored the line (see `types::match_text`);
     ///   * `expand_match` rendered the fenced block from its own unstripped read, and
     ///     prefix-tested those same lines for the leading-import skip;
-    ///   * `find_defs_markdown_buf` parsed markdown unstripped, disagreeing with the read side.
+    ///   * `stream_defs_markdown` parsed markdown unstripped, disagreeing with the read side.
     ///
     /// Asserting byte equality against the BOM-free spelling covers all of them at once. The
     /// paths differ between the two trees, so the fixture uses the same filename in two

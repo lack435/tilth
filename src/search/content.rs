@@ -1,9 +1,7 @@
-use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use super::file_metadata;
+use super::retain::{BoundedRetain, FileOffer, MAX_RETAINED};
 
 use crate::error::TilthError;
 use crate::search::rank;
@@ -15,34 +13,6 @@ use grep_searcher::Searcher;
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
 const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
-
-/// Candidates kept for ranking. Everything past this is counted and dropped.
-///
-/// Selection ignores recency (see `rank::Scorer`), so the retained set has to be deep enough
-/// that recency can still promote a match onto the page from *within* it. Recency is worth up
-/// to 100 points, so a match is at risk of being wrongly dropped only when its selection score
-/// is within 100 of the score at the retention cut.
-///
-/// This was 500, and 500 was far too small — set from an assumption that recency was small
-/// against "scores in the thousands". It is not. A content match scores about **230** in total:
-/// `is_definition` and `exact` are both false for every content match, which removes two
-/// 500-point terms and leaves `scope_proximity` (180 at depth 1) plus the 50-point short-file
-/// bonus. So recency is ~43% of the whole score, and 100 points is **five directory levels** of
-/// `scope_proximity`.
-///
-/// The consequence was measured, not theorised: 600 matches at the scope root aged 60 days,
-/// plus 300 in a freshly-edited directory five levels down, and the fresh directory vanished
-/// from the page entirely — 10 of 10 entries before the bound, 0 after, while the header still
-/// reported all 900. "Edit a subdirectory, then search for a common token" is an ordinary
-/// thing to do.
-///
-/// 20k candidates is ~5.6 MB at ~280 bytes each, against the 405-449 MB this bound exists to
-/// remove, so the memory argument tolerates a bound two orders of magnitude above the display
-/// cap. What remains is precise: the page can differ from an unbounded search only when more
-/// than `MAX_RETAINED` matches sit within 100 points above the dropped one. That is a real
-/// residual, not a proof of correctness — it is just now narrow enough to need a pathological
-/// tree rather than an ordinary one.
-const MAX_RETAINED: usize = 20_000;
 
 // This walk used to stop once a shared `AtomicUsize` crossed `EARLY_QUIT_THRESHOLD`
 // (30, or 300 under `--full`), which made content search **non-deterministic** for the
@@ -76,18 +46,22 @@ const MAX_RETAINED: usize = 20_000;
 // reached 420-462 MB resident.
 //
 // Retention is now bounded at `MAX_RETAINED` candidates, selected by rank rather than by
-// arrival, while the *counts* stay exact via two atomics. So the reported totals are still
-// true totals, which is the half of this that a naive cap gets wrong.
+// arrival, while the *counts* stay exact. So the reported totals are still true totals, which
+// is the half of this that a naive cap gets wrong.
 //
-// The three things that make a bound safe here are worth naming together, because each was a
-// bug on some other path in this codebase first:
+// That bound, its heap, its inverted `Ord` and its exact counters all live in `search::retain`
+// now, shared with the symbol path (#62). This file carried a second copy for a while, with its
+// own `Candidate` whose key was three levels where `retain`'s is five — harmless on this input,
+// where every match has `is_definition: false` and a unique `(path, line)`, but an invariant
+// stated in two places and enforced in one. It has already been the source of one bug on the
+// other copy (the inverted `Ord` shipped backwards, keeping the worst ties), and a fix to either
+// had to be applied to both. `retain::Candidate` is now the only implementation; the three
+// properties that make a bound safe here are argued there, at the type that enforces them.
 //
-//   * The counters only ever report. Nothing reads them to decide whether to keep walking —
-//     a count that gates a parallel walk cannot be deterministic.
-//   * Selection uses `rank::Scorer`, which omits the recency term, so the wall clock cannot
-//     decide which matches exist. A clock deciding content is the `overview::hot_files` bug.
-//   * The selection key is a total order (score, then path, then line), so a truncation can
-//     never be resolved by thread arrival order. That is the `tilth_files` bug.
+// What this file still owns is the *facet* mapping, and it is exact rather than approximate:
+// every content match has `is_definition: false`, so `facets::primary_package` finds no primary
+// definition, `is_same_package` short-circuits to false, and every non-test match lands in
+// `usages_cross`. Two of the five buckets are reachable, and `retain`'s tallies count both.
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -109,18 +83,13 @@ pub fn search(
         reason: e.to_string(),
     })?;
 
-    // Max-heap ordered so its top is the *worst* retained candidate — see `Candidate`.
-    let matches: Mutex<BinaryHeap<Candidate>> = Mutex::new(BinaryHeap::new());
-    let total_found = AtomicUsize::new(0);
-    let test_matches = AtomicUsize::new(0);
+    let sink = BoundedRetain::new(MAX_RETAINED);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matcher = &matcher;
-        let matches = &matches;
-        let total_found = &total_found;
-        let test_matches = &test_matches;
+        let sink = &sink;
         // One scorer per worker thread. It memoises package-root lookups, and omitting the
         // recency term makes it independent of when it runs — so two threads scoring the
         // same match always agree, and so do two runs.
@@ -174,129 +143,78 @@ pub fn search(
 
             let (file_lines, mtime) = file_metadata(path);
 
-            let mut file_matches = Vec::new();
+            // Matches go straight into the sink as they are found, `OFFER_CHUNK` at a time,
+            // rather than accumulating this file's whole `Vec<Match>` first. That per-file
+            // term was #59: it is multiplied by the walk's thread count and is independent
+            // of `MAX_RETAINED`, so it reached 422 MB on a dense fixture while retention was
+            // doing exactly what it promised. Where the chunk boundaries fall cannot change
+            // which matches survive — see `FileOffer`.
+            let mut offer = FileOffer::new(sink);
             let mut searcher = Searcher::new();
 
             let _ = searcher.search_slice(
                 matcher,
                 &bytes,
                 UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: crate::types::match_text(line),
-                        is_definition: false,
-                        exact: false,
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
+                    offer.push(
+                        Match {
+                            path: path.to_path_buf(),
+                            line: line_num as u32,
+                            text: crate::types::match_text(line),
+                            is_definition: false,
+                            exact: false,
+                            file_lines,
+                            mtime,
+                            def_range: None,
+                            def_name: None,
+                            def_weight: 0,
+                            impl_target: None,
+                        },
+                        &mut scorer,
+                    );
                     Ok(true)
                 }),
             );
-
-            if !file_matches.is_empty() {
-                // Counts first, and they are exact regardless of what is retained below.
-                // Every content match is a usage, so the only facet split that can occur is
-                // test-vs-other, decidable per match from its path and text. See the note
-                // on `facet_totals` after the walk for why nothing else is reachable.
-                let tests_here = file_matches
-                    .iter()
-                    .filter(|m| super::facets::is_test_match_for_totals(m))
-                    .count();
-                total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
-                test_matches.fetch_add(tests_here, Ordering::Relaxed);
-
-                // Reduce this file to its own best `MAX_RETAINED` first, with **no lock held**.
-                // `Scorer` omits the recency term, so what survives cannot depend on when it
-                // ran. A rejected candidate is dropped here, off the lock.
-                //
-                // Two earlier shapes were worse and are worth naming. Collecting everything
-                // and reducing after the walk left peak memory unmoved — the peak is reached
-                // before ranking starts, so a bound applied afterwards bounds nothing.
-                // Reducing straight into the shared heap fixed that but held the mutex across
-                // every comparison for the file, each a `PathBuf` compare, and let the reject
-                // buffer grow to the file's whole match count under that lock. A file with
-                // 250k matches then serialised the entire parallel walk behind it.
-                let mut local: BinaryHeap<Candidate> = BinaryHeap::with_capacity(64);
-                for m in file_matches {
-                    let cand = Candidate {
-                        score: scorer.selection_score(&m),
-                        m,
-                    };
-                    if local.len() < MAX_RETAINED {
-                        local.push(cand);
-                    } else if local.peek().is_some_and(|worst| cand < *worst) {
-                        // Peek first so a doomed candidate is never sifted in and back out.
-                        local.pop();
-                        local.push(cand);
-                    }
-                }
-
-                // Merge under one acquisition, now bounded by `MAX_RETAINED` rather than by
-                // the file's match count.
-                let mut evicted: Vec<Candidate> = Vec::new();
-                {
-                    let mut heap = matches
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for cand in local.into_vec() {
-                        if heap.len() < MAX_RETAINED {
-                            heap.push(cand);
-                        } else if heap.peek().is_some_and(|worst| cand < *worst) {
-                            if let Some(out) = heap.pop() {
-                                evicted.push(out);
-                            }
-                            heap.push(cand);
-                        } else {
-                            evicted.push(cand);
-                        }
-                    }
-                }
-                // Freed after the guard drops. `Match` owns a `PathBuf` and a `String`, so
-                // dropping under the lock would serialise two deallocations per rejected
-                // match through one mutex — the mistake found in `glob::search`'s review.
-                drop(evicted);
-            }
+            offer.finish(&mut scorer);
 
             ignore::WalkState::Continue
         })
     });
 
-    let heap = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // True totals, read once after `walker.run` has joined every thread. The sink is the only
+    // thing that sees every match, so it is where they are kept; they only ever *report* —
+    // nothing above reads them to decide whether to keep walking, which is the distinction
+    // that made the old match-count cutoffs non-deterministic.
+    let (mut all_matches, tallies) = sink.finish();
+    let total = tallies.total();
+    let tests = tallies.tests;
+    // The invariant this file used to argue in prose, now asserted where it is relied on: a
+    // content match is never a definition, so only the test/usage split is reachable and the
+    // facet mapping below is exact rather than approximate.
+    debug_assert_eq!(
+        (tallies.definitions, tallies.implementations),
+        (0, 0),
+        "content search produced a definition match; the facet mapping below assumes it cannot"
+    );
 
-    // True totals, read once after `walker.run` has joined every thread. These are counters
-    // that only ever *report* — nothing above reads them to decide whether to keep walking,
-    // which is the distinction that made the old match-count cutoffs non-deterministic.
-    let total = total_found.load(Ordering::Relaxed);
-    let tests = test_matches.load(Ordering::Relaxed);
-
-    // Best-first by the selection key. `rank::sort` then re-orders with recency included;
-    // this ordering exists so the input to it is a function of the tree, not of arrival.
-    let mut all_matches: Vec<Match> = heap.into_sorted_vec().into_iter().map(|c| c.m).collect();
-
+    // `into_matches` returns the retained set in no particular order. That costs nothing:
+    // `rank::sort`'s key is a total order over these matches, so the page is a function of the
+    // tree rather than of the order the walk's threads arrived in.
     rank::sort(&mut all_matches, pattern, scope, context);
 
     // Per-facet totals. Content search used to return `FacetTotals::default()`, i.e. all
     // zeros, which made `count_label` print a bare `10` and suppressed every hidden-count
     // tail — a query with 34290 matches rendered exactly like one with 10.
     //
-    // These are computed from the counters rather than from the retained set, and they are
-    // still *exact*, because content search can only ever populate two of the five buckets.
-    // Every match has `is_definition: false`, so `facets::primary_package` finds no primary
-    // definition, `is_same_package` short-circuits to false, and every non-test match lands
-    // in `usages_cross`. There is nothing for a bound to make approximate here.
+    // These come from the sink's exact tallies rather than from the retained set, and they are
+    // exact rather than approximate for the reason asserted above: only two of the five
+    // buckets are reachable, and the sink counts both.
     let facet_totals = FacetTotals {
         definitions: 0,
         implementations: 0,
         tests,
         usages_local: 0,
-        usages_cross: total - tests,
+        usages_cross: tallies.usages,
     };
 
     all_matches.truncate(max_matches);
@@ -311,48 +229,3 @@ pub fn search(
         facet_totals,
     })
 }
-
-/// A match plus its time-independent selection score, ordered so that **greater means
-/// worse**.
-///
-/// That inversion is what lets a `BinaryHeap` — a max-heap — hold the *best* `MAX_RETAINED`
-/// candidates: its top is the worst kept, so it is the one to evict. The key is
-/// `(score desc, path asc, line asc)` — the first three levels of `rank::sort`'s key, which has
-/// since grown two more (`def_range`, `text`) for the symbol path. Three is enough *here*, and only
-/// here: every content match has `is_definition: false` and a unique `(path, line)`, so those three
-/// are already a total order on this input and a truncation can never be resolved by the order the
-/// walk's threads happened to arrive in.
-///
-/// This duplicates `search::retain`, which exists so that logic lives in one place. It was not
-/// migrated with the symbol path because this version is measured and reviewed as it stands and the
-/// migration is not free — `retain`'s sink also tallies facets this path counts its own way. Worth
-/// doing, but as its own change; until then, a fix to either one has to be applied to both.
-struct Candidate {
-    score: i32,
-    m: Match,
-}
-
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Lower score is worse, hence greater. Then larger path, then larger line.
-        other
-            .score
-            .cmp(&self.score)
-            .then_with(|| self.m.path.cmp(&other.m.path))
-            .then_with(|| self.m.line.cmp(&other.m.line))
-    }
-}
-
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Candidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
-    }
-}
-
-impl Eq for Candidate {}

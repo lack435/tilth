@@ -350,7 +350,7 @@ fn section_end_line(section: tree_sitter::Node) -> usize {
 /// Walks `atx_heading` nodes from `tree-sitter-md`, which by construction
 /// covers `CommonMark` §4.6 (1–6 `#`s followed by space/EOL) and excludes
 /// headings inside fenced or indented code blocks. `Setext` headings
-/// (`Title\n===`) are silently ignored — see `find_defs_markdown_buf` for
+/// (`Title\n===`) are silently ignored — see `stream_defs_markdown` for
 /// the same trade-off; the block grammar puts them at document scope so
 /// span computation doesn't apply.
 ///

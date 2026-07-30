@@ -62,10 +62,9 @@ const FULL_MAX_MATCHES: usize = 100;
 // argument is load-bearing enough to write down. `rank::sort` is stable, and its key used
 // to be (`score`, then `path`, then `line`) — which is *not* a total order, because two
 // matches sharing a path and line compare equal. That happens for real: two overload
-// declarations on one line whose `def_range`s differ, which
-// `dedupe_same_span_definitions` deliberately keeps both of. A stable sort leaves equal
-// elements in input order, and input order here was the order the parallel walk appended
-// them, so determinism additionally required:
+// declarations on one line whose `def_range`s differ, which `SameSpanDedupe` deliberately
+// keeps both of. A stable sort leaves equal elements in input order, and input order here
+// was the order the parallel walk appended them, so determinism additionally required:
 //
 //   **each file's matches are appended as one contiguous block, in a deterministic
 //   within-file order, under a single lock acquisition.**
@@ -540,11 +539,12 @@ fn find_definitions(
 
             let ts_language = lang.and_then(outline_language);
 
-            let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                find_defs_treesitter(path, query, ts_lang, lang, &content, file_lines, mtime)
-            } else {
-                Vec::new()
-            };
+            // Definitions are streamed into the sink `OFFER_CHUNK` at a time rather than
+            // collected per file. A file of generated declarations can hold tens of thousands,
+            // and both walks run concurrently under `rayon::join`, so the per-file term #59
+            // filed is paid twice over. Where the chunk boundaries fall cannot change what is
+            // retained — see `retain::FileOffer`.
+            let mut offer = super::retain::FileOffer::new(matches);
 
             // Per-file-type fallback dispatch. The semantics of "definition"
             // differ by file kind, so handle them separately:
@@ -565,19 +565,39 @@ fn find_definitions(
             //   (A future patch could treat top-level config keys matching
             //   the query as soft definitions, but that's ambiguous enough
             //   to skip for now.)
-            if file_defs.is_empty() && ts_language.is_none() {
-                file_defs = match file_type {
+            //
+            // The arms are exclusive: the fallback used to be guarded by
+            // `file_defs.is_empty() && ts_language.is_none()`, and the first half of that was
+            // implied by the second — with no grammar the tree-sitter arm produced nothing at
+            // all. A grammar that parses to nothing still suppresses the fallback, as before.
+            if let Some(ref ts_lang) = ts_language {
+                stream_defs_treesitter(
+                    path,
+                    query,
+                    ts_lang,
+                    lang,
+                    &content,
+                    file_lines,
+                    mtime,
+                    &mut |m| offer.push(m, &mut scorer),
+                );
+            } else {
+                match file_type {
                     FileType::Code(_) => {
-                        find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
+                        stream_defs_heuristic(path, query, &content, file_lines, mtime, &mut |m| {
+                            offer.push(m, &mut scorer);
+                        });
                     }
                     FileType::Markdown => {
-                        find_defs_markdown_buf(path, query, &content, file_lines, mtime)
+                        stream_defs_markdown(path, query, &content, file_lines, mtime, &mut |m| {
+                            offer.push(m, &mut scorer);
+                        });
                     }
-                    _ => Vec::new(),
-                };
+                    _ => {}
+                }
             }
 
-            matches.offer_file(file_defs, &mut scorer);
+            offer.finish(&mut scorer);
 
             ignore::WalkState::Continue
         })
@@ -590,13 +610,17 @@ fn find_definitions(
 ///
 /// Returns one bucket per query, positionally. Each bucket holds exactly the matches the
 /// single-query walk would have produced for that query, because every per-query step is
-/// the same code applied per query: the `memmem` needle check, `defs_from_tree`, and the
+/// the same code applied per query: the `memmem` needle check, `stream_defs_from_tree`, and the
 /// fallbacks. What is shared is the per-*file* work — the read, the size and minified
 /// gates, the metadata, and the tree-sitter parse — which is where the cost is.
 ///
-/// The determinism invariant at the top of this file still holds per bucket: one lock
-/// acquisition per file appends every query's block for that file, so each bucket receives
-/// contiguous per-file blocks and threads can still only interleave whole files.
+/// The determinism invariant at the top of this file still holds per bucket, but no longer for the
+/// reason this comment used to give. It said one lock acquisition per file appended every query's
+/// block, so each bucket received contiguous per-file blocks — that stopped being true when #57 gave
+/// each bucket its own lock, and there is now no contiguity at all, since a bucket receives a dense
+/// file in `OFFER_CHUNK`-sized pieces. Determinism rests entirely on `rank::sort`'s key being a
+/// total order and retention admitting on a candidate's own key; see the note at the top of this
+/// file and `retain::FileOffer`.
 fn find_definitions_multi(
     queries: &[&str],
     scope: &Path,
@@ -693,40 +717,54 @@ fn find_definitions_multi(
                 Vec::new()
             };
 
-            let mut per_query: Vec<(usize, Vec<Match>)> = Vec::new();
+            // One target at a time, each streaming into its own bucket. Per-bucket bound;
+            // contiguity is no longer load-bearing — `rank::sort`'s key is a total order — so
+            // each target's sink can decide independently. Streaming also stops every target's
+            // definitions for this file existing at once, which multiplied the per-file peak #59
+            // filed by the target count.
             for &i in &present {
-                let mut file_defs = match &tree {
-                    Some(tree) => {
-                        defs_from_tree(path, queries[i], tree, lang, &lines, file_lines, mtime)
-                    }
-                    None => Vec::new(),
+                let Some(bucket) = matches.bucket(i) else {
+                    continue;
                 };
-
+                let mut offer = super::retain::FileOffer::new(bucket);
                 // Same per-file-type fallback dispatch as the single-query walk; see the
-                // long comment there for why each file kind is handled the way it is.
-                if file_defs.is_empty() && ts_language.is_none() {
-                    file_defs = match file_type {
-                        FileType::Code(_) => {
-                            find_defs_heuristic_buf(path, queries[i], &content, file_lines, mtime)
-                        }
-                        FileType::Markdown => {
-                            find_defs_markdown_buf(path, queries[i], &content, file_lines, mtime)
-                        }
-                        _ => Vec::new(),
-                    };
+                // long comment there for why each file kind is handled the way it is, and for
+                // why the arms are exclusive.
+                match &tree {
+                    Some(tree) => stream_defs_from_tree(
+                        path,
+                        queries[i],
+                        tree,
+                        lang,
+                        &lines,
+                        file_lines,
+                        mtime,
+                        &mut |m| offer.push(m, &mut scorers[i]),
+                    ),
+                    None if ts_language.is_none() => match file_type {
+                        FileType::Code(_) => stream_defs_heuristic(
+                            path,
+                            queries[i],
+                            &content,
+                            file_lines,
+                            mtime,
+                            &mut |m| offer.push(m, &mut scorers[i]),
+                        ),
+                        FileType::Markdown => stream_defs_markdown(
+                            path,
+                            queries[i],
+                            &content,
+                            file_lines,
+                            mtime,
+                            &mut |m| offer.push(m, &mut scorers[i]),
+                        ),
+                        _ => {}
+                    },
+                    // A grammar that failed to parse: no definitions, and no fallback, exactly
+                    // as before.
+                    None => {}
                 }
-
-                if !file_defs.is_empty() {
-                    per_query.push((i, file_defs));
-                }
-            }
-
-            if !per_query.is_empty() {
-                // Per-bucket bound. Contiguity is no longer load-bearing — `rank::sort`'s key
-                // is a total order — so each target's sink can decide independently.
-                for (i, file_defs) in per_query {
-                    matches.offer_file(i, file_defs, &mut scorers[i]);
-                }
+                offer.finish(&mut scorers[i]);
             }
 
             ignore::WalkState::Continue
@@ -813,11 +851,16 @@ fn find_usages_multi(
             // single-query walk tests.
             let (file_lines, mtime) = file_metadata(path);
 
-            let mut file_matches: Vec<Vec<Match>> = vec![Vec::new(); queries.len()];
-
+            // One target at a time, each streaming into its own bucket. The earlier shape built
+            // `Vec<Vec<Match>>` — every target's matches for this file alive at once, so the
+            // per-file peak-RSS term #59 filed was multiplied by the target count on top of the
+            // thread count. Streaming makes it `OFFER_CHUNK` per thread regardless.
             for i in 0..queries.len() {
                 let query = queries[i];
-                let bucket = &mut file_matches[i];
+                let Some(bucket) = matches.bucket(i) else {
+                    continue;
+                };
+                let mut offer = super::retain::FileOffer::new(bucket);
                 // A fresh `Searcher` per query, so this loop body is structurally the same
                 // search `find_usages` performs — one searcher, one `search_slice`, one
                 // file. That is the whole justification, and it is worth being exact about
@@ -839,29 +882,29 @@ fn find_usages_multi(
                     &matchers[i],
                     &bytes,
                     UTF8(|line_num, line| {
-                        bucket.push(Match {
-                            path: path.to_path_buf(),
-                            line: line_num as u32,
-                            text: crate::types::match_text(line),
-                            is_definition: false,
-                            exact: line.contains(query),
-                            file_lines,
-                            mtime,
-                            def_range: None,
-                            def_name: None,
-                            def_weight: 0,
-                            impl_target: None,
-                        });
+                        offer.push(
+                            Match {
+                                path: path.to_path_buf(),
+                                line: line_num as u32,
+                                text: crate::types::match_text(line),
+                                is_definition: false,
+                                exact: line.contains(query),
+                                file_lines,
+                                mtime,
+                                def_range: None,
+                                def_name: None,
+                                def_weight: 0,
+                                impl_target: None,
+                            },
+                            &mut scorers[i],
+                        );
                         Ok(true)
                     }),
                 );
-            }
-
-            // Per-bucket bound, each with its own lock. Contiguity is no longer load-bearing —
-            // `rank::sort`'s key is a total order — so a dense file no longer holds every target's
-            // lock while it merges.
-            for (i, v) in file_matches.into_iter().enumerate() {
-                matches.offer_file(i, v, &mut scorers[i]);
+                // Per-bucket bound, each with its own lock. Contiguity is no longer load-bearing —
+                // `rank::sort`'s key is a total order — so a dense file no longer holds every
+                // target's lock while it merges.
+                offer.finish(&mut scorers[i]);
             }
 
             ignore::WalkState::Continue
@@ -871,9 +914,18 @@ fn find_usages_multi(
     Ok(matches.finish())
 }
 
-/// Tree-sitter structural definition detection.
+/// Tree-sitter structural definition detection, emitting each definition as it is found.
 /// Accepts pre-read content — no redundant file read.
-fn find_defs_treesitter(
+///
+/// Emitting rather than returning a `Vec` is what keeps a file's definitions from all existing at
+/// once — the per-file peak-RSS term #59 filed. The unit tests want a `Vec`, and collect one from
+/// this via the test module's `collect_defs_treesitter`, so they exercise the streaming path rather
+/// than a parallel implementation of it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one file's identity plus the query; a struct would move the same values"
+)]
+fn stream_defs_treesitter(
     path: &Path,
     query: &str,
     ts_lang: &tree_sitter::Language,
@@ -881,12 +933,13 @@ fn find_defs_treesitter(
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
+    out: &mut dyn FnMut(Match),
+) {
     let Some(tree) = parse_tree(ts_lang, content, lang) else {
-        return Vec::new();
+        return;
     };
     let lines: Vec<&str> = content.lines().collect();
-    defs_from_tree(path, query, &tree, lang, &lines, file_lines, mtime)
+    stream_defs_from_tree(path, query, &tree, lang, &lines, file_lines, mtime, out);
 }
 
 /// Parse `content`, or `None` if the grammar or the parse fails.
@@ -906,7 +959,11 @@ fn parse_tree(
 /// The per-query half of definition detection, unchanged from what it always did. Both the
 /// single-query and batched paths call this, so a batched query's definitions are the same
 /// matches in the same within-file order.
-fn defs_from_tree(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one file's identity plus the query; a struct would move the same values"
+)]
+fn stream_defs_from_tree(
     path: &Path,
     query: &str,
     tree: &tree_sitter::Tree,
@@ -914,8 +971,9 @@ fn defs_from_tree(
     lines: &[&str],
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
-    let mut defs = Vec::new();
+    out: &mut dyn FnMut(Match),
+) {
+    let mut dedupe = SameSpanDedupe::new(out);
     walk_for_definitions(
         tree.root_node(),
         query,
@@ -923,15 +981,14 @@ fn defs_from_tree(
         lines,
         file_lines,
         mtime,
-        &mut defs,
+        &mut |m| dedupe.push(m),
         lang,
         0,
     );
-    dedupe_same_span_definitions(&mut defs);
-    defs
+    dedupe.finish();
 }
 
-/// Collapse definition matches that describe the same definition at the same span,
+/// Collapses definition matches that describe the same definition at the same span,
 /// keeping the most specific one.
 ///
 /// Two nodes can name one definition: in C++ a nested class is reachable both as the
@@ -946,24 +1003,45 @@ fn defs_from_tree(
 /// the lowest definition tier (30) precisely because it is not the interesting node.
 /// Keeping it would demote every exported definition below an unrelated local `let`
 /// (weight 40) in `rank::sort`, which multiplies `def_weight` by 10.
-fn dedupe_same_span_definitions(defs: &mut Vec<Match>) {
-    if defs.len() < 2 {
-        return;
+///
+/// This is a one-slot streaming filter rather than a pass over a finished `Vec`, so the
+/// definition walks never hold a file's whole definition set (#59). One slot is exactly
+/// enough: pre-order emission puts an enclosing node adjacent to the node it wraps, which is
+/// why the `Vec` version only ever compared against the last kept element. Holding one match
+/// back also means a flush downstream can never emit a match that a later sibling could still
+/// have merged into.
+struct SameSpanDedupe<'a> {
+    /// The last kept match, still eligible to absorb the next one.
+    pending: Option<Match>,
+    out: &'a mut dyn FnMut(Match),
+}
+
+impl<'a> SameSpanDedupe<'a> {
+    fn new(out: &'a mut dyn FnMut(Match)) -> Self {
+        Self { pending: None, out }
     }
-    // Pre-order emission puts an enclosing node adjacent to the node it wraps, so a
-    // single pass over adjacent runs is sufficient.
-    let mut out: Vec<Match> = Vec::with_capacity(defs.len());
-    for m in defs.drain(..) {
-        match out.last_mut() {
+
+    fn push(&mut self, m: Match) {
+        match &mut self.pending {
             Some(prev) if prev.def_range == m.def_range && prev.def_name == m.def_name => {
                 if m.def_weight > prev.def_weight {
                     *prev = m;
                 }
             }
-            _ => out.push(m),
+            _ => {
+                if let Some(prev) = self.pending.replace(m) {
+                    (self.out)(prev);
+                }
+            }
         }
     }
-    *defs = out;
+
+    /// Emits the held-back match. Consumes `self` so it cannot be forgotten.
+    fn finish(mut self) {
+        if let Some(prev) = self.pending.take() {
+            (self.out)(prev);
+        }
+    }
 }
 
 /// Recursively walk AST nodes looking for definitions of the queried symbol.
@@ -974,7 +1052,7 @@ fn walk_for_definitions(
     lines: &[&str],
     file_lines: u32,
     mtime: SystemTime,
-    defs: &mut Vec<Match>,
+    emit: &mut dyn FnMut(Match),
     lang: Option<crate::types::Lang>,
     depth: usize,
 ) {
@@ -993,7 +1071,7 @@ fn walk_for_definitions(
                     .get(node.start_position().row)
                     .unwrap_or(&"")
                     .trim_end();
-                defs.push(Match {
+                emit(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: crate::types::match_text(line_text),
@@ -1024,7 +1102,7 @@ fn walk_for_definitions(
                         .get(node.start_position().row)
                         .unwrap_or(&"")
                         .trim_end();
-                    defs.push(Match {
+                    emit(Match {
                         path: path.to_path_buf(),
                         line: line_num,
                         text: crate::types::match_text(line_text),
@@ -1052,7 +1130,7 @@ fn walk_for_definitions(
                     .get(node.start_position().row)
                     .unwrap_or(&"")
                     .trim_end();
-                defs.push(Match {
+                emit(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: crate::types::match_text(line_text),
@@ -1079,7 +1157,7 @@ fn walk_for_definitions(
                     .get(node.start_position().row)
                     .unwrap_or(&"")
                     .trim_end();
-                defs.push(Match {
+                emit(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: crate::types::match_text(line_text),
@@ -1122,7 +1200,7 @@ fn walk_for_definitions(
             lines,
             file_lines,
             mtime,
-            defs,
+            emit,
             lang,
             child_depth,
         );
@@ -1152,18 +1230,17 @@ fn is_transparent_wrapper(kind: &str, lang: Option<crate::types::Lang>) -> bool 
 
 /// Keyword heuristic fallback for files without tree-sitter grammars.
 /// Operates on pre-read buffer — no redundant file read.
-fn find_defs_heuristic_buf(
+fn stream_defs_heuristic(
     path: &Path,
     query: &str,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
-    let mut defs = Vec::new();
-
+    out: &mut dyn FnMut(Match),
+) {
     for (i, line) in content.lines().enumerate() {
         if line.contains(query) && is_definition_line(line) {
-            defs.push(Match {
+            out(Match {
                 path: path.to_path_buf(),
                 line: (i + 1) as u32,
                 text: crate::types::match_text(line),
@@ -1178,8 +1255,6 @@ fn find_defs_heuristic_buf(
             });
         }
     }
-
-    defs
 }
 
 /// Find all usages via ripgrep (word-boundary matching).
@@ -1259,35 +1334,40 @@ fn find_usages(
 
             let (file_lines, mtime) = file_metadata(path);
 
-            let mut file_matches = Vec::new();
+            // Streamed into the sink `OFFER_CHUNK` at a time rather than collected per file
+            // first. This is the densest path in the codebase, and the whole-file `Vec<Match>`
+            // it used to build was the per-thread peak-RSS term #59 filed — independent of
+            // `MAX_RETAINED`, so retention could not bound it. Contiguity is not load-bearing
+            // here: `rank::sort`'s key is a total order, so the retained set and its final order
+            // are both independent of arrival *and* of where the chunk boundaries fall. See the
+            // determinism note at the top of this file and `retain::FileOffer`.
+            let mut offer = super::retain::FileOffer::new(matches);
             let mut searcher = Searcher::new();
 
             let _ = searcher.search_slice(
                 matcher,
                 &bytes,
                 UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: crate::types::match_text(line),
-                        is_definition: false,
-                        exact: line.contains(query),
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
+                    offer.push(
+                        Match {
+                            path: path.to_path_buf(),
+                            line: line_num as u32,
+                            text: crate::types::match_text(line),
+                            is_definition: false,
+                            exact: line.contains(query),
+                            file_lines,
+                            mtime,
+                            def_range: None,
+                            def_name: None,
+                            def_weight: 0,
+                            impl_target: None,
+                        },
+                        &mut scorer,
+                    );
                     Ok(true)
                 }),
             );
-
-            // Bounded per file, then merged under one acquisition. Contiguity is no longer
-            // load-bearing here — `rank::sort`'s key is a total order, so the retained set and its
-            // final order are both independent of arrival. See the determinism note at the top of
-            // this file.
-            matches.offer_file(file_matches, &mut scorer);
+            offer.finish(&mut scorer);
 
             ignore::WalkState::Continue
         })
@@ -1311,13 +1391,14 @@ fn find_usages(
 ///
 /// Whole-identifier match (not substring-anywhere) prevents false positives
 /// like query `func` matching heading `## refactoring guidelines`.
-fn find_defs_markdown_buf(
+fn stream_defs_markdown(
     path: &Path,
     query: &str,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
+    out: &mut dyn FnMut(Match),
+) {
     // The read side strips a BOM before parsing markdown (`read::outline::generate`,
     // `resolve_heading`, `suggest_headings`); this side did not, so the two disagreed about a
     // doubled-BOM file's *first* heading — tree-sitter-md skips one BOM itself but parses the
@@ -1327,10 +1408,9 @@ fn find_defs_markdown_buf(
     // rows tree-sitter reports and the `lines` indices below stay aligned.
     let content = crate::lang::outline::strip_bom(content);
     let Some(tree) = parse_markdown(content) else {
-        return Vec::new();
+        return;
     };
     let lines: Vec<&str> = content.lines().collect();
-    let mut defs = Vec::new();
     walk_md_sections(
         tree.root_node(),
         &lines,
@@ -1338,9 +1418,8 @@ fn find_defs_markdown_buf(
         path,
         file_lines,
         mtime,
-        &mut defs,
+        out,
     );
-    defs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1351,18 +1430,18 @@ fn walk_md_sections(
     path: &Path,
     file_lines: u32,
     mtime: SystemTime,
-    defs: &mut Vec<Match>,
+    emit: &mut dyn FnMut(Match),
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "section" => {
-                emit_md_section_match(child, lines, query, path, file_lines, mtime, defs);
-                walk_md_sections(child, lines, query, path, file_lines, mtime, defs);
+                emit_md_section_match(child, lines, query, path, file_lines, mtime, emit);
+                walk_md_sections(child, lines, query, path, file_lines, mtime, emit);
             }
             // The parser owns these — no headings hide inside.
             "fenced_code_block" | "indented_code_block" | "html_block" => {}
-            _ => walk_md_sections(child, lines, query, path, file_lines, mtime, defs),
+            _ => walk_md_sections(child, lines, query, path, file_lines, mtime, emit),
         }
     }
 }
@@ -1375,7 +1454,7 @@ fn emit_md_section_match(
     path: &Path,
     file_lines: u32,
     mtime: SystemTime,
-    defs: &mut Vec<Match>,
+    emit: &mut dyn FnMut(Match),
 ) {
     let mut cursor = section.walk();
     let Some(heading) = section
@@ -1395,7 +1474,7 @@ fn emit_md_section_match(
         .get(heading.start_position().row)
         .copied()
         .unwrap_or("");
-    defs.push(Match {
+    emit(Match {
         path: path.to_path_buf(),
         line: heading_line,
         text: crate::types::match_text(line_text),
@@ -1499,6 +1578,50 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
+    /// Collect `stream_defs_treesitter` into a `Vec`.
+    ///
+    /// The walks stream definitions so a file's whole set never exists at once (#59); assertions
+    /// are easier against a `Vec`, and collecting one here means every test below still runs
+    /// through the streaming path — including its one-slot `SameSpanDedupe` — rather than a
+    /// parallel implementation that could drift from it.
+    fn collect_defs_treesitter(
+        path: &std::path::Path,
+        query: &str,
+        ts_lang: &tree_sitter::Language,
+        lang: Option<crate::types::Lang>,
+        content: &str,
+        file_lines: u32,
+        mtime: SystemTime,
+    ) -> Vec<Match> {
+        let mut out = Vec::new();
+        stream_defs_treesitter(
+            path,
+            query,
+            ts_lang,
+            lang,
+            content,
+            file_lines,
+            mtime,
+            &mut |m| out.push(m),
+        );
+        out
+    }
+
+    /// Collect `stream_defs_markdown` into a `Vec`. See `collect_defs_treesitter` above.
+    fn collect_defs_markdown(
+        path: &std::path::Path,
+        query: &str,
+        content: &str,
+        file_lines: u32,
+        mtime: SystemTime,
+    ) -> Vec<Match> {
+        let mut out = Vec::new();
+        stream_defs_markdown(path, query, content, file_lines, mtime, &mut |m| {
+            out.push(m)
+        });
+        out
+    }
+
     /// `stratify_for_display` replaced `sort_by_key(stratum_for_display)` to avoid the
     /// stable sort's `n/2 * size_of::<Match>()` scratch buffer on an unbounded match set.
     /// It must be indistinguishable from what it replaced, including stability *within*
@@ -1593,7 +1716,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
 "#;
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
 
-        let defs = find_defs_treesitter(
+        let defs = collect_defs_treesitter(
             std::path::Path::new("test.rs"),
             "hello",
             &ts_lang,
@@ -1606,7 +1729,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         assert!(defs[0].is_definition);
         assert!(defs[0].def_range.is_some());
 
-        let defs = find_defs_treesitter(
+        let defs = collect_defs_treesitter(
             std::path::Path::new("test.rs"),
             "Foo",
             &ts_lang,
@@ -1617,7 +1740,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         );
         assert!(!defs.is_empty(), "should find 'Foo' definition");
 
-        let defs = find_defs_treesitter(
+        let defs = collect_defs_treesitter(
             std::path::Path::new("test.rs"),
             "dispatch_tool",
             &ts_lang,
@@ -1641,7 +1764,7 @@ const unexported = "hello";
             crate::lang::outline::outline_language(crate::types::Lang::TypeScript).unwrap();
         let lines = code.lines().count() as u32;
 
-        let defs = find_defs_treesitter(
+        let defs = collect_defs_treesitter(
             std::path::Path::new("test.ts"),
             "UNTAGGED_REQUESTS_SQL",
             &ts_lang,
@@ -1658,7 +1781,7 @@ const unexported = "hello";
         assert!(defs[0].def_range.is_some());
 
         // Non-exported const also detected
-        let defs = find_defs_treesitter(
+        let defs = collect_defs_treesitter(
             std::path::Path::new("test.ts"),
             "unexported",
             &ts_lang,
@@ -1675,7 +1798,7 @@ const unexported = "hello";
     fn elixir_find(code: &str, name: &str) -> Vec<Match> {
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Elixir).unwrap();
         let lines = code.lines().count() as u32;
-        find_defs_treesitter(
+        collect_defs_treesitter(
             std::path::Path::new("test.ex"),
             name,
             &ts_lang,
@@ -1842,7 +1965,7 @@ end
 
     fn md_find(content: &str, query: &str) -> Vec<Match> {
         let lines = content.lines().count() as u32;
-        find_defs_markdown_buf(
+        collect_defs_markdown(
             std::path::Path::new("test.md"),
             query,
             content,
@@ -2083,7 +2206,7 @@ Body to end.
     /// Helper: search for a C++ definition by name in a `.h` snippet.
     fn cpp_find(code: &str, name: &str) -> Vec<Match> {
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Cpp).unwrap();
-        find_defs_treesitter(
+        collect_defs_treesitter(
             std::path::Path::new("Probe.h"),
             name,
             &ts_lang,
@@ -2139,20 +2262,19 @@ using MyAlias = float;
         assert_eq!(outer.len(), 1, "class must be reported once, got {outer:?}");
     }
 
-    /// `dedupe_same_span_definitions` must keep the *highest-weight* node of a
-    /// same-span run, not the first. The walk is pre-order, so the first is the
-    /// enclosing node — for TS/JS that is the `export_statement` wrapper, weight 30,
-    /// the lowest definition tier. Keeping it demoted every exported definition below
-    /// an unrelated local `let` (weight 40), because `rank::sort` multiplies
-    /// `def_weight` by 10. This is the run the dedup actually fires on; the C++ nested
-    /// class it was written for is depth-limited out of reach.
+    /// `SameSpanDedupe` must keep the *highest-weight* node of a same-span run, not the first.
+    /// The walk is pre-order, so the first is the enclosing node — for TS/JS that is the
+    /// `export_statement` wrapper, weight 30, the lowest definition tier. Keeping it demoted
+    /// every exported definition below an unrelated local `let` (weight 40), because
+    /// `rank::sort` multiplies `def_weight` by 10. This is the run the dedup actually fires
+    /// on; the C++ nested class it was written for is depth-limited out of reach.
     #[test]
     fn exported_ts_definition_survives_dedup_with_its_real_weight() {
         let code = "export class Widget {}\nexport function handle() {}\n";
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::TypeScript)
             .expect("ts grammar");
         for (name, want_weight) in [("Widget", 100u16), ("handle", 100)] {
-            let defs = find_defs_treesitter(
+            let defs = collect_defs_treesitter(
                 std::path::Path::new("thing.ts"),
                 name,
                 &ts_lang,
@@ -2226,10 +2348,10 @@ using MyAlias = float;
 
     /// A template whose `template <…>` clause sits on its own line — the normal spelling
     /// in real C++ — was reported twice, once for the `template_declaration` wrapper and
-    /// once for the declaration it wraps. Their spans differ, so
-    /// `dedupe_same_span_definitions` could not collapse them; only the single-line
-    /// spelling happened to coincide and dedupe, which is why the original tests missed
-    /// it. Fixed by making the wrapper transparent rather than a definition.
+    /// once for the declaration it wraps. Their spans differ, so `SameSpanDedupe` could not
+    /// collapse them; only the single-line spelling happened to coincide and dedupe, which is
+    /// why the original tests missed it. Fixed by making the wrapper transparent rather than a
+    /// definition.
     #[test]
     fn cpp_multi_line_template_is_reported_once() {
         let cases: &[(&str, &str)] = &[
