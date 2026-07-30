@@ -679,9 +679,13 @@ fn read_manifest(path: &Path) -> Result<String, String> {
 /// **BOM-driven only, and deliberately so.** A BOM makes the encoding and the byte order
 /// unambiguous. Without one, detection is a heuristic — and worse, UTF-16 LE holding ASCII is
 /// *valid UTF-8*, since NUL is a legal UTF-8 byte, so a BOM-less file never reaches this at all:
-/// `read_to_string` succeeds and hands NUL-interleaved text to the parser. `parse_go_mod`'s "no
+/// `String::from_utf8` succeeds and hands NUL-interleaved text to the parser. `parse_go_mod`'s "no
 /// module directive" guard is what catches that, and `a_bomless_utf16_go_mod_reports_a_reason`
-/// pins it.
+/// pins it. The other three formats report their parser's reason — `malformed TOML` or
+/// `malformed JSON` — which is an encoding problem wearing a syntax error's clothes. Unchanged from
+/// before #65 and not closable from here: the file *is* valid UTF-8, so "not UTF-8" would be a
+/// false statement about it, and anything better needs either a new reason string or the heuristic
+/// detection this deliberately avoids. Worth its own issue rather than a guess made here.
 ///
 /// The BOM is consumed rather than translated, so the returned text starts at the first real
 /// character. A *doubled* BOM therefore leaves one U+FEFF, which the TOML and JSON parsers strip
@@ -699,6 +703,15 @@ fn decode_utf16_with_bom(bytes: &[u8]) -> Option<String> {
         return None;
     }
 
+    // Both of these allocate infallibly — `Vec` and `String` grow through `handle_alloc_error`,
+    // which aborts, whereas `fs::read` reserves through `try_reserve_exact` and surfaces
+    // `OutOfMemory` as the "read failed" reason. So peak for an N-byte manifest is ~3.5N on this
+    // path (N still owned by the `FromUtf8Error`, N for the units, up to 1.5N for the `String`)
+    // against N before, and the top of that range aborts rather than reporting. Nothing caps
+    // manifest size anywhere — `find_manifest` gates on `Path::exists()` alone — so this is a
+    // pre-existing exposure that the decode multiplies rather than a new one, and it needs a cap
+    // chosen deliberately rather than invented here. Reachable only by a UTF-16 manifest sized
+    // near available memory.
     let units: Vec<u16> = rest
         .chunks_exact(2)
         .map(|c| {
@@ -725,6 +738,12 @@ fn decode_utf16_with_bom(bytes: &[u8]) -> Option<String> {
     // a UTF-32-shaped payload with no UTF-32 BOM walks past it and produces the same wrong reason.
     // No manifest format has a legitimate raw NUL — JSON writes one as a six-character escape — so
     // rejecting all of them costs nothing real.
+    //
+    // **This covers the decode path only, which is less than the argument above might suggest.** A
+    // BOM-*less* UTF-16 file is valid UTF-8 and never arrives here, so it still reaches the parser
+    // and still reports `malformed TOML`/`malformed JSON`. See this function's doc comment for why
+    // that is left alone rather than closed by moving the test up to the `from_utf8` success arm:
+    // there the file really is UTF-8, and "not UTF-8" would be false.
     if text.contains('\0') {
         return None;
     }
@@ -1514,11 +1533,11 @@ mod tests {
 
     /// The reasons #43 established must all survive the decode being added (#65).
     ///
-    /// The decode sits on the `InvalidData` arm, so everything that is *not* a UTF-8 validation
-    /// failure has to reach its old reason untouched, and `InvalidData` without a usable BOM has
-    /// to keep reporting `not UTF-8` rather than falling through to a parse error. Each row is a
-    /// distinct way to fail, and the two four-byte ones are the cases a naive BOM match gets
-    /// wrong.
+    /// The decode sits on the `Err` arm of `read_manifest`'s `String::from_utf8`, so everything that
+    /// is *not* a UTF-8 validation failure has to reach its old reason untouched, and a validation
+    /// failure with no usable BOM has to keep reporting `not UTF-8` rather than falling through to a
+    /// parse error. Each row is a distinct way to fail, and the two UTF-32-shaped ones are the cases
+    /// a naive BOM match gets wrong.
     #[test]
     fn a_file_with_no_usable_utf16_bom_still_reports_not_utf8() {
         let json = "{\"name\":\"n\",\"version\":\"1.0.0\"}";
@@ -1549,12 +1568,21 @@ mod tests {
         // UTF-16 text. `from_utf16_lossy` would accept this and hand the parser U+FFFD.
         let unpaired_surrogate = vec![0xFF, 0xFE, 0x00, 0xD8, 0x21, 0x00];
 
+        // A perfectly well-formed UTF-16 document whose *content* holds a raw NUL. This is the one
+        // class where the two encodings deliberately disagree — as UTF-8 the same body reaches the
+        // parser and reports `malformed JSON` — and pinning it here is what keeps the NUL test from
+        // being "fixed" by moving it to the `from_utf8` success arm, where it would call a file that
+        // really is UTF-8 "not UTF-8". `a_utf16_manifest_renders_what_its_utf8_spelling_renders`
+        // names the same bound from the other side.
+        let nul_in_content = utf16le_with_bom("{\"name\":\"a\0b\",\"version\":\"1.0.0\"}");
+
         let cases: &[(&str, Vec<u8>)] = &[
             ("a lone continuation byte", not_utf8_and_not_utf16(json)),
             ("UTF-32 LE", utf32le),
             ("a BOM-less UTF-32 LE payload", utf32le_bomless),
             ("an odd trailing byte", odd_tail),
             ("an unpaired surrogate", unpaired_surrogate),
+            ("a raw NUL in the content", nul_in_content),
         ];
 
         for (label, bytes) in cases {
@@ -1623,7 +1651,7 @@ mod tests {
         );
     }
 
-    /// A decoded UTF-16 manifest must render **exactly** what the same content in UTF-8 renders.
+    /// A decoded UTF-16 manifest must render exactly what the same NUL-free content renders in UTF-8.
     ///
     /// This is the property the change is really for, and the one an intuition about it gets
     /// wrong. Review of this work read the empty and nameless cases as regressions, because
@@ -1638,6 +1666,15 @@ mod tests {
     /// that mangles a value is caught as well as one that loses it. Rows are included whose UTF-8
     /// rendering is itself a failure or a blank, since those are exactly where "agrees with UTF-8"
     /// and "looks successful" come apart.
+    ///
+    /// **"NUL-free" in the name is a real bound, not hedging.** A body holding a raw NUL is the one
+    /// class where the two encodings legitimately diverge: as UTF-8 it reaches the parser and
+    /// reports `malformed TOML`/`malformed JSON`, while as UTF-16 `decode_utf16_with_bom` refuses it
+    /// and reports `not UTF-8`. That refusal is deliberate — see the NUL test there — and the
+    /// divergence class is exactly it, because the decode is otherwise byte-for-byte:
+    /// `String::from_utf16` cannot fail on `str::encode_utf16` output, and the leading-BOM match is
+    /// unambiguous in both orders even for a body that itself starts with U+FEFF. No manifest format
+    /// permits a raw NUL, so nothing real sits in the excluded class.
     #[test]
     fn a_utf16_manifest_renders_what_its_utf8_spelling_renders() {
         let cases: &[(&str, &str)] = &[
@@ -1685,8 +1722,8 @@ mod tests {
                 assert_eq!(
                     manifest_line(&fingerprint(utf16_dir.path())),
                     manifest_line(&fingerprint(utf8_dir.path())),
-                    "{manifest} in UTF-16 {order} must render what its UTF-8 spelling renders \
-                     (body {body:?})"
+                    "{manifest} in UTF-16 {order} must render what its NUL-free UTF-8 spelling \
+                     renders (body {body:?})"
                 );
             }
         }
@@ -1729,7 +1766,7 @@ mod tests {
     /// The reason must not depend on which errno the platform chose.
     ///
     /// `find_manifest` uses `Path::exists()`, which is true for directories, so a *directory*
-    /// named `package.json` reaches `read_manifest`. `read_to_string` reports that as
+    /// named `package.json` reaches `read_manifest`. `fs::read` reports that as
     /// `PermissionDenied` on Windows and `IsADirectory` on Linux — so deriving the reason
     /// from `ErrorKind` alone both diverged across platforms and told a Windows agent to go
     /// fix file modes for a problem that is "this is a directory". CI is Linux-only while
