@@ -295,8 +295,30 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
+/// Every tool name `dispatch_tool` will answer.
+///
+/// `dispatch_tool` gates on this list before matching, so a tool added to the `match` below without
+/// being added here is **unreachable** — a failure at the first call rather than a silent gap. That
+/// matters because this list, not `tool_definitions`, is the real request entry point: the two are
+/// not equal, and `tilth_session` is the standing proof (dispatchable, never advertised). The BOM
+/// surface table in `bom_surfaces` enumerates from here for exactly that reason.
+pub(in crate::mcp) const DISPATCHABLE_TOOLS: &[&str] = &[
+    "tilth_read",
+    "tilth_search",
+    "tilth_files",
+    "tilth_deps",
+    "tilth_grok",
+    "tilth_diff",
+    "tilth_session",
+    "tilth_savings",
+    "tilth_write",
+];
+
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
+    if !DISPATCHABLE_TOOLS.contains(&tool) {
+        return Err(format!("unknown tool: {tool}"));
+    }
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
