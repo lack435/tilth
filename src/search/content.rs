@@ -184,7 +184,7 @@ pub fn search(
                     file_matches.push(Match {
                         path: path.to_path_buf(),
                         line: line_num as u32,
-                        text: line.trim_end().to_string(),
+                        text: crate::types::match_text(line),
                         is_definition: false,
                         exact: false,
                         file_lines,

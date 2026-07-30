@@ -152,10 +152,19 @@ fn resolve_by_path_line(
 /// Read `path` and detect its language. Errors if the file isn't a code file —
 /// grok requires source-level analysis, not a markdown / config / data file.
 fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
-    let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
+    let mut content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;
+    // grok renders slices of this content verbatim — `body_with_dedup` → `slice_body` — so a
+    // definition starting on line 1 of a BOM'd file printed the glyph (#51). grok reads its
+    // target itself rather than through `bloom_walk::read_with_bloom_check`, so it does not
+    // inherit that reader's strip and needs its own. Drained in place; a BOM carries no
+    // newline, so `start_line`/`end_line` slicing stays correct.
+    let bom_len = content.len() - crate::lang::outline::strip_bom(&content).len();
+    if bom_len > 0 {
+        content.drain(..bom_len);
+    }
     let FileType::Code(lang) = detect_file_type(path) else {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
@@ -272,7 +281,11 @@ fn read_delegate_content(
     if callee_file == target_path {
         Some(target_content.to_string())
     } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
-        fs::read_to_string(callee_file).ok()
+        // Stripped for the same reason as `read_code_file`: callee bodies are sliced out of
+        // this content and rendered, so a callee defined on line 1 of a BOM'd file leaked.
+        fs::read_to_string(callee_file)
+            .ok()
+            .map(|c| crate::lang::outline::strip_bom(&c).to_string())
     } else {
         None
     }
@@ -2078,6 +2091,116 @@ pub fn outer(x: u32) -> u32 {
         assert!(
             saved_after_second > 0,
             "degradation must record tokens saved, got {saved_after_second}"
+        );
+    }
+
+    /// A grok over a BOM'd file must render and rank exactly as without one.
+    ///
+    /// grok reads its target itself rather than through `bloom_walk::read_with_bloom_check`,
+    /// so it does not inherit that reader's strip, and `body_with_dedup` → `slice_body` prints
+    /// slices of that content verbatim (#51). A definition starting on line 1 therefore leaked
+    /// the glyph into the rendered body — the same for a callee body, which comes from a second
+    /// direct read.
+    ///
+    /// The definition is on line 1 deliberately: a BOM only ever affects line 1, so a fixture
+    /// with it lower down cannot detect this at all.
+    #[test]
+    fn a_bom_does_not_change_grok_output() {
+        let run = |prefix: &[u8]| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let body = "pub fn alpha_thing() -> u32 {\n    helper_fn()\n}\n\
+                        \npub fn helper_fn() -> u32 {\n    7\n}\n";
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            let path = tmp.path().join("src/lib.rs");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &bytes).unwrap();
+
+            let bloom = BloomFilterCache::default();
+            let session = crate::session::Session::default();
+            let result = grok(
+                "alpha_thing",
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+            )
+            .unwrap();
+            format_grok(&result, tmp.path())
+        };
+
+        let plain = run(&[]);
+        let bommed = run(&[0xEF, 0xBB, 0xBF]);
+
+        assert!(
+            plain.contains("alpha_thing"),
+            "fixture is broken, grok found nothing:\n{plain}"
+        );
+        assert!(
+            !bommed.contains('\u{feff}'),
+            "a BOM reached grok output:\n{bommed}"
+        );
+        assert_eq!(bommed, plain, "a BOM changed grok output");
+    }
+
+    /// The *cross-file* callee body read is a second, separate strip, and the single-file
+    /// fixture above cannot reach it.
+    ///
+    /// `read_delegate_content` short-circuits on `callee_file == target_path` and returns the
+    /// already-stripped target content, so with the target and its callee in one file the
+    /// cross-file branch never executes — I claimed that strip was covered in three places
+    /// while reverting it left the suite green. The callee therefore lives in its own BOM'd
+    /// file here, on line 1, with a `Cargo.toml` present so it resolves as an internal callee
+    /// and the delegate-body expansion actually fires.
+    #[test]
+    fn a_bom_does_not_change_a_cross_file_grok_callee_body() {
+        let run = |prefix: &[u8]| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+            write_fixture(
+                tmp.path(),
+                "src/lib.rs",
+                // A real `use` line is required, not just `pub mod`: `resolve_callees` scans
+                // files reached through *imports*, and `is_import_line` for Rust matches
+                // `use `. With only `pub mod helper;` the callee resolved as `extern`, the
+                // delegate-body read never ran, and this test could not see the strip at all.
+                "pub mod helper;\nuse crate::helper::helper_fn;\n\n\
+                 pub fn alpha_thing() -> u32 {\n    helper_fn()\n}\n",
+            );
+            // The callee's own file, BOM'd, definition on line 1.
+            let helper = tmp.path().join("src/helper.rs");
+            fs::create_dir_all(helper.parent().unwrap()).unwrap();
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(b"pub fn helper_fn() -> u32 {\n    7\n}\n");
+            fs::write(&helper, &bytes).unwrap();
+
+            let bloom = BloomFilterCache::default();
+            let session = crate::session::Session::default();
+            let result = grok(
+                "alpha_thing",
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+            )
+            .unwrap();
+            format_grok(&result, tmp.path())
+        };
+
+        let plain = run(&[]);
+        let bommed = run(&[0xEF, 0xBB, 0xBF]);
+
+        assert!(
+            plain.contains("helper_fn"),
+            "fixture is broken: the callee must resolve cross-file:\n{plain}"
+        );
+        assert!(
+            !bommed.contains('\u{feff}'),
+            "a BOM reached grok's cross-file callee output:\n{bommed}"
+        );
+        assert_eq!(
+            bommed, plain,
+            "a BOM changed grok's cross-file callee output"
         );
     }
 

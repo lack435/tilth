@@ -289,7 +289,7 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+    let mut content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: None,
@@ -306,6 +306,18 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
         path: path.to_path_buf(),
         source: e,
     })?;
+    // `mode=stripped` is a *derived* view — it removes comments, debug logs and extra blanks
+    // — so it takes the same side of #42's rule as the outline funnel rather than the full
+    // view's: strip the BOM. It emits no hashline anchors (the numbered gutter below is
+    // `{line_num}  {line}`, not `{line}:{hash}|`), so there is no verification contract to
+    // desynchronise, which is the only thing that forced the full view to keep its BOM.
+    //
+    // Drained in place so a large file is not copied. A BOM carries no newline, so
+    // `total_lines` and every gutter number are unaffected.
+    let bom_len = content.len() - crate::lang::outline::strip_bom(&content).len();
+    if bom_len > 0 {
+        content.drain(..bom_len);
+    }
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     if !matches!(detect_file_type(path), FileType::Code(_)) {
@@ -373,6 +385,47 @@ mod tests {
         assert!(
             !out.contains("body_marker"),
             "signature mode should omit function body: {out}"
+        );
+    }
+
+    /// `mode=stripped` must not render a leading BOM.
+    ///
+    /// An explicit acceptance item of #51, alongside the search preview and the fenced block —
+    /// and the only one of the three that shipped unpinned: reverting the strip in
+    /// `read_stripped_file` left the whole suite green.
+    ///
+    /// Stripped mode takes the *outline* side of #42's rule rather than the full view's,
+    /// because it is a derived view (comments, debug logs and extra blanks removed) and its
+    /// gutter is `{line_num}  {line}` with no `{line}:{hash}|` anchor — so there is no
+    /// verification contract to desynchronise, which is the only thing that forced the full
+    /// view to keep its BOM. Asserted both ways for that reason: no glyph here, and
+    /// `both_full_view_modes_agree_about_a_bom` pins that the full view still keeps it.
+    #[test]
+    fn tool_read_stripped_mode_does_not_render_a_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bommed.rs");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"pub fn helper_fn() -> u32 {\n    // drop me\n    7\n}\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(
+            &serde_json::json!({ "path": path.to_str().unwrap(), "mode": "stripped" }),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("stripped read");
+
+        assert!(out.contains("[stripped]"), "stripped header missing: {out}");
+        assert!(
+            out.contains("pub fn helper_fn"),
+            "fixture is broken, the definition must survive stripping: {out}"
+        );
+        assert!(
+            !out.contains('\u{feff}'),
+            "a BOM reached mode=stripped output: {out}"
         );
     }
 

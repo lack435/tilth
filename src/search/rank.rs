@@ -409,7 +409,16 @@ fn query_intent_boost(m: &Match, query: &str) -> i32 {
 
     let looks_type = query.chars().next().is_some_and(char::is_uppercase);
     let looks_fn = query.chars().next().is_some_and(char::is_lowercase);
-    let text = m.text.trim_start();
+    // BOM-aware, because `str::trim_start` is not — see `types::match_text`.
+    //
+    // Unreachable today, and deliberately kept: all nine `Match.text` construction sites go
+    // through `match_text`, and nothing in live code assigns that field otherwise, so no
+    // `Match` currently reaches ranking carrying a BOM. The rank test has to hand-build one to
+    // exercise this, which is the honest signal that it is belt-and-braces rather than a live
+    // fix. It stays because the failure it guards is invisible: a construction site added later
+    // that forgets the helper costs a visible rendering glyph, but without this it would *also*
+    // cost 130 points of score with nothing in the output to show it.
+    let text = crate::lang::outline::trim_start_bom_aware(&m.text);
 
     if looks_type
         && (text.starts_with("struct ")
@@ -447,7 +456,8 @@ fn query_intent_boost(m: &Match, query: &str) -> i32 {
 }
 
 fn exported_api_boost(m: &Match) -> i32 {
-    let text = m.text.trim_start();
+    // BOM-aware — see `definition_kind_boost`.
+    let text = crate::lang::outline::trim_start_bom_aware(&m.text);
 
     if text.starts_with("export default ") {
         90
@@ -497,7 +507,10 @@ fn incidental_text_penalty(m: &Match, query: &str) -> i32 {
         return 0;
     }
 
-    let text = m.text.trim();
+    // BOM-aware — see `definition_kind_boost`. Here the sign is reversed: a BOM'd line-1
+    // comment failed `starts_with("//")` and so *escaped* the 150-point penalty, ranking
+    // above where it belonged.
+    let text = crate::lang::outline::trim_start_bom_aware(&m.text).trim_end();
     let q_lower = query.to_ascii_lowercase();
 
     // Only use unambiguous comment prefixes — avoid '#' (Python/C preprocessor/Rust attrs)
@@ -553,7 +566,9 @@ fn multi_word_boost(m: &Match, query: &str) -> i32 {
     }
 
     let path_lower = m.path.to_string_lossy().to_ascii_lowercase();
-    let text_lower = m.text.to_ascii_lowercase();
+    // BOM-aware — see `definition_kind_boost`. The BOM would fuse onto the first word, so
+    // `﻿pub` did not match the query word `pub` under whole-word splitting below.
+    let text_lower = crate::lang::outline::strip_bom(&m.text).to_ascii_lowercase();
     let haystack = format!("{path_lower} {text_lower}");
 
     // Whole-word matching: split haystack on non-alphanumeric boundaries so
@@ -723,6 +738,58 @@ mod tests {
             key(&reverse),
             "sort depends on arrival order, so retention cannot be bounded without changing output"
         );
+    }
+
+    /// A UTF-8 BOM on line 1 must not change a match's score.
+    ///
+    /// This is why #51 is not the cosmetic issue it was filed as. Four ranking terms test the
+    /// *start* of `m.text` — `definition_kind_boost` (`starts_with("pub fn ")` and friends),
+    /// `exported_api_boost` (`"pub "` / `"export "`), `incidental_text_penalty`
+    /// (`starts_with("//")`) and `multi_word_boost` (first whole word) — and all four reach it
+    /// through `str::trim_start` or `str::trim`, neither of which removes U+FEFF. So on a
+    /// BOM'd file:
+    ///
+    ///   * a line-1 `pub fn` definition silently loses both its kind boost and its
+    ///     exported-API boost, and sorts below the identical line in a file without a BOM;
+    ///   * a line-1 `//` comment escapes the incidental-text penalty and sorts *above* where
+    ///     it belongs.
+    ///
+    /// Only line 1 of a BOM'd file is affected — a BOM occurs once, at file start — which is
+    /// exactly why it went unnoticed: the same line anywhere else in the file scores right.
+    ///
+    /// Asserted as equality against the BOM-free spelling rather than against a literal
+    /// score, so it keeps holding as the weights change.
+    #[test]
+    fn a_bom_on_line_one_does_not_change_the_score() {
+        let scope = PathBuf::from("/repo/src");
+        let now = SystemTime::now();
+        // (query, line text, is_definition) — one case per affected ranking term.
+        let cases: &[(&str, &str, bool)] = &[
+            ("alpha_thing", "pub fn alpha_thing() {", true),
+            ("Widget", "pub struct Widget {", true),
+            ("export_thing", "export function export_thing() {", true),
+            ("handle auth", "pub fn handle_auth() {", true),
+            ("thing", "// thing is mentioned here", false),
+        ];
+
+        for (query, text, is_def) in cases {
+            let plain = make_match("/repo/src/a.rs", text, *is_def, Some("x"));
+            // The BOM is built from its bytes, per the #35/#41 convention.
+            let bommed_text =
+                String::from_utf8([&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat()).unwrap();
+            let bommed = make_match("/repo/src/a.rs", &bommed_text, *is_def, Some("x"));
+
+            let mut cache = std::collections::HashMap::new();
+            let s_plain = score(&plain, query, &scope, None, None, &mut cache, now);
+            let mut cache = std::collections::HashMap::new();
+            let s_bommed = score(&bommed, query, &scope, None, None, &mut cache, now);
+
+            assert_eq!(
+                s_bommed, s_plain,
+                "a BOM changed the score for {text:?} (query {query:?}): \
+                 {s_bommed} vs {s_plain}"
+            );
+        }
     }
 
     /// `sort` scores once per match and applies a hand-rolled index permutation, replacing

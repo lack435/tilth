@@ -1355,7 +1355,21 @@ fn format_search_result(
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
 fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
-    let content = fs::read_to_string(&m.path).ok()?;
+    let mut content = fs::read_to_string(&m.path).ok()?;
+    // One strip, because this function does two things with these lines and a BOM broke both
+    // (#51): it renders them into the fenced block, where a BOM'd line 1 showed a stray
+    // glyph, and it prefix-tests them below for the leading-import skip, where
+    // `trimmed.starts_with("use ")` silently failed so a BOM'd line-1 import was never
+    // skipped. The second is the #35 bug again, in a path that fix never visited.
+    //
+    // Removing a BOM cannot shift a line number — it carries no newline — so `start`/`end`
+    // and the `{i:>4} |` gutter stay correct. Drained in place rather than reassigned so a
+    // large file is not copied; the range is a multiple of 3 bytes and therefore always on a
+    // char boundary.
+    let bom_len = content.len() - crate::lang::outline::strip_bom(&content).len();
+    if bom_len > 0 {
+        content.drain(..bom_len);
+    }
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
@@ -1553,8 +1567,11 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
     if match_line == 0 {
         return None;
     }
-    let content = std::fs::read_to_string(path).ok()?;
-    let tree = crate::lang::outline::parse_markdown(&content)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    // BOM-stripped before parsing, to match the read side and `find_defs_markdown_buf` — see
+    // that function for why the two sides disagreeing mattered (#51).
+    let content = crate::lang::outline::strip_bom(&raw);
+    let tree = crate::lang::outline::parse_markdown(content)?;
     let lines: Vec<&str> = content.lines().collect();
     let mut best: Option<(tree_sitter::Node, u32)> = None;
     walk_md_for_enclosing(tree.root_node(), match_line, &mut best);
@@ -3324,6 +3341,217 @@ mod tests {
     }
 
     /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must
+    /// Search and the read side must agree about a doubled-BOM markdown file's first heading.
+    ///
+    /// The last piece of the split #42 opened. `read::outline::generate`, `resolve_heading`
+    /// and `suggest_headings` all strip a BOM before parsing; `find_defs_markdown_buf` and
+    /// `markdown_enclosing_scope` did not. tree-sitter-md skips one BOM by itself, so a single
+    /// BOM never diverged — but behind **two** it parses the first heading as a paragraph, and
+    /// after #42 the outline advertised that heading and the section resolver accepted it while
+    /// search reported it as a plain usage rather than a definition. One half of the tool
+    /// naming a definition the other denies.
+    ///
+    /// `n == 2` is the case that matters; 0 and 1 are controls proving the fixture is sound.
+    ///
+    /// Naming caveat: this asserts search's side against the read side's *known* answer
+    /// (`[definition]`) rather than calling the read side and comparing. A read-side regression
+    /// would leave it green — the read side is pinned separately by
+    /// `read::tests::the_outline_and_the_heading_resolver_agree_on_a_bom_file`. It also covers
+    /// only `find_defs_markdown_buf`; the other half of that fix,
+    /// `markdown_enclosing_scope`, is pinned by
+    /// `a_doubled_bom_does_not_lose_the_markdown_scope_label`.
+    #[test]
+    fn search_and_the_read_side_agree_on_a_doubled_bom_markdown_heading() {
+        let body = "# Alpha Section\n\ntext here\n\n# Beta Section\n\nmore\n";
+
+        for n in 0..=2 {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut bytes = Vec::new();
+            for _ in 0..n {
+                bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            bytes.extend_from_slice(body.as_bytes());
+            let path = tmp.path().join("notes.md");
+            std::fs::write(&path, &bytes).unwrap();
+
+            let cache = OutlineCache::new();
+            let out = search_symbol("Alpha Section", tmp.path(), &cache, None).unwrap();
+
+            assert!(
+                !out.contains('\u{feff}'),
+                "{n} BOM(s): a BOM reached search output:\n{out}"
+            );
+            // The read side treats it as a definition; search must too.
+            assert!(
+                out.contains("[definition]"),
+                "{n} BOM(s): search must report the first heading as a definition, \
+                 as the outline and section resolver do:\n{out}"
+            );
+        }
+    }
+
+    /// The `in §Heading` scope label must survive a doubled BOM.
+    ///
+    /// `markdown_enclosing_scope` is the other half of the markdown fix, and
+    /// `search_and_the_read_side_agree_on_a_doubled_bom_markdown_heading` does not reach it —
+    /// that one pins `find_defs_markdown_buf` only, so reverting this strip left the suite
+    /// green while I claimed both were covered.
+    ///
+    /// The query has to match a *usage* inside a section rather than the heading itself, since
+    /// the label is only attached to usages, and the fixture needs **two** BOMs: tree-sitter-md
+    /// absorbs one, so at a single BOM the enclosing section is found either way.
+    #[test]
+    fn a_doubled_bom_does_not_lose_the_markdown_scope_label() {
+        let body = "# Alpha Section\n\nthe zzz_token lives here\n";
+
+        let run = |n: usize| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut bytes = Vec::new();
+            for _ in 0..n {
+                bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            }
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(tmp.path().join("notes.md"), &bytes).unwrap();
+            let cache = OutlineCache::new();
+            search_content("zzz_token", tmp.path(), &cache, None).unwrap()
+        };
+
+        let plain = run(0);
+        assert!(
+            plain.contains("Alpha Section"),
+            "fixture is broken: the unmarked file must carry the scope label:\n{plain}"
+        );
+        for n in [1, 2] {
+            let out = run(n);
+            assert!(
+                !out.contains('\u{feff}'),
+                "{n} BOM(s): a BOM reached search output:\n{out}"
+            );
+            assert!(
+                out.contains("Alpha Section"),
+                "{n} BOM(s): the enclosing-section label was lost:\n{out}"
+            );
+        }
+    }
+
+    /// A BOM'd file must search identically to the same file without one.
+    ///
+    /// The acceptance case for #51, driven end to end through `search_symbol_expanded` rather
+    /// than at any single writer — which is the point, because the leak had three separate
+    /// causes and a per-site test would have missed at least one:
+    ///
+    ///   * `Match.text` was built from the raw line, so the `-> [1]` preview printed the glyph
+    ///     *and* four ranking terms mis-scored the line (see `types::match_text`);
+    ///   * `expand_match` rendered the fenced block from its own unstripped read, and
+    ///     prefix-tested those same lines for the leading-import skip;
+    ///   * `find_defs_markdown_buf` parsed markdown unstripped, disagreeing with the read side.
+    ///
+    /// Asserting byte equality against the BOM-free spelling covers all of them at once. The
+    /// paths differ between the two trees, so the fixture uses the same filename in two
+    /// tempdirs and compares the outputs with the directory prefix removed.
+    ///
+    /// Two honest limits on what this proves. It does **not** detect a reordering: the fixture
+    /// is one definition and one usage, which land in different `stratify_for_display` strata,
+    /// so no score change could permute them — ranking is pinned by
+    /// `rank::tests::a_bom_on_line_one_does_not_change_the_score` instead. And the byte
+    /// comparison quietly relies on the two `tempfile` paths having equal byte length, because
+    /// the `(~N tokens)` footer is computed before the `<TMP>` substitution; that holds for
+    /// `tempfile` today, and a mismatch would show up as a one-token diff rather than as a
+    /// silent pass.
+    ///
+    /// Two things about the fixture are load-bearing, both learned by watching this test pass
+    /// while a fix was neutered:
+    ///
+    ///   * **The matched line must be line 1.** A BOM only ever affects line 1, so a fixture
+    ///     whose definition sits on line 3 behind an import leaves `Match.text` clean and
+    ///     cannot detect `match_text` regressing at all.
+    ///   * **Both `expand` settings must run.** The `-> [line]` preview and the fenced block
+    ///     are mutually exclusive — `fence_will_follow` suppresses the preview whenever an
+    ///     expansion would reprint the same line — so `expand: 2` alone never reaches the
+    ///     preview, and `match_text` goes unpinned.
+    #[test]
+    fn a_bom_does_not_change_search_output_or_ranking() {
+        // Two shapes, because the two bugs live on different lines: the matched line at line 1
+        // (reaches `Match.text`, so the preview and the ranking terms), and a BOM'd import at
+        // line 1 (what `expand_match`'s leading-import skip prefix-tests).
+        let bodies: &[(&str, &str)] = &[
+            (
+                "def_on_line_1",
+                "pub fn alpha_thing() {\n    let _ = 1;\n}\n",
+            ),
+            (
+                "import_on_line_1",
+                "use std::fmt;\n\npub fn alpha_thing() {\n    let _ = 1;\n}\n",
+            ),
+        ];
+
+        let run = |body: &str, prefix: &[u8], expand: usize| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            std::fs::write(tmp.path().join("alpha.rs"), &bytes).unwrap();
+            // A second file so ranking has something to order against.
+            std::fs::write(
+                tmp.path().join("caller.rs"),
+                "pub fn calls() {\n    alpha_thing();\n}\n",
+            )
+            .unwrap();
+
+            let cache = OutlineCache::new();
+            let session = Session::new();
+            let bloom = crate::index::bloom::BloomFilterCache::new();
+            let out = search_symbol_expanded(
+                "alpha_thing",
+                tmp.path(),
+                &cache,
+                &session,
+                &bloom,
+                expand,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            // Paths differ per tempdir; compare everything else.
+            out.replace(&tmp.path().to_string_lossy().to_string(), "<TMP>")
+        };
+
+        for (shape, body) in bodies {
+            for expand in [0, 2] {
+                let plain = run(body, &[], expand);
+                let bommed = run(body, &[0xEF, 0xBB, 0xBF], expand);
+
+                assert!(
+                    plain.contains("alpha_thing"),
+                    "{shape}/expand={expand}: fixture is broken, nothing found:\n{plain}"
+                );
+                assert!(
+                    !bommed.contains('\u{feff}'),
+                    "{shape}/expand={expand}: a BOM reached search output:\n{bommed}"
+                );
+                assert_eq!(
+                    bommed, plain,
+                    "{shape}/expand={expand}: a BOM changed search output \
+                     (text, ranking or ordering)"
+                );
+            }
+        }
+
+        // Confirm the fixture reaches both mutually exclusive render paths, so the loop above
+        // cannot silently exercise only the fence.
+        let preview = run(bodies[0].1, &[], 0);
+        let fenced = run(bodies[0].1, &[], 2);
+        assert!(
+            preview.contains("-> ["),
+            "expand=0 must render the `-> [line]` preview, or `match_text` is unpinned:\n{preview}"
+        );
+        assert!(
+            fenced.contains("```"),
+            "expand=2 must render the fenced block:\n{fenced}"
+        );
+    }
+
     /// receive the caller's real `budget` instead of always being called with
     /// `crate::budget::DEFAULT_BUDGET` (24_000). Fixture: one real definition
     /// (`budget_probe_target`, high `def_weight`) plus a usage in a file named

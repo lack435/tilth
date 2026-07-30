@@ -39,7 +39,36 @@ where
         return None;
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let content = std::fs::read_to_string(path).ok()?;
+    let mut content = std::fs::read_to_string(path).ok()?;
+
+    // A leading BOM comes off here, at the reader shared by `callers` (`callers.rs:207`) and
+    // `callees` (`callees.rs:242`) — those two, precisely. `deps` reads its own target with a
+    // plain `fs::read_to_string` and reaches this helper only indirectly, through
+    // `resolve_callees` and `find_callers_batch`, so the content deps parses for the target
+    // file does *not* inherit this. It happens to be clean anyway (it renders paths and symbol
+    // names, and its import parsing is BOM-aware since #35), but it is not covered by this.
+    //
+    // The concrete leak this closes is `callers::find_callers_treesitter_batch`, which builds
+    // `call_text` as `lines[row].trim()` — and `str::trim` does not remove U+FEFF — then
+    // renders it as `-> {call_text}`. So a call site on line 1 of a BOM'd file printed the
+    // glyph. Stripping at the reader rather than at that one site is what stops the next
+    // consumer of this helper having to remember, which is how this bug family kept
+    // recurring across #35, #41, #42 and #43.
+    //
+    // Placed before `contains_any` for ordering hygiene only — *not* because the filter needed
+    // it. `bloom::extract_identifiers` is a byte state machine whose ident-start test is
+    // `is_ascii_alphabetic() || b'_'`, so the three BOM bytes were already skipped and the
+    // token set is identical either way. An earlier version of this comment claimed the strip
+    // fixed line-1 tokenisation; it does not, and nothing depended on that.
+    //
+    // Drained in place so a large file is not copied. A BOM carries no newline, so no line
+    // number any consumer derives from this content shifts — with the degenerate exception of
+    // a file that is *only* BOM bytes, where `"".lines().count()` is 0 against 1 for the
+    // unstripped `"\u{feff}"`. No consumer here indexes by that count.
+    let bom_len = content.len() - crate::lang::outline::strip_bom(&content).len();
+    if bom_len > 0 {
+        content.drain(..bom_len);
+    }
 
     if !bloom.contains_any(path, mtime, &content, targets) {
         return None;
