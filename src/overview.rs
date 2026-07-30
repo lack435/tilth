@@ -632,11 +632,19 @@ fn read_manifest(path: &Path) -> Result<String, String> {
     if path.is_dir() {
         return Err("not a file".to_string());
     }
-    fs::read_to_string(path).map_err(|e| {
+    // `fs::read` plus an explicit `String::from_utf8`, rather than `read_to_string`, which is
+    // those two steps welded together. Splitting them is what lets the UTF-16 decode see the
+    // bytes (#65) — and it does so **without reading twice**. A first version kept
+    // `read_to_string` and re-read the file on the `InvalidData` arm, which paid for a second
+    // read, opened a window in which the bytes decoded were not the bytes that failed
+    // validation, and collapsed a `NotFound` on that second read into "not UTF-8" instead of
+    // "disappeared during the scan". One read has none of those.
+    //
+    // The success path costs no more than before: `String::from_utf8` takes the `Vec` by value
+    // and validates in place, so a UTF-8 manifest is one read and no copy, exactly as
+    // `read_to_string` was.
+    let bytes = fs::read(path).map_err(|e| {
         match e.kind() {
-            // What a UTF-16 (or otherwise non-UTF-8) file produces. Raised by std's own
-            // UTF-8 validation rather than by the OS, so it is stable across platforms.
-            std::io::ErrorKind::InvalidData => "not UTF-8",
             std::io::ErrorKind::PermissionDenied => "permission denied",
             // `find_manifest` stat'd the file moments ago, so this is a genuine race.
             std::io::ErrorKind::NotFound => "disappeared during the scan",
@@ -645,7 +653,101 @@ fn read_manifest(path: &Path) -> Result<String, String> {
             _ => "read failed",
         }
         .to_string()
-    })
+    })?;
+
+    // "not UTF-8" now comes from `String::from_utf8` rather than from `io::ErrorKind::InvalidData`,
+    // and the reason that string was platform-stable is unchanged and now load-bearing rather than
+    // merely reassuring: the verdict is std's own UTF-8 validation over a buffer already in memory,
+    // never an errno the OS picked. The code branches on it to decide whether to try a decode.
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        // #43 stopped at reporting this. Reporting is the wrong end state: the agent learns the
+        // file is unusable at the one moment `overview` exists to tell it the project's name,
+        // version and dependencies without a tool call. So try to decode first (#65).
+        Err(not_utf8) => {
+            decode_utf16_with_bom(not_utf8.as_bytes()).ok_or_else(|| "not UTF-8".to_string())
+        }
+    }
+}
+
+/// Decode BOM-prefixed UTF-16 to a `String`, or `None` for anything else.
+///
+/// `String::from_utf16` is in std, so this costs no dependency — #43 estimated the decode as
+/// costing `encoding_rs` or a hand-rolled decoder and that was wrong, which is what reopened
+/// the trade-off as #65.
+///
+/// **BOM-driven only, and deliberately so.** A BOM makes the encoding and the byte order
+/// unambiguous. Without one, detection is a heuristic — and worse, UTF-16 LE holding ASCII is
+/// *valid UTF-8*, since NUL is a legal UTF-8 byte, so a BOM-less file never reaches this at all:
+/// `String::from_utf8` succeeds and hands NUL-interleaved text to the parser. `parse_go_mod`'s "no
+/// module directive" guard is what catches that, and `a_bomless_utf16_go_mod_reports_a_reason`
+/// pins it. The other three formats report their parser's reason — `malformed TOML` or
+/// `malformed JSON` — which is an encoding problem wearing a syntax error's clothes. Unchanged from
+/// before #65 and not closable from here: the file *is* valid UTF-8, so "not UTF-8" would be a
+/// false statement about it, and anything better needs either a new reason string or the heuristic
+/// detection this deliberately avoids. Worth its own issue rather than a guess made here.
+///
+/// The BOM is consumed rather than translated, so the returned text starts at the first real
+/// character. A *doubled* BOM therefore leaves one U+FEFF, which the TOML and JSON parsers strip
+/// for themselves and `parse_go_mod` handles with `trim_start_bom_aware` — the doubled-BOM handling
+/// the rest of the codebase settled on. Note that consuming it here versus leaving it to them is
+/// not observable through any parser, so it is tidiness rather than correctness.
+fn decode_utf16_with_bom(bytes: &[u8]) -> Option<String> {
+    let (rest, big_endian) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, false),
+        [0xFE, 0xFF, rest @ ..] => (rest, true),
+        _ => return None,
+    };
+    // An odd tail cannot be UTF-16, and `chunks_exact` would silently drop the stray byte.
+    if rest.len() % 2 != 0 {
+        return None;
+    }
+
+    // Both of these allocate infallibly — `Vec` and `String` grow through `handle_alloc_error`,
+    // which aborts, whereas `fs::read` reserves through `try_reserve_exact` and surfaces
+    // `OutOfMemory` as the "read failed" reason. So peak for an N-byte manifest is ~3.5N on this
+    // path (N still owned by the `FromUtf8Error`, N for the units, up to 1.5N for the `String`)
+    // against N before, and the top of that range aborts rather than reporting. Nothing caps
+    // manifest size anywhere — `find_manifest` gates on `Path::exists()` alone — so this is a
+    // pre-existing exposure that the decode multiplies rather than a new one, and it needs a cap
+    // chosen deliberately rather than invented here. Reachable only by a UTF-16 manifest sized
+    // near available memory.
+    let units: Vec<u16> = rest
+        .chunks_exact(2)
+        .map(|c| {
+            if big_endian {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    // `from_utf16`, not `from_utf16_lossy`: an unpaired surrogate means the guess was wrong, and
+    // a manifest silently studded with U+FFFD is the kind of confidently-wrong output the
+    // renderer's own comments warn is worse than a useless one.
+    let text = String::from_utf16(&units).ok()?;
+
+    // A NUL in the decoded text means these bytes were not UTF-16 text, whatever the BOM claimed.
+    // UTF-32 LE is the case that matters: it opens `FF FE 00 00`, whose first two bytes *are* the
+    // UTF-16 LE BOM, so it matches above and decodes — NUL is a valid code point — into NUL-riddled
+    // text that then fails the TOML/JSON parser. That turns "not UTF-8" into "malformed JSON",
+    // sending the reader after a syntax error that is really an encoding.
+    //
+    // Tested on the decoded text rather than by matching an `FF FE 00 00` prefix, which was the
+    // first version: the prefix only catches a *declared* UTF-32 LE file, while `FF FE` followed by
+    // a UTF-32-shaped payload with no UTF-32 BOM walks past it and produces the same wrong reason.
+    // No manifest format has a legitimate raw NUL — JSON writes one as a six-character escape — so
+    // rejecting all of them costs nothing real.
+    //
+    // **This covers the decode path only, which is less than the argument above might suggest.** A
+    // BOM-*less* UTF-16 file is valid UTF-8 and never arrives here, so it still reaches the parser
+    // and still reports `malformed TOML`/`malformed JSON`. See this function's doc comment for why
+    // that is left alone rather than closed by moving the test up to the `from_utf8` success arm:
+    // there the file really is UTF-8, and "not UTF-8" would be false.
+    if text.contains('\0') {
+        return None;
+    }
+    Some(text)
 }
 
 fn parse_cargo_toml(root: &Path) -> Result<ManifestInfo, String> {
@@ -1246,9 +1348,28 @@ mod tests {
         bytes
     }
 
+    fn utf16be_with_bom(body: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in body.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Bytes that are neither valid UTF-8 nor BOM-prefixed UTF-16, so `read_manifest` has no
+    /// decode to attempt and must still report `not UTF-8`.
+    ///
+    /// `0x80` is a UTF-8 continuation byte with nothing to continue, and the file does not open
+    /// with either UTF-16 BOM — both halves matter, since `FF FE` would now be *decoded*.
+    fn not_utf8_and_not_utf16(body: &str) -> Vec<u8> {
+        let mut bytes = vec![0x80];
+        bytes.extend_from_slice(body.as_bytes());
+        bytes
+    }
+
     /// A manifest that cannot be read must say so, not vanish.
     ///
-    /// `fs::read_to_string` requires valid UTF-8, so a UTF-16 manifest returned
+    /// `fs::read_to_string` requires valid UTF-8, so a non-UTF-8 manifest returned
     /// `Err(InvalidData)` and `.ok()?` discarded it — taking the entire manifest block out
     /// of the fingerprint injected at MCP initialize with no error anywhere (#43). Worse
     /// than the report captured: `hot`, `git` and `tests` were nested inside the
@@ -1258,6 +1379,10 @@ mod tests {
     /// Both halves are asserted. That the reason is visible is the fix; that the unrelated
     /// lines survive is what makes it better than "no manifest" rather than merely
     /// different from it.
+    ///
+    /// The fixture used to be UTF-16 LE, which #65 now decodes — so it would have stopped being
+    /// unusable and this test would have gone green while asserting nothing. It is now bytes with
+    /// no decode available, which is the case the reason string still exists for.
     #[test]
     fn an_unreadable_manifest_says_why_and_keeps_the_rest_of_the_block() {
         let body = "{\"name\":\"utf16-app\",\"version\":\"9.9.9\"}";
@@ -1280,7 +1405,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        build(dir.path(), &utf16le_with_bom(body));
+        build(dir.path(), &not_utf8_and_not_utf16(body));
         let out = fingerprint(dir.path());
 
         assert!(
@@ -1323,36 +1448,284 @@ mod tests {
         }
     }
 
-    /// Every manifest format must report the same reason for the same failure.
+    /// Every manifest format must **decode** a BOM'd UTF-16 file, in both byte orders (#65).
     ///
-    /// They share `read_manifest`, so this is cheap insurance rather than deep coverage —
-    /// but the issue names all four, and a parser reverting to `.ok()?` on its own would
-    /// otherwise be caught by nothing.
+    /// This test used to assert the opposite — that each of the four reported
+    /// `unusable: not UTF-8` — which was #43 taking the "fail visibly" option and leaving the
+    /// decode open. Reporting fixed the silence but still told the agent nothing about the
+    /// project at the one moment `overview` exists to say what it is called and what it depends
+    /// on. So the expectation inverts: name, version and dependency list, from the encoding
+    /// PowerShell 5.1 writes by default on several paths.
+    ///
+    /// All four formats, because they reach the decode through one `read_manifest` but each
+    /// parses independently — and both byte orders, because a decoder that ignores the BOM it
+    /// matched on passes LE and produces nothing but mojibake on BE.
+    ///
+    /// Fixtures write the UTF-16 bytes explicitly, per #35/#41: a `&str` literal cannot express
+    /// this, and a fixture that is secretly UTF-8 proves nothing.
     #[test]
-    fn every_manifest_format_reports_a_utf16_file() {
-        let cases: &[(&str, &str)] = &[
+    fn every_manifest_format_decodes_a_bommed_utf16_file() {
+        // `(manifest, body, expected substrings)`. A dependency is included per format so the
+        // decode is shown to survive the whole parse, not just the name line.
+        let cases: &[(&str, &str, &[&str])] = &[
             (
                 "Cargo.toml",
-                "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+                "[package]\nname = \"crate-c\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+                &["crate-c", "0.1.0", "serde"],
             ),
-            ("package.json", "{\"name\":\"p\",\"version\":\"0.1.0\"}"),
-            ("go.mod", "module example.com/g\n"),
+            (
+                "package.json",
+                "{\"name\":\"pkg-p\",\"version\":\"0.2.0\",\"dependencies\":{\"left-pad\":\"1.0.0\"}}",
+                &["pkg-p", "0.2.0", "left-pad"],
+            ),
+            (
+                "go.mod",
+                "module example.com/mod-g\n\nrequire (\n\tgithub.com/acme/widget v1.2.3\n)\n",
+                &["example.com/mod-g", "widget"],
+            ),
             (
                 "pyproject.toml",
-                "[project]\nname = \"y\"\nversion = \"0.1.0\"\n",
+                "[project]\nname = \"proj-y\"\nversion = \"0.3.0\"\ndependencies = [\"requests\"]\n",
+                &["proj-y", "0.3.0", "requests"],
             ),
         ];
 
-        for (manifest, body) in cases {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join(manifest), utf16le_with_bom(body)).unwrap();
-            std::fs::write(dir.path().join("main.go"), "package main\n").unwrap();
+        for (manifest, body, expected) in cases {
+            for (order, encode) in [
+                ("LE", utf16le_with_bom as fn(&str) -> Vec<u8>),
+                ("BE", utf16be_with_bom as fn(&str) -> Vec<u8>),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                std::fs::write(dir.path().join(manifest), encode(body)).unwrap();
+                std::fs::write(dir.path().join("main.go"), "package main\n").unwrap();
 
+                let out = fingerprint(dir.path());
+                assert!(
+                    !out.contains("unusable"),
+                    "{manifest} in UTF-16 {order} must decode, not report a reason:\n{out}"
+                );
+                for want in *expected {
+                    assert!(
+                        out.contains(want),
+                        "{manifest} in UTF-16 {order} lost `{want}` from the fingerprint:\n{out}"
+                    );
+                }
+            }
+
+            // The control, once per format rather than once per byte order — it does not depend on
+            // the order. The same body as UTF-8 must carry the same claims, so a failure above is
+            // about the encoding and not about a fixture the parser never liked. Equality of the
+            // rendered lines is asserted separately, by
+            // `a_utf16_manifest_renders_what_its_utf8_spelling_renders`.
+            let utf8_dir = tempfile::tempdir().unwrap();
+            std::fs::write(utf8_dir.path().join(manifest), body).unwrap();
+            std::fs::write(utf8_dir.path().join("main.go"), "package main\n").unwrap();
+            let utf8_out = fingerprint(utf8_dir.path());
+            for want in *expected {
+                assert!(
+                    utf8_out.contains(want),
+                    "fixture is broken: the UTF-8 spelling of {manifest} lacks `{want}`:\n\
+                     {utf8_out}"
+                );
+            }
+        }
+    }
+
+    /// The reasons #43 established must all survive the decode being added (#65).
+    ///
+    /// The decode sits on the `Err` arm of `read_manifest`'s `String::from_utf8`, so everything that
+    /// is *not* a UTF-8 validation failure has to reach its old reason untouched, and a validation
+    /// failure with no usable BOM has to keep reporting `not UTF-8` rather than falling through to a
+    /// parse error. Each row is a distinct way to fail, and the two UTF-32-shaped ones are the cases
+    /// a naive BOM match gets wrong.
+    #[test]
+    fn a_file_with_no_usable_utf16_bom_still_reports_not_utf8() {
+        let json = "{\"name\":\"n\",\"version\":\"1.0.0\"}";
+
+        // UTF-32 LE opens `FF FE 00 00`, whose first two bytes *are* the UTF-16 LE BOM. Decoding
+        // it as UTF-16 succeeds and yields NUL-riddled text, so without the NUL check in
+        // `decode_utf16_with_bom` this reports `malformed JSON` — a syntax error for what is
+        // really an encoding.
+        let mut utf32le = vec![0xFF, 0xFE, 0x00, 0x00];
+        for ch in json.chars() {
+            utf32le.extend_from_slice(&(ch as u32).to_le_bytes());
+        }
+
+        // The same payload shape with **no** UTF-32 BOM, so only the first character's high bytes
+        // supply the `00 00`. A guard matching the four-byte `FF FE 00 00` prefix — the first
+        // version of this — lets it through and reports `malformed JSON` again. Testing the decoded
+        // text for NUL catches both, which is why the check moved off the prefix.
+        let mut utf32le_bomless = vec![0xFF, 0xFE];
+        for ch in json.chars() {
+            utf32le_bomless.extend_from_slice(&(ch as u32).to_le_bytes());
+        }
+
+        // An odd byte count cannot be UTF-16; `chunks_exact` would drop the stray byte silently.
+        let mut odd_tail = utf16le_with_bom(json);
+        odd_tail.push(0x21);
+
+        // A BOM followed by an unpaired high surrogate: well-formed UTF-16 units, not valid
+        // UTF-16 text. `from_utf16_lossy` would accept this and hand the parser U+FFFD.
+        let unpaired_surrogate = vec![0xFF, 0xFE, 0x00, 0xD8, 0x21, 0x00];
+
+        // A perfectly well-formed UTF-16 document whose *content* holds a raw NUL. This is the one
+        // class where the two encodings deliberately disagree — as UTF-8 the same body reaches the
+        // parser and reports `malformed JSON` — and pinning it here is what keeps the NUL test from
+        // being "fixed" by moving it to the `from_utf8` success arm, where it would call a file that
+        // really is UTF-8 "not UTF-8". `a_utf16_manifest_renders_what_its_utf8_spelling_renders`
+        // names the same bound from the other side.
+        let nul_in_content = utf16le_with_bom("{\"name\":\"a\0b\",\"version\":\"1.0.0\"}");
+
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("a lone continuation byte", not_utf8_and_not_utf16(json)),
+            ("UTF-32 LE", utf32le),
+            ("a BOM-less UTF-32 LE payload", utf32le_bomless),
+            ("an odd trailing byte", odd_tail),
+            ("an unpaired surrogate", unpaired_surrogate),
+            ("a raw NUL in the content", nul_in_content),
+        ];
+
+        for (label, bytes) in cases {
+            assert!(
+                std::str::from_utf8(bytes).is_err(),
+                "{label}: fixture must not be valid UTF-8, or it never reaches the decode"
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("package.json"), bytes).unwrap();
             let out = fingerprint(dir.path());
             assert!(
-                out.contains(&format!("manifest: {manifest} — unusable: not UTF-8")),
-                "{manifest} in UTF-16 must report a reason:\n{out}"
+                out.contains("manifest: package.json — unusable: not UTF-8"),
+                "{label} must report `not UTF-8`, not a parse error or a decode:\n{out}"
             );
+        }
+    }
+
+    /// A decoded manifest must still be able to fail its *parser*, with the parser's own reason.
+    ///
+    /// The decode is additive: it turns bytes into text and hands them on. If it started
+    /// swallowing failures — returning the reason string for a decode problem where the content
+    /// is simply malformed — an agent would be told to re-save a file whose real problem is a
+    /// missing brace.
+    #[test]
+    fn a_decoded_utf16_manifest_still_reports_a_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            utf16le_with_bom("{\"name\": \"broken\","),
+        )
+        .unwrap();
+
+        let out = fingerprint(dir.path());
+        assert!(
+            out.contains("manifest: package.json — unusable: malformed JSON"),
+            "a decoded but malformed manifest must report the parse failure:\n{out}"
+        );
+    }
+
+    /// A doubled BOM must not survive the decode into the parsed values.
+    ///
+    /// `decode_utf16_with_bom` consumes the BOM it matched on, so a file written with two leaves
+    /// one U+FEFF at the start of the decoded text — the doubled-BOM shape #35/#41/#42/#51 kept
+    /// finding. Here it is `strip_bom` inside the parser that has to absorb it, so this asserts
+    /// the two mechanisms compose rather than each assuming the other ran.
+    ///
+    /// **`package.json`, not `Cargo.toml`, and the choice is the whole test.** `serde_json` rejects
+    /// any leading BOM, so `parse_package_json` genuinely depends on its `strip_bom` call. The
+    /// `toml` crate strips one itself — `strip_bom`'s own doc records that calling it there is "a
+    /// harmless no-op" — so a `Cargo.toml` fixture passes even with `strip_bom` deleted from the
+    /// parser, and tests nothing. Verified by mutation: it did.
+    #[test]
+    fn a_doubled_bom_utf16_manifest_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            utf16le_with_bom("\u{FEFF}{\"name\":\"doubled\",\"version\":\"4.5.6\"}"),
+        )
+        .unwrap();
+
+        let out = fingerprint(dir.path());
+        assert!(
+            out.contains("doubled") && out.contains("4.5.6"),
+            "a doubled BOM must be absorbed by the parser's own strip:\n{out}"
+        );
+    }
+
+    /// A decoded UTF-16 manifest must render exactly what the same NUL-free content renders in UTF-8.
+    ///
+    /// This is the property the change is really for, and the one an intuition about it gets
+    /// wrong. Review of this work read the empty and nameless cases as regressions, because
+    /// `FF FE` alone used to report `unusable: not UTF-8` and now reports a bare
+    /// `manifest: Cargo.toml`. But an *empty UTF-8* `Cargo.toml` has always reported that bare
+    /// line, and an empty UTF-8 `package.json` has always reported `malformed JSON` — measured on
+    /// the parent commit, not assumed. So the change makes the two spellings agree, and a special
+    /// case keeping UTF-16 on "not UTF-8" for an empty file would be both a new divergence and a
+    /// false statement about a file that decoded fine.
+    ///
+    /// Asserted as equality of the whole `manifest:` line rather than as a substring, so a decode
+    /// that mangles a value is caught as well as one that loses it. Rows are included whose UTF-8
+    /// rendering is itself a failure or a blank, since those are exactly where "agrees with UTF-8"
+    /// and "looks successful" come apart.
+    ///
+    /// **"NUL-free" in the name is a real bound, not hedging.** A body holding a raw NUL is the one
+    /// class where the two encodings legitimately diverge: as UTF-8 it reaches the parser and
+    /// reports `malformed TOML`/`malformed JSON`, while as UTF-16 `decode_utf16_with_bom` refuses it
+    /// and reports `not UTF-8`. That refusal is deliberate — see the NUL test there — and the
+    /// divergence class is exactly it, because the decode is otherwise byte-for-byte:
+    /// `String::from_utf16` cannot fail on `str::encode_utf16` output, and the leading-BOM match is
+    /// unambiguous in both orders even for a body that itself starts with U+FEFF. No manifest format
+    /// permits a raw NUL, so nothing real sits in the excluded class.
+    #[test]
+    fn a_utf16_manifest_renders_what_its_utf8_spelling_renders() {
+        let cases: &[(&str, &str)] = &[
+            // Ordinary success.
+            (
+                "Cargo.toml",
+                "[package]\nname = \"ordinary\"\nversion = \"1.0.0\"\n",
+            ),
+            // Valid TOML with no `[package]` — a workspace root. Renders a bare line in UTF-8 too;
+            // that it reads as "no name" is a pre-existing weakness of the manifest block, not
+            // something the decode introduced.
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\"]\n"),
+            // Empty, and comment-only: both parse as valid, nameless TOML.
+            ("Cargo.toml", ""),
+            ("Cargo.toml", "# nothing here\n"),
+            // Empty JSON is malformed JSON in either encoding.
+            ("package.json", ""),
+            // A `pyproject.toml` whose metadata lives in `setup.cfg`.
+            (
+                "pyproject.toml",
+                "[build-system]\nrequires = [\"setuptools\"]\n",
+            ),
+        ];
+
+        let manifest_line = |out: &str| {
+            out.lines()
+                .find(|l| l.trim_start().starts_with("manifest:"))
+                .unwrap_or("<no manifest line>")
+                .to_string()
+        };
+
+        for (manifest, body) in cases {
+            for (order, encode) in [
+                ("LE", utf16le_with_bom as fn(&str) -> Vec<u8>),
+                ("BE", utf16be_with_bom as fn(&str) -> Vec<u8>),
+            ] {
+                let utf16_dir = tempfile::tempdir().unwrap();
+                std::fs::write(utf16_dir.path().join(manifest), encode(body)).unwrap();
+                std::fs::write(utf16_dir.path().join("m.rs"), "fn main() {}\n").unwrap();
+
+                let utf8_dir = tempfile::tempdir().unwrap();
+                std::fs::write(utf8_dir.path().join(manifest), body).unwrap();
+                std::fs::write(utf8_dir.path().join("m.rs"), "fn main() {}\n").unwrap();
+
+                assert_eq!(
+                    manifest_line(&fingerprint(utf16_dir.path())),
+                    manifest_line(&fingerprint(utf8_dir.path())),
+                    "{manifest} in UTF-16 {order} must render what its NUL-free UTF-8 spelling \
+                     renders (body {body:?})"
+                );
+            }
         }
     }
 
@@ -1393,7 +1766,7 @@ mod tests {
     /// The reason must not depend on which errno the platform chose.
     ///
     /// `find_manifest` uses `Path::exists()`, which is true for directories, so a *directory*
-    /// named `package.json` reaches `read_manifest`. `read_to_string` reports that as
+    /// named `package.json` reaches `read_manifest`. `fs::read` reports that as
     /// `PermissionDenied` on Windows and `IsADirectory` on Linux — so deriving the reason
     /// from `ErrorKind` alone both diverged across platforms and told a Windows agent to go
     /// fix file modes for a problem that is "this is a directory". CI is Linux-only while
