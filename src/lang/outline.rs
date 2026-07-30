@@ -43,7 +43,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
 /// heading text is read as the raw inline node's text.
 ///
 /// Centralised so both `read::outline::markdown` and
-/// `search::symbol::find_defs_markdown_buf` configure the parser the same
+/// `search::symbol::stream_defs_markdown` configure the parser the same
 /// way.
 pub fn parse_markdown(content: &str) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();

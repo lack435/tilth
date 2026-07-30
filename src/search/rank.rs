@@ -123,10 +123,9 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
     // Sort indices, so the comparator reads scores by index and paths by reference.
     //
     // `(score, path, line)` alone is **not** a total order: two overload declarations on one
-    // line compare equal, and `dedupe_same_span_definitions` deliberately keeps both. That
-    // used to be covered by arrival order — a stable sort plus the "one contiguous block per
-    // file" invariant in `symbol.rs` meant ties could only ever be within a file, in a fixed
-    // within-file order.
+    // line compare equal, and `SameSpanDedupe` deliberately keeps both. That used to be covered
+    // by arrival order — a stable sort plus the "one contiguous block per file" invariant in
+    // `symbol.rs` meant ties could only ever be within a file, in a fixed within-file order.
     //
     // Relying on arrival order caps how the callers can collect. A bounded retention heap has
     // to be able to drop a match from the middle, which destroys contiguity, so symbol search
@@ -698,10 +697,10 @@ mod tests {
     /// contiguity, so the key had to stop relying on arrival order.
     ///
     /// The fixture is the case the old comment named as genuinely tied: two overload declarations
-    /// on one line, same path, same line, different `def_range` — which
-    /// `dedupe_same_span_definitions` deliberately keeps both of. Feeding them in both orders must
-    /// give the same output. Without the `def_range` tie-break this fails, because a stable sort
-    /// preserves whichever order it was handed.
+    /// on one line, same path, same line, different `def_range` — which `SameSpanDedupe`
+    /// deliberately keeps both of. Feeding them in both orders must give the same output. Without
+    /// the `def_range` tie-break this fails, because a stable sort preserves whichever order it
+    /// was handed.
     #[test]
     fn sort_is_order_independent_for_matches_tied_on_path_and_line() {
         let mk = |span: (u32, u32)| {
