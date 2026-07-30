@@ -78,54 +78,83 @@ use crate::types::Lang;
 
 /// Estimated tree bytes per line of source.
 ///
-/// The corpus maximum over files >= 10 KB was 1386 B/line (`callee_query.rs`, a file of long
-/// `match` arms); 1536 rounds that up for margin without inflating the mean over-estimate much
-/// beyond the measured 1.93x. See the module header for the full comparison against bytes and
-/// tokens, and for why over-estimating is the safe direction.
+/// This has to be an **upper bound**, not a typical value: the ceiling holds only where
+/// `estimate >= actual`. The densest files in this repository's own source, over files >= 10 KB:
 ///
-/// If this is ever raised, the ceiling admits proportionally fewer concurrent parses and searches
-/// over large-file trees get slower without getting more correct. If it is lowered below a
-/// grammar's real cost, the ceiling is exceeded by that ratio — bounded overshoot, not a wrong
-/// answer.
-const TREE_BYTES_PER_LINE: usize = 1536;
+/// ```text
+///   1675 B/line   src/mcp/tools/definitions.rs   (405 lines of JSON schema literals)
+///   1327 B/line   src/search/callee_query.rs
+///   1281 B/line   src/mcp/tools/write.rs
+///   1239 B/line   src/classify.rs
+///   1228 B/line   src/diff/format.rs
+/// ```
+///
+/// That is a *cluster*, not an outlier, so 2048 is set above the top of it rather than just above
+/// the single maximum. `calibrate_tree_bytes_per_line` asserts the bound and prints this list.
+///
+/// **It was 1536, which did not bound this repository.** The first calibration ran over a corpus
+/// gathered with a shell glob that silently did not recurse, so it saw `src/search/*.rs` and
+/// `src/*.rs` and never `src/mcp/tools/definitions.rs` — the densest file in the tree. The committed
+/// harness found that on its first real run. The lesson worth keeping is about corpora rather than
+/// constants: a predictor validated on a subtree is validated on whatever that subtree happens to
+/// contain, and the failure is silent in the unsafe direction.
+///
+/// Raising this admits proportionally fewer concurrent parses, so searches over large-file trees get
+/// slower without getting more correct — which is why the default ceiling is re-measured whenever it
+/// moves. Lowering it below a grammar's real cost exceeds the ceiling by that ratio: bounded
+/// overshoot, not a wrong answer.
+const TREE_BYTES_PER_LINE: usize = 2048;
 
 /// Default ceiling on concurrently-held tree bytes.
 ///
-/// 256 MB is chosen to be **inert at the default thread count and binding above it**, and that was
-/// measured rather than intended. Peak working set and wall time, five reps per cell, fixtures of 60
-/// files of 499 000 B:
+/// Chosen to be **inert at the default thread count and binding above it**, and re-measured whenever
+/// `TREE_BYTES_PER_LINE` moves — because the ceiling is denominated in *estimated* bytes, so a more
+/// conservative estimator makes the same ceiling bind sooner. Peak working set and wall, five reps
+/// per cell (three at 32 threads), fixtures of 60 files of 499 000 B:
 ///
 /// ```text
 ///                          before          after        wall before   wall after
-/// ordinary, default t   94.7-95.6 MB   94.6-95.1 MB    1.02-1.06 s   1.02-1.07 s
-/// ordinary, t=32         448-452  MB    193-197  MB    0.78-0.83 s   0.80-0.86 s
-/// dense, default t       221-222  MB    188-190  MB    2.74-3.41 s   2.99-3.49 s
-/// dense, t=32           1091-1092 MB    231-232  MB    2.43-2.62 s   3.04-3.22 s
-/// this repository       20.6-21.2 MB   20.4-22.0 MB    0.08-0.10 s   0.09    s
+/// ordinary, default t   94.7-95.2 MB   94.0-95.9 MB    1.04-1.07 s   1.05-1.22 s
+/// ordinary, t=32         445-452  MB    216-228  MB    0.79-0.82 s   0.80-0.82 s
+/// dense, default t       220-221  MB    220-222  MB    2.80-3.56 s   2.80-3.63 s
+/// dense, t=32           1091-1092 MB    264-265  MB    2.42-2.57 s   2.77-2.92 s
+/// this repository       20.6-21.2 MB   19.0-22.0 MB    0.08-0.10 s   0.07-0.11 s
 /// ```
 ///
-/// So: **inert** on ordinary use and on ordinary large files at the default — every figure inside
-/// the other's range — a **4.7x** reduction at 32 threads on the dense shape for ~24% wall, and
-/// **2.3x** at 32 threads on ordinary source for no wall cost. On the dense shape it binds slightly
-/// at the default too, taking ~33 MB off peak with overlapping wall ranges; that was not the intent
-/// of "inert" and it is a small win rather than a cost, but the word is doing less work than it
-/// looks.
+/// **4.1x** at 32 threads on the dense shape for ~15% wall, **2.0x** at 32 threads on ordinary source
+/// for none, and genuinely inert at the default — every default-thread cell inside the other's range,
+/// on ordinary *and* dense input.
+///
+/// That last property is what set the number, and it moved: at 256 MB with the corrected estimator
+/// the dense shape bound at the default too, costing ~30% wall (3.55-4.39 s against 2.80-3.56 s) to
+/// save 64 MB. Swept on the dense fixture to find where that stops:
+///
+/// ```text
+/// ceiling   default-t peak     default-t wall     t=32 peak    t=32 wall
+///   256    155.5-156.9 MB     3.55-4.39 s        199-200 MB   3.65-3.70 s
+///   320    187.5-189.4 MB     2.99-3.83 s        232    MB    3.05-3.22 s
+///   384    221.0-222.1 MB     3.18-3.60 s        264-265 MB   2.77-3.02 s
+///   512    220.0-220.4 MB     2.76-3.55 s        328-330 MB   2.51-2.55 s
+/// ```
+///
+/// 384 is the smallest that leaves the default-thread case alone. 512 buys ~10% more wall at 32
+/// threads for 64 MB more memory, which is the wrong side of the trade for a bound.
 ///
 /// Override with `TILTH_PARSE_BUDGET_MB`. Three cells say the knob is real rather than decorative,
 /// all on the dense fixture at 32 threads:
 ///
 /// ```text
-///   0 (disabled)   1091-1092 MB   2.45-2.64 s    reproduces the unbudgeted figures exactly
-///  64             101 -102  MB   9.33-9.40 s    tighter ceiling, cost is the serialisation
-///   1              101 -102  MB   9.29-9.42 s    a ceiling 48x smaller than one tree
+///   0 (disabled)   1090-1092 MB   2.50-2.74 s    reproduces the unbudgeted figures exactly
+///  64              101 -102  MB  10.36-10.47 s   tighter ceiling; the cost is the serialisation
+///   1              101 -102  MB  10.32-10.44 s   a ceiling 64x smaller than one file's estimate
 /// ```
 ///
-/// The `0` row is the control that says the mechanism is off when asked. The `1` row is the one
-/// worth reading twice: a single file's estimate is ~48 MB against a 1 MB ceiling, and the search
-/// still completes with identical output, because `reserve` always admits when nothing else is in
-/// flight. It degrades to serial parsing rather than hanging, and lands at the same peak as the 64 MB
-/// ceiling because one tree is the floor either way.
-const DEFAULT_BUDGET_MB: usize = 256;
+/// The `0` row is the control that says the mechanism is off when asked. The `1` row is the one worth
+/// reading twice: one file's estimate is ~64 MB against a 1 MB ceiling, and the search still
+/// completes with identical output, because `reserve` always admits when nothing else is in flight.
+/// It degrades to serial parsing rather than hanging, and lands at the same peak as the 64 MB ceiling
+/// because one tree is the floor either way.
+const DEFAULT_BUDGET_MB: usize = 384;
 
 /// Process-wide budget. One instance, because the thing being bounded is process peak RSS.
 ///
@@ -181,6 +210,17 @@ impl ParseBudget {
     /// a 29 MB tree is admitted against any ceiling. Bounding it harder would mean refusing to parse
     /// a file, which changes the answer — and admission must never do that, or which definitions a
     /// search finds would depend on scheduling, the class of defect #8 and #18 removed.
+    ///
+    /// **This makes #61 slightly worse, and that is the one cost not visible in the measurements.**
+    /// `timeout.rs` stops waiting on an expired request but does not cancel its worker, so the
+    /// worker keeps running with nothing consuming its result. A worker blocked here lives *longer*
+    /// than one that is not, because it now waits for space as well as for its own work — and an
+    /// abandoned request is one logical query, so its effective parallelism is low and it is
+    /// unusually likely to be the thread that waits. The trade is still right: an abandoned worker
+    /// holding a bounded amount of memory for longer beats eight of them holding an unbounded amount,
+    /// which is what #61 measures. But if #61 gains cooperative cancellation, the flag has to be
+    /// checked *here* as well as in the file callback, or a cancelled worker will sit in this wait
+    /// until unrelated work releases it.
     fn reserve(&self, estimate: usize) -> Permit<'_> {
         if self.ceiling == 0 {
             return Permit {
@@ -426,5 +466,270 @@ mod tests {
     #[test]
     fn an_empty_file_estimates_one_line() {
         assert_eq!(estimate_bytes(""), TREE_BYTES_PER_LINE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Calibration harness for TREE_BYTES_PER_LINE
+    // -----------------------------------------------------------------------
+
+    /// Counting hooks for tree-sitter's own allocator, so a tree's bytes can be measured exactly.
+    ///
+    /// tree-sitter is a C library and allocates through `malloc`, so a Rust `#[global_allocator]`
+    /// sees **none** of it — the first attempt at this measurement reported zero for every file.
+    /// `ts_set_allocator` is the only way to observe it.
+    ///
+    /// Each block carries a 16-byte header holding a magic tag and its size, which keeps the
+    /// returned pointer 16-aligned (C's `max_align_t`) and makes the swap safe to perform at any
+    /// point: a block allocated by the *default* malloc before the swap has no magic, and `ts_free`
+    /// leaks it rather than passing a fabricated layout to `dealloc`. Leaking in a `#[ignore]`d
+    /// measurement is free; the alternative is undefined behaviour, and it is a real risk because
+    /// the lib test binary parses trees in hundreds of other tests that may run first.
+    mod alloc_probe {
+        use std::alloc::{alloc, dealloc, Layout};
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        pub static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+        const HDR: usize = 16;
+        const MAGIC: usize = 0x7115_7401_7115_7401;
+
+        fn layout(total: usize) -> Layout {
+            Layout::from_size_align(total, HDR).expect("layout")
+        }
+
+        unsafe fn tagged_alloc(size: usize) -> *mut c_void {
+            let base = alloc(layout(size + HDR));
+            if base.is_null() {
+                return std::ptr::null_mut();
+            }
+            base.cast::<usize>().write(MAGIC);
+            base.add(8).cast::<usize>().write(size);
+            LIVE.fetch_add(size, Ordering::Relaxed);
+            base.add(HDR).cast()
+        }
+
+        /// `Some(size)` only for blocks this module allocated.
+        unsafe fn tagged_size(p: *mut c_void) -> Option<usize> {
+            let base = p.cast::<u8>().sub(HDR);
+            (base.cast::<usize>().read() == MAGIC).then(|| base.add(8).cast::<usize>().read())
+        }
+
+        unsafe fn tagged_free(p: *mut c_void) {
+            if p.is_null() {
+                return;
+            }
+            // Foreign block: leak rather than mis-free. See the module doc.
+            let Some(size) = tagged_size(p) else { return };
+            LIVE.fetch_sub(size, Ordering::Relaxed);
+            dealloc(p.cast::<u8>().sub(HDR), layout(size + HDR));
+        }
+
+        pub unsafe extern "C" fn ts_malloc(size: usize) -> *mut c_void {
+            tagged_alloc(size)
+        }
+
+        pub unsafe extern "C" fn ts_calloc(n: usize, size: usize) -> *mut c_void {
+            let total = n.saturating_mul(size);
+            let p = tagged_alloc(total);
+            if !p.is_null() {
+                std::ptr::write_bytes(p.cast::<u8>(), 0, total);
+            }
+            p
+        }
+
+        pub unsafe extern "C" fn ts_realloc(p: *mut c_void, size: usize) -> *mut c_void {
+            if p.is_null() {
+                return tagged_alloc(size);
+            }
+            let q = tagged_alloc(size);
+            if q.is_null() {
+                return q;
+            }
+            match tagged_size(p) {
+                Some(old) => {
+                    std::ptr::copy_nonoverlapping(p.cast::<u8>(), q.cast::<u8>(), old.min(size));
+                    tagged_free(p);
+                }
+                // Foreign source: its length is unknown, so copying any of it could read past the
+                // end. Zeroed is wrong but this path is unreachable in practice — tree-sitter does
+                // not realloc across an allocator swap — and it is memory-safe, which mis-copying
+                // would not be.
+                None => std::ptr::write_bytes(q.cast::<u8>(), 0, size),
+            }
+            q
+        }
+
+        pub unsafe extern "C" fn ts_free(p: *mut c_void) {
+            tagged_free(p);
+        }
+    }
+
+    /// Re-derive `TREE_BYTES_PER_LINE` from a real corpus, and fail if it is no longer an upper
+    /// bound.
+    ///
+    /// `#[ignore]`d and environment-driven, in the shape of `bloom`'s `#[40]` harness and for the
+    /// same reason: the question only has an answer over a corpus of real source, and no corpus
+    /// broad enough to calibrate a cross-grammar constant can live in this repository. Run it as:
+    ///
+    /// ```text
+    /// TILTH_CALIBRATION_ROOT=<a tree of real source> \
+    ///   cargo test --release calibrate_tree_bytes -- --ignored --exact \
+    ///   lang::parse_budget::tests::calibrate_tree_bytes_per_line --nocapture
+    /// ```
+    ///
+    /// It exists as a committed test rather than the throwaway crate that first produced these
+    /// numbers so that the constant can be re-derived — after a grammar upgrade, or when a new
+    /// language is added — and so the *shape* of the measurement is reviewable rather than asserted.
+    /// The table in the module header came from exactly this procedure over 95 files and four
+    /// grammars.
+    ///
+    /// **Run it alone.** `--exact` is not decoration: `LIVE` is process-wide, so a tree allocated by
+    /// another test running concurrently lands in the same counter and inflates whichever file
+    /// happens to be parsing.
+    ///
+    /// It asserts one thing — that `TREE_BYTES_PER_LINE` still bounds the corpus — because that is
+    /// the property the budget's correctness rests on. Everything else it prints.
+    #[test]
+    #[ignore = "needs a corpus in TILTH_CALIBRATION_ROOT; prints the predictor table and checks the constant still bounds it"]
+    fn calibrate_tree_bytes_per_line() {
+        let Ok(root) = std::env::var("TILTH_CALIBRATION_ROOT") else {
+            eprintln!("set TILTH_CALIBRATION_ROOT to a tree of real source; see this test's doc");
+            return;
+        };
+
+        // Smaller files cannot move a ceiling, and their trees are dominated by fixed per-parse
+        // overhead — a 500-byte file's tree is ~23 KB, which is 46 B/byte and pure noise for a
+        // constant meant to bound large ones. The module header's table uses the same floor.
+        const MIN_BYTES: usize = 10_000;
+
+        unsafe {
+            tree_sitter::set_allocator(
+                Some(alloc_probe::ts_malloc),
+                Some(alloc_probe::ts_calloc),
+                Some(alloc_probe::ts_realloc),
+                Some(alloc_probe::ts_free),
+            );
+        }
+
+        struct Row {
+            lang: crate::types::Lang,
+            live: usize,
+            bytes: usize,
+            lines: usize,
+            path: String,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+
+        for entry in ignore::WalkBuilder::new(&root).build().flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+                continue;
+            };
+            let Some(ts_lang) = crate::lang::outline::outline_language(lang) else {
+                continue;
+            };
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            if src.len() < MIN_BYTES {
+                continue;
+            }
+
+            let before = alloc_probe::LIVE.load(Ordering::Relaxed);
+            let Some(tree) = super::super::parse_masked(&src, Some(lang), &ts_lang) else {
+                continue;
+            };
+            let live = alloc_probe::LIVE
+                .load(Ordering::Relaxed)
+                .saturating_sub(before);
+            drop(tree);
+
+            rows.push(Row {
+                lang,
+                live,
+                bytes: src.len(),
+                lines: src.lines().count().max(1),
+                path: path.display().to_string(),
+            });
+        }
+
+        assert!(
+            rows.len() >= 8,
+            "only {} files >= {MIN_BYTES} B with a grammar under {root}; too few to calibrate a \
+             cross-grammar constant",
+            rows.len()
+        );
+
+        // Each predictor's corpus maximum is what a conservative constant has to clear; the mean
+        // over-estimate is what that costs in admitted parallelism. See the module header.
+        let report = |name: &str, of: &dyn Fn(&Row) -> usize| {
+            let ratios: Vec<f64> = rows
+                .iter()
+                .map(|r| r.live as f64 / of(r).max(1) as f64)
+                .collect();
+            let max = ratios.iter().copied().fold(f64::MIN, f64::max);
+            let min = ratios.iter().copied().fold(f64::MAX, f64::min);
+            let mean_over = ratios.iter().map(|x| max / x).sum::<f64>() / ratios.len() as f64;
+            println!(
+                "  {name:6} max={max:9.1} B  spread={:5.1}x  mean over-estimate={mean_over:5.2}x",
+                max / min
+            );
+            max
+        };
+
+        let mut langs: Vec<String> = rows.iter().map(|r| format!("{:?}", r.lang)).collect();
+        langs.sort_unstable();
+        langs.dedup();
+        println!(
+            "\n{} files >= {MIN_BYTES} B, grammars: {}",
+            rows.len(),
+            langs.join(", ")
+        );
+        report("byte", &|r: &Row| r.bytes);
+        let per_line = report("line", &|r: &Row| r.lines);
+        report("token", &|r: &Row| {
+            // The token proxy the module header compares against: each identifier run is one token,
+            // each other non-whitespace byte is one.
+            let mut n = 0usize;
+            let mut in_word = false;
+            for b in std::fs::read(&r.path).unwrap_or_default() {
+                let word = b.is_ascii_alphanumeric() || b == b'_';
+                if word && !in_word {
+                    n += 1;
+                } else if !word && !b.is_ascii_whitespace() {
+                    n += 1;
+                }
+                in_word = word;
+            }
+            n
+        });
+
+        // The densest few, not just the maximum: one outlier is a fixture question, a cluster is a
+        // property of the corpus, and the constant has to be set against the latter.
+        rows.sort_by(|a, b| {
+            (b.live as f64 / b.lines as f64).total_cmp(&(a.live as f64 / a.lines as f64))
+        });
+        println!("  densest per line:");
+        for r in rows.iter().take(5) {
+            println!(
+                "    {:6.0} B/line  {:5} lines  {}",
+                r.live as f64 / r.lines as f64,
+                r.lines,
+                r.path
+            );
+        }
+        let worst = &rows[0];
+
+        assert!(
+            per_line <= TREE_BYTES_PER_LINE as f64,
+            "TREE_BYTES_PER_LINE ({TREE_BYTES_PER_LINE}) no longer bounds this corpus: {} needs \
+             {per_line:.0} B/line. The budget under-charges by that ratio, so raise the constant \
+             (and re-measure the default ceiling, which was chosen against the old value).",
+            worst.path
+        );
     }
 }

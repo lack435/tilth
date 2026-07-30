@@ -352,15 +352,16 @@ opinionated defaults:
   ordinary 499 KB files, ~1.1 GB line-dense — and is now bounded by
   `lang::parse_budget` instead. See `util::worker_threads` for the
   measurements and #70.
-- **Parse memory**: `TILTH_PARSE_BUDGET_MB` (default 256) caps the
+- **Parse memory**: `TILTH_PARSE_BUDGET_MB` (default 384) caps the
   bytes of tree-sitter tree held concurrently, by reserving an
   estimate per file before parsing and waiting when it would not fit.
   Inert at the default thread count; at `TILTH_THREADS=32` it holds
-  peak to ~232 MB where it was ~1.1 GB, for ~24% wall on that shape.
+  peak to ~264 MB where it was ~1.1 GB, for ~15% wall on that shape.
   `0` disables it. Deadlock-free by construction: a file whose
   estimate exceeds the whole ceiling is still parsed, so a tiny
   ceiling degrades to serial parsing rather than hanging. See
-  `lang::parse_budget`.
+  `lang::parse_budget`, and `calibrate_tree_bytes_per_line` there to
+  re-derive the estimator constant.
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.

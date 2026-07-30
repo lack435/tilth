@@ -130,9 +130,15 @@
 //! defs-dense is 60 files whose every 14-byte line is a definition — 2 138 520 definitions, and the
 //! same number of usages, since each line both defines and mentions the symbol. It is the fixture
 //! where *both* walks are dense and run concurrently under `rayon::join`, which is why it improves
-//! most at 6 threads. Its rendered header reports 2 118 520 usages rather than 2 138 520; that
-//! 20 000 gap is exactly `MAX_RETAINED` and it is #60, not a fixture error — every usage collides
-//! with a definition, and the def/usage overlap can only be subtracted over *retained* usages.
+//! most at 6 threads. Because every usage shares a line with a definition, the def/usage dedup
+//! removes all of them and the rendered header is `2 138 520 matches (2 138 520 definitions, 0
+//! usages)`.
+//!
+//! It read `2 118 520 usages` when these measurements were taken, and this note used to explain the
+//! 20 000 shortfall — exactly `MAX_RETAINED` — as #60, whose overlap subtraction could only see
+//! *retained* usages. #71 fixed that by counting the overlap during the walk, so the shortfall is
+//! gone. Recorded rather than deleted because this fixture is the shape that made #60 maximal: if
+//! the count ever drifts from the definition count again, it is that mechanism regressing.
 //! spread is 25 000 two-line files, 50 000 matches, and is here to show the change costs nothing on
 //! the shape where there is no per-file term to remove.
 //!
