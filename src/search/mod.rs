@@ -2023,14 +2023,6 @@ mod tests {
         );
         assert_eq!(result.usages, usages, "usages must be the true count");
 
-        // The retained set really is bounded — otherwise the assertions above would pass for the
-        // trivial reason that nothing was dropped.
-        assert!(
-            result.matches.len() <= crate::search::retain::MAX_RETAINED,
-            "retention did not bound the set ({})",
-            result.matches.len()
-        );
-
         // Facets plus the unattributed remainder must account for every match. This is what keeps
         // the rendered header from contradicting its own body.
         let remainder =
@@ -2046,6 +2038,13 @@ mod tests {
             "facets ({facet_sum}) + remainder ({remainder}) != total_found ({})",
             result.total_found
         );
+        // This is also what establishes that retention clipped at all, without which every
+        // assertion above holds for the trivial reason that nothing was dropped. An earlier
+        // `assert!(result.matches.len() <= MAX_RETAINED)` claimed that job and could not do it:
+        // `assemble` truncates to the ten-match display cap before returning, so the value is
+        // always 10 against a bound of 20_000 — measured, not inferred. The remainder is non-zero
+        // only when the facets, counted over the retained set, cannot reach `total_found`, which is
+        // exactly the condition the claim needed.
         assert!(
             remainder > 0,
             "fixture did not clip, so the remainder path is untested"
