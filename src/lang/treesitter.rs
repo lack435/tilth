@@ -265,8 +265,28 @@ fn c_declarator_name_at(node: tree_sitter::Node, lines: &[&str], depth: usize) -
         return None;
     }
     match node.kind() {
+        // `primitive_type` is the odd one, and it is here rather than treated as a type
+        // reference because of *where* this walk can see it. tree-sitter-cpp carries a
+        // fixed set of builtin type spellings, so a typedef whose alias happens to be one
+        // of them — `typedef UINT8 uint8_t;`, `typedef INT64 int64_t;`, the compatibility
+        // shims every platform header stack has — parses its **declarator** as a
+        // `primitive_type` rather than a `type_identifier`:
+        //
+        // ```text
+        // type_definition
+        //   type_identifier "UINT8"     <- the underlying type
+        //   primitive_type  "uint8_t"   <- the declarator: the name being declared
+        // ```
+        //
+        // This function is only ever entered from a declarator position, and a declarator
+        // is by construction the thing being named, so accepting it here cannot turn a
+        // type *reference* into a name. Without it the walk answered `None` and the
+        // outline said `type <anonymous>` — while `extract_definition_name` resolved
+        // `uint8_t` correctly, because `primitive_type` is not in `C_DECLARATOR_KINDS` and
+        // its generic probe reads the declarator's raw text, which for a bare token is
+        // right. One symbol under two names depending on the caller (#68).
         "identifier" | "field_identifier" | "type_identifier" | "destructor_name"
-        | "operator_name" => {
+        | "operator_name" | "primitive_type" => {
             let text = node_text_simple(node, lines);
             (!text.is_empty()).then_some(text)
         }
@@ -470,11 +490,22 @@ fn inner_declarator(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
 
 /// True for kinds that can be the next link in a declarator chain — another
 /// declarator, or the name that ends one.
+///
+/// `primitive_type` ends one whenever a typedef's alias shadows a grammar builtin, for
+/// the reason spelled out in `c_declarator_name_at`. It matters here and not only there
+/// because the three kinds routed through this allowlist hide their inner declarator as
+/// an *unnamed* child: without the entry, `typedef UINT8& uint8_t;` dead-ended and the
+/// caller named it `"& uint8_t"` off the raw declarator text — the same wrong-name-rather-
+/// than-no-name failure 20c34f2 fixed for `"& /* alias */ Commented()"`.
 fn is_declarator_link(kind: &str) -> bool {
     C_DECLARATOR_KINDS.contains(&kind)
         || matches!(
             kind,
-            "identifier" | "field_identifier" | "type_identifier" | "destructor_name"
+            "identifier"
+                | "field_identifier"
+                | "type_identifier"
+                | "destructor_name"
+                | "primitive_type"
         )
 }
 
@@ -1678,6 +1709,68 @@ mod tests {
         assert_eq!(
             cpp_name("using Callback = void(*)(int);\n", "alias_declaration"),
             Some("Callback".to_string())
+        );
+    }
+
+    /// #68: tree-sitter-cpp carries a fixed set of builtin type spellings, so a typedef
+    /// whose *alias* is one of them parses its declarator as a `primitive_type` rather
+    /// than a `type_identifier`.
+    ///
+    /// Asserted as **parity between the two name paths**, because that — not the missing
+    /// name — was the defect. `extract_definition_name` already resolved `uint8_t`, via a
+    /// generic raw-text probe that happens to be right for a bare token, while the outline
+    /// walk answered `None` and rendered `type <anonymous>`. A test that only checked for
+    /// the absence of `<anonymous>` would pass again if the two paths drifted the other
+    /// way.
+    ///
+    /// `MyByte` and `wchar_t` are the controls: identical source shape, but the grammar
+    /// reads those declarators as `type_identifier`, so they worked before and must be
+    /// unchanged.
+    #[test]
+    fn typedef_alias_shadowing_a_builtin_resolves_by_both_paths() {
+        let cases: &[(&str, &str)] = &[
+            // The alias shadows a grammar builtin: declarator is a `primitive_type`.
+            ("typedef UINT8 uint8_t;", "uint8_t"),
+            ("typedef INT64 int64_t;", "int64_t"),
+            ("typedef uint_least16_t char16_t;", "char16_t"),
+            ("typedef SSIZE_T ssize_t;", "ssize_t"),
+            ("typedef int size_t;", "size_t"),
+            ("typedef unsigned char uint8_t;", "uint8_t"),
+            // Decorated spellings. The reference one is the reason `is_declarator_link`
+            // needed the kind too: `reference_declarator` hides its inner declarator as an
+            // unnamed child, so the walk dead-ended and the raw-text probe named the alias
+            // `"& uint8_t"` — a wrong name rather than no name.
+            ("typedef UINT8* uint8_t;", "uint8_t"),
+            ("typedef UINT8& uint8_t;", "uint8_t"),
+            ("typedef UINT8 uint8_t[4];", "uint8_t"),
+            ("typedef UINT8 /* c */ uint8_t;", "uint8_t"),
+            // Controls: the grammar reads these declarators as `type_identifier`.
+            ("typedef UINT8 MyByte;", "MyByte"),
+            ("typedef int wchar_t;", "wchar_t"),
+        ];
+        for (src, expected) in cases {
+            let owned = format!("{src}\n");
+            let tree = parse(&owned, Lang::Cpp);
+            let lines: Vec<&str> = owned.lines().collect();
+            let node = find_by_kind(tree.root_node(), "type_definition");
+            let declarator = node.child_by_field_name("declarator").expect("declarator");
+            assert_eq!(
+                c_declarator_name(declarator, &lines).as_deref(),
+                Some(*expected),
+                "the declarator walk failed on {src:?} (declarator kind {})",
+                declarator.kind()
+            );
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*expected),
+                "the two name paths disagree for {src:?}"
+            );
+        }
+        // `using` never consults the declarator walk — it has a `name` field — so it was
+        // always fine and must stay that way.
+        assert_eq!(
+            cpp_name("using uint8_t = UINT8;\n", "alias_declaration"),
+            Some("uint8_t".to_string())
         );
     }
 
