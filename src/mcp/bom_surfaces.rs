@@ -507,13 +507,16 @@ fn args_for(label: &str, root: &Path) -> Value {
         "files" => json!({"pattern": "*.rs", "scope": scope}),
         "diff:files" => json!({"a": p("before.rs"), "b": p("after.rs")}),
         "diff:patch" => json!({"patch": p("change.patch")}),
-        // `HEAD~1..HEAD` is exactly one commit. `HEAD~1` alone is not a range — git reads it as
-        // "every ancestor of HEAD~1", i.e. the whole repo history, and `diff_log` then shells a
-        // `git diff` and builds a tree-sitter overlay per commit: ~135s and climbing with history.
-        // The bounded range renders one commit's metadata (BOM-free) in milliseconds. No `scope`:
-        // it is a suffix filter against the ambient repo's paths, so the fixture path only ever
-        // filters every commit out — the same misuse the `diff:source=*` rows carried.
-        "diff:log" => json!({"log": "HEAD~1..HEAD"}),
+        // `-1` (= `--max-count=1`) is the one bounded, depth-agnostic spelling. It must be bounded:
+        // a bare `HEAD` enumerates every ancestor, and `diff_log` shells a `git diff` + tree-sitter
+        // overlay per commit — that was the whole-history 135s. But it must also reference no parent:
+        // CI checks out a shallow clone (`fetch-depth: 1`), where `HEAD~1..HEAD` fails with "unknown
+        // revision" because `HEAD~1` was never fetched. `git log -1` lists exactly the tip on a deep
+        // *or* shallow clone; the per-commit `hash^..hash` diff then finds no parent on a shallow tip
+        // and `run_git_diff` returns empty for it (no hard error), so the row renders the tip's
+        // metadata (BOM-free) either way. No `scope`: it is a suffix filter against the ambient repo's
+        // paths, so the fixture path only ever filters every commit out — the `diff:source=*` misuse.
+        "diff:log" => json!({"log": "-1"}),
         // No `scope`: for a git source, `scope` is a post-hoc file *filter*, not a sandbox — it never
         // redirects git away from the process cwd. Passing the fixture path as scope is wrong on every
         // platform: the git diff is taken against the tilth repo (cwd), so no overlay ever matches the
