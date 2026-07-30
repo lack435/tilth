@@ -281,11 +281,31 @@ fn assemble(
     // one short-string `is_match` per distinct definition line, and `Get` has 3864 of them in a
     // 39-second search. Report a build-to-build delta as a cost and you are tuning the linker.
     //
-    // Still true under clipping, and separate from the count: a usage sitting on a line whose
-    // definition was clipped away survives the dedup and is *displayed* as a usage on a line that
-    // is really a definition. Cosmetic, and not fixable from here — suppressing it needs the full
-    // definition-line set at dedup time, which is the unbounded set the retention bound exists to
-    // avoid holding. The number no longer inherits the error.
+    // Separate from the count, and narrower than an earlier version of this comment said: a usage
+    // sitting on a line whose definition was clipped away survives the dedup and is *displayed* as
+    // a usage on a line that is really a definition. That comment claimed it followed from clipping.
+    // It does not, and the reason is worth writing down because it is not obvious from here.
+    //
+    // The two sinks rank with the same scorer, and for a definition and the usage on its own line
+    // every path- and text-derived term is identical — `scope_proximity`, `query_intent_boost`,
+    // `exported_api_boost`, `basename_boost` and `non_code_penalty` are all computed the same for
+    // both. What differs is a *constant*: `def_weight * 10` plus `definition_name_boost`, which is
+    // 220 for every definition whose name is the query. `incidental_text_penalty` is usage-only but
+    // scores 0 on a definition's line, which is never a comment. So if that constant is the same
+    // across colliding lines, the two sinks order those lines identically and retain the same ones —
+    // a clipped definition's line is a clipped usage too, and the artifact cannot arise.
+    //
+    // It needs the constant to *vary*, which means colliding lines with different `def_weight`s —
+    // a doc heading at 30 or a variable-ish declaration at 40 against a primary definition at 60+ —
+    // arranged so a low-weight definition falls outside the definition sink's `MAX_RETAINED` while
+    // its co-located usage stays inside the usage sink's. Reachable in principle, and the definition
+    // walk has to clip first, which takes more than 20 000 definitions of one symbol name.
+    // **Not reproduced**: this is derived from `rank::score_inner`, not observed, and no fixture
+    // here exercises it.
+    //
+    // Left alone either way, because the fix is the expensive part rather than the diagnosis:
+    // suppressing it needs the full definition-line set at dedup time, which is the unbounded set
+    // the retention bound exists to avoid holding. The number no longer inherits the error.
     let overlap_in_retained = usages_before_dedup - usages_after_dedup;
     let overlap_exact = def_tally.usages_on_definition_lines;
     // Retained ⊆ offered, so an exact count can only be the larger of the two. A violation means
