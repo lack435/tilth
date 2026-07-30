@@ -79,81 +79,90 @@ use crate::types::Lang;
 /// Estimated tree bytes per line of source.
 ///
 /// This has to be an **upper bound**, not a typical value: the ceiling holds only where
-/// `estimate >= actual`. The densest files in this repository's own source, over files >= 10 KB:
+/// `estimate >= actual`. Measured with `examples/calibrate_parse_budget.rs`, which counts exact tree
+/// bytes through tree-sitter's own allocator. Across every corpus tried — this repository, a large
+/// external C++ tree, and deliberately adversarial shapes — the maximum is **92.5 B per source
+/// byte**, so 128 carries ~1.4x margin.
+///
+/// **Source bytes, and not lines, because only bytes are bounded.** Tree size tracks node count,
+/// node count is bounded by token count, and token count is bounded by bytes — so a per-byte
+/// estimate has a ceiling that holds by construction. Lines do not: nodes-per-line is
+/// bytes-per-line times nodes-per-byte, and bytes-per-line is unbounded.
 ///
 /// ```text
-///   1675 B/line   src/mcp/tools/definitions.rs   (405 lines of JSON schema literals)
-///   1327 B/line   src/search/callee_query.rs
-///   1281 B/line   src/mcp/tools/write.rs
-///   1239 B/line   src/classify.rs
-///   1228 B/line   src/diff/format.rs
+/// shape                                       B/line    B/byte
+/// this repository, densest (405 lines)           1675      22.5
+/// generated C++                                  1238      13.9
+/// ordinary C++ with long lines                   2997      27.3
+/// minified JS behind a license banner          470651      53.1
+/// one 90 KB line                              4578568      53.2
+/// Rust data-as-code, one huge array literal    397322      92.5
 /// ```
 ///
-/// That is a *cluster*, not an outlier, so 2048 is set above the top of it rather than just above
-/// the single maximum. `calibrate_tree_bytes_per_line` asserts the bound and prints this list.
+/// **A per-line estimator shipped first, and it bounded nothing.** 1536 B/line, then 2048 after a
+/// committed harness found a 1675 B/line file the original corpus had missed. Both were wrong by
+/// construction rather than by margin: review of that change measured 6143 B/line on an ordinary
+/// hand-written C++ file, and the shapes above reach 4.5 million. Worse than the under-charge, a
+/// minified bundle behind a preserved license banner — which passes the minified gate, because the
+/// banner puts newlines in the first 2 KB — estimated 92 KB against a real 21 MB tree, leaving the
+/// budget **entirely inert** on exactly the input it exists to bound: 765 MB against a 384 MB
+/// ceiling, indistinguishable from disabling it.
 ///
-/// **It was 1536, which did not bound this repository.** The first calibration ran over a corpus
-/// gathered with a shell glob that silently did not recurse, so it saw `src/search/*.rs` and
-/// `src/*.rs` and never `src/mcp/tools/definitions.rs` — the densest file in the tree. The committed
-/// harness found that on its first real run. The lesson worth keeping is about corpora rather than
-/// constants: a predictor validated on a subtree is validated on whatever that subtree happens to
-/// contain, and the failure is silent in the unsafe direction.
+/// The lesson is about the predictor rather than the constant, and it is the second time the corpus
+/// question bit: a predictor validated on a corpus is validated on whatever that corpus happened to
+/// contain, and both failures were silent and in the unsafe direction. `bytes` is the one candidate
+/// whose bound does not depend on the corpus at all.
 ///
 /// Raising this admits proportionally fewer concurrent parses, so searches over large-file trees get
-/// slower without getting more correct — which is why the default ceiling is re-measured whenever it
-/// moves. Lowering it below a grammar's real cost exceeds the ceiling by that ratio: bounded
-/// overshoot, not a wrong answer.
-const TREE_BYTES_PER_LINE: usize = 2048;
+/// slower without getting more correct — which is why the ceiling is re-derived whenever it moves.
+/// Lowering it below a grammar's real cost exceeds the ceiling by that ratio.
+const TREE_BYTES_PER_SOURCE_BYTE: usize = 128;
 
 /// Default ceiling on concurrently-held tree bytes.
 ///
-/// Chosen to be **inert at the default thread count and binding above it**, and re-measured whenever
-/// `TREE_BYTES_PER_LINE` moves — because the ceiling is denominated in *estimated* bytes, so a more
-/// conservative estimator makes the same ceiling bind sooner. Peak working set and wall, five reps
-/// per cell (three at 32 threads), fixtures of 60 files of 499 000 B:
+/// **Derived, not tuned.** It is the smallest multiple of 64 MiB that admits `worker_threads`'
+/// maximum of 6 worst-case parses at once: a parsing walk gates files at 500 000 B, so no file can
+/// estimate above `500_000 x 128 = 64 MB`, and `6 x 64 = 384`. That is what keeps it inert at the
+/// default thread count, and it means the value is coupled to **two** other constants — the thread
+/// clamp in `util::worker_threads` and the size gate in the walks.
+/// `the_worst_single_file_estimate_matches_the_ceiling_derivation` fails if either drifts.
+///
+/// Measured with the same binary throughout, `TILTH_PARSE_BUDGET_MB=0` as the unbudgeted reference so
+/// nothing but the mechanism differs. Seven reps at the default thread count, five at 32. Fixtures of
+/// 60 files: *ordinary* is real source at 39 B/line, *line-dense* is 16 B/line, *long-line* is a
+/// minified bundle behind a license banner (41 lines, 387 KB) — the shape the per-line estimator
+/// could not see at all.
 ///
 /// ```text
-///                          before          after        wall before   wall after
-/// ordinary, default t   94.7-95.2 MB   94.0-95.9 MB    1.04-1.07 s   1.05-1.22 s
-/// ordinary, t=32         445-452  MB    216-228  MB    0.79-0.82 s   0.80-0.82 s
-/// dense, default t       220-221  MB    220-222  MB    2.80-3.56 s   2.80-3.63 s
-/// dense, t=32           1091-1092 MB    264-265  MB    2.42-2.57 s   2.77-2.92 s
-/// this repository       20.6-21.2 MB   19.0-22.0 MB    0.08-0.10 s   0.07-0.11 s
+///                        unbudgeted       bounded      wall unbudg   wall bounded
+/// ordinary,   default   94.7-95.6 MB   94.5-95.1 MB   1.04-1.07 s   1.14-1.15 s
+/// ordinary,   t=32       442-451  MB    110-111  MB   0.90-0.93 s   1.17-1.20 s
+/// line-dense, default    220-222  MB    219-222  MB   2.74-3.56 s   3.04-4.13 s
+/// line-dense, t=32      1089-1093 MB    263-266  MB   2.72-2.78 s   3.16-3.32 s
+/// long-line,  default    266-268  MB    265-269  MB   2.83-2.89 s   2.82-2.89 s
+/// long-line,  t=32        707    MB     267-272  MB   2.28-2.35 s   2.63-2.70 s
+/// this repository       19.9-22.5 MB   19.9-22.5 MB   0.09-0.12 s   0.09-0.12 s
 /// ```
 ///
-/// **4.1x** at 32 threads on the dense shape for ~15% wall, **2.0x** at 32 threads on ordinary source
-/// for none, and genuinely inert at the default — every default-thread cell inside the other's range,
-/// on ordinary *and* dense input.
-///
-/// That last property is what set the number, and it moved: at 256 MB with the corrected estimator
-/// the dense shape bound at the default too, costing ~30% wall (3.55-4.39 s against 2.80-3.56 s) to
-/// save 64 MB. Swept on the dense fixture to find where that stops:
-///
-/// ```text
-/// ceiling   default-t peak     default-t wall     t=32 peak    t=32 wall
-///   256    155.5-156.9 MB     3.55-4.39 s        199-200 MB   3.65-3.70 s
-///   320    187.5-189.4 MB     2.99-3.83 s        232    MB    3.05-3.22 s
-///   384    221.0-222.1 MB     3.18-3.60 s        264-265 MB   2.77-3.02 s
-///   512    220.0-220.4 MB     2.76-3.55 s        328-330 MB   2.51-2.55 s
-/// ```
-///
-/// 384 is the smallest that leaves the default-thread case alone. 512 buys ~10% more wall at 32
-/// threads for 64 MB more memory, which is the wrong side of the trade for a bound.
+/// **4.0x / 4.1x / 2.6x** at 32 threads, for 29% / 18% / 15% wall. At the default thread count every
+/// bounded cell sits inside its unbudgeted range on all three shapes and on this repository — which
+/// is the property the value was derived for, and the property the previous 256 MB did *not* have:
+/// it bound the line-dense shape at the default, taking 33 MB off peak for wall it did not need to
+/// spend.
 ///
 /// Override with `TILTH_PARSE_BUDGET_MB`. Three cells say the knob is real rather than decorative,
-/// all on the dense fixture at 32 threads:
+/// all on the line-dense fixture at 32 threads:
 ///
 /// ```text
-///   0 (disabled)   1090-1092 MB   2.50-2.74 s    reproduces the unbudgeted figures exactly
-///  64              101 -102  MB  10.36-10.47 s   tighter ceiling; the cost is the serialisation
-///   1              101 -102  MB  10.32-10.44 s   a ceiling 64x smaller than one file's estimate
+///   0 (disabled)   1089-1093 MB   2.72-2.78 s   the reference row above
+///  64              101 -102  MB  10.36-10.47 s  tighter ceiling; the cost is the serialisation
+///   1              101 -102  MB  10.32-10.44 s  a ceiling 64x smaller than one file's estimate
 /// ```
 ///
-/// The `0` row is the control that says the mechanism is off when asked. The `1` row is the one worth
-/// reading twice: one file's estimate is ~64 MB against a 1 MB ceiling, and the search still
-/// completes with identical output, because `reserve` always admits when nothing else is in flight.
-/// It degrades to serial parsing rather than hanging, and lands at the same peak as the 64 MB ceiling
-/// because one tree is the floor either way.
+/// The `1` row is the one worth reading twice: one file's estimate is 64 MB against a 1 MB ceiling,
+/// and the search still completes with identical output, because `reserve` always admits when nothing
+/// else is in flight. It degrades to serial parsing rather than hanging, and lands at the same peak as
+/// the 64 MB ceiling because one tree is the floor either way.
 const DEFAULT_BUDGET_MB: usize = 384;
 
 /// Process-wide budget. One instance, because the thing being bounded is process peak RSS.
@@ -212,15 +221,24 @@ impl ParseBudget {
     /// search finds would depend on scheduling, the class of defect #8 and #18 removed.
     ///
     /// **This makes #61 slightly worse, and that is the one cost not visible in the measurements.**
-    /// `timeout.rs` stops waiting on an expired request but does not cancel its worker, so the
-    /// worker keeps running with nothing consuming its result. A worker blocked here lives *longer*
-    /// than one that is not, because it now waits for space as well as for its own work — and an
-    /// abandoned request is one logical query, so its effective parallelism is low and it is
-    /// unusually likely to be the thread that waits. The trade is still right: an abandoned worker
-    /// holding a bounded amount of memory for longer beats eight of them holding an unbounded amount,
-    /// which is what #61 measures. But if #61 gains cooperative cancellation, the flag has to be
-    /// checked *here* as well as in the file callback, or a cancelled worker will sit in this wait
-    /// until unrelated work releases it.
+    /// `timeout.rs` stops waiting on an expired request but does not cancel its worker, so the worker
+    /// keeps running with nothing consuming its result. A worker parked here lives *longer* than one
+    /// that is not, because it now waits for space as well as for its own work.
+    ///
+    /// The reason it can be parked is worth stating precisely, because the obvious one is wrong: it is
+    /// not that an abandoned request has low parallelism. Low self-parallelism means *less* pressure
+    /// from itself, and a lone abandoned query never waits at all — `in_flight` reaches zero and the
+    /// guard below admits it unconditionally, and the default ceiling is sized to admit all of one
+    /// request's threads at once anyway. It waits only when *other, live* requests fill the budget.
+    /// So the shape is: live work can park abandoned work, and there is no priority between them.
+    ///
+    /// The trade is still right — an abandoned worker holding a bounded amount of memory for longer
+    /// beats eight of them holding an unbounded amount, which is what #61 estimates. But if #61 gains
+    /// cooperative cancellation, checking a flag *here* is necessary and not sufficient: a thread
+    /// inside `Condvar::wait` cannot notice a flag until something wakes it, so the canceller has to
+    /// `notify_all` or this wait has to become `wait_timeout`. The wait is already bounded — a waiter
+    /// exists only while someone holds a permit, and every permit is released by `Permit::drop`,
+    /// including on panic — so this is about latency, not liveness.
     fn reserve(&self, estimate: usize) -> Permit<'_> {
         if self.ceiling == 0 {
             return Permit {
@@ -309,15 +327,16 @@ fn global() -> &'static ParseBudget {
     BUDGET.get_or_init(ParseBudget::from_env)
 }
 
-/// Estimated tree bytes for `content`, from its line count.
+/// Estimated tree bytes for `content`.
 ///
-/// `memchr` rather than `content.lines().count()`: this runs once per parsed file on the walk's hot
-/// path, and counting newlines is the SIMD-friendly half of what `lines()` does. The `+ 1` treats a
-/// file with no trailing newline as having a final line, and keeps a one-line file from estimating
-/// zero.
+/// Free: the length is already known, so unlike the line-counting estimator this replaced there is
+/// no scan of the file at all on the walk's hot path. `max(1)` keeps an empty file from reserving
+/// zero and slipping the accounting.
 fn estimate_bytes(content: &str) -> usize {
-    let lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
-    lines.saturating_mul(TREE_BYTES_PER_LINE)
+    content
+        .len()
+        .max(1)
+        .saturating_mul(TREE_BYTES_PER_SOURCE_BYTE)
 }
 
 /// `lang::parse_masked`, holding a budget reservation for the tree's lifetime.
@@ -444,292 +463,48 @@ mod tests {
         assert_eq!(b.in_flight(), 0);
     }
 
-    /// The estimate is a function of line count, not of bytes.
+    /// The estimate is a function of length, and of nothing else.
     ///
-    /// Two files of the same length and very different line counts must not estimate the same, which
-    /// is the entire reason the predictor is lines — see the module header's measured comparison.
+    /// The predictor this replaced was per *line*, which two files of the same length and different
+    /// line counts estimated differently — and that is exactly how it came to under-charge a
+    /// one-line 90 KB file by four orders of magnitude. Same length must now mean same estimate,
+    /// whatever the shape.
     #[test]
-    fn the_estimate_tracks_lines_not_bytes() {
-        let dense = "a\n".repeat(500); // 1000 bytes, 500 lines
-        let sparse = format!("{}\n", "a".repeat(998)); // 999 bytes, 1 line
-        assert_eq!(dense.len(), 1000);
-        assert_eq!(sparse.len(), 999);
-        assert_eq!(estimate_bytes(&dense), 501 * TREE_BYTES_PER_LINE);
-        assert_eq!(estimate_bytes(&sparse), 2 * TREE_BYTES_PER_LINE);
+    fn the_estimate_tracks_length_and_not_shape() {
+        let dense = "a
+"
+        .repeat(500); // 1000 bytes, 500 lines
+        let one_line = "a".repeat(1000); // 1000 bytes, 1 line
+        assert_eq!(dense.len(), one_line.len());
+        assert_eq!(
+            estimate_bytes(&dense),
+            estimate_bytes(&one_line),
+            "estimate still depends on line structure, so a long-line file under-charges"
+        );
+        assert_eq!(estimate_bytes(&dense), 1000 * TREE_BYTES_PER_SOURCE_BYTE);
+    }
+
+    /// The worst single-file estimate is what the ceiling is derived from, so pin the arithmetic.
+    ///
+    /// `MAX_SEARCH_FILE_SIZE` (500 000) gates every parsing walk, so no file can estimate above
+    /// this — which is what makes `DEFAULT_BUDGET_MB` a function of the thread ceiling rather than
+    /// of the corpus. If either constant moves, this fails and the ceiling has to be re-derived.
+    #[test]
+    fn the_worst_single_file_estimate_matches_the_ceiling_derivation() {
+        let worst = 500_000 * TREE_BYTES_PER_SOURCE_BYTE;
+        assert_eq!(worst, 64_000_000, "worst per-file estimate moved");
+        // `util::worker_threads` clamps to at most 6, and the default ceiling is the smallest
+        // multiple of 64 MiB that admits that many worst-case files at once.
+        let needed = 6 * worst;
         assert!(
-            estimate_bytes(&dense) > 100 * estimate_bytes(&sparse),
-            "estimator is not discriminating on line count"
+            DEFAULT_BUDGET_MB * 1024 * 1024 >= needed,
+            "the default ceiling ({DEFAULT_BUDGET_MB} MB) no longer admits 6 worst-case parses              ({needed} B), so it will bind at the default thread count"
         );
     }
 
-    /// An empty file still estimates one line, so nothing reserves zero and slips the accounting.
+    /// An empty file still reserves something, so nothing slips the accounting at zero.
     #[test]
-    fn an_empty_file_estimates_one_line() {
-        assert_eq!(estimate_bytes(""), TREE_BYTES_PER_LINE);
-    }
-
-    // -----------------------------------------------------------------------
-    // Calibration harness for TREE_BYTES_PER_LINE
-    // -----------------------------------------------------------------------
-
-    /// Counting hooks for tree-sitter's own allocator, so a tree's bytes can be measured exactly.
-    ///
-    /// tree-sitter is a C library and allocates through `malloc`, so a Rust `#[global_allocator]`
-    /// sees **none** of it — the first attempt at this measurement reported zero for every file.
-    /// `ts_set_allocator` is the only way to observe it.
-    ///
-    /// Each block carries a 16-byte header holding a magic tag and its size, which keeps the
-    /// returned pointer 16-aligned (C's `max_align_t`) and makes the swap safe to perform at any
-    /// point: a block allocated by the *default* malloc before the swap has no magic, and `ts_free`
-    /// leaks it rather than passing a fabricated layout to `dealloc`. Leaking in a `#[ignore]`d
-    /// measurement is free; the alternative is undefined behaviour, and it is a real risk because
-    /// the lib test binary parses trees in hundreds of other tests that may run first.
-    mod alloc_probe {
-        use std::alloc::{alloc, dealloc, Layout};
-        use std::ffi::c_void;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        pub static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-        const HDR: usize = 16;
-        const MAGIC: usize = 0x7115_7401_7115_7401;
-
-        fn layout(total: usize) -> Layout {
-            Layout::from_size_align(total, HDR).expect("layout")
-        }
-
-        unsafe fn tagged_alloc(size: usize) -> *mut c_void {
-            let base = alloc(layout(size + HDR));
-            if base.is_null() {
-                return std::ptr::null_mut();
-            }
-            base.cast::<usize>().write(MAGIC);
-            base.add(8).cast::<usize>().write(size);
-            LIVE.fetch_add(size, Ordering::Relaxed);
-            base.add(HDR).cast()
-        }
-
-        /// `Some(size)` only for blocks this module allocated.
-        unsafe fn tagged_size(p: *mut c_void) -> Option<usize> {
-            let base = p.cast::<u8>().sub(HDR);
-            (base.cast::<usize>().read() == MAGIC).then(|| base.add(8).cast::<usize>().read())
-        }
-
-        unsafe fn tagged_free(p: *mut c_void) {
-            if p.is_null() {
-                return;
-            }
-            // Foreign block: leak rather than mis-free. See the module doc.
-            let Some(size) = tagged_size(p) else { return };
-            LIVE.fetch_sub(size, Ordering::Relaxed);
-            dealloc(p.cast::<u8>().sub(HDR), layout(size + HDR));
-        }
-
-        pub unsafe extern "C" fn ts_malloc(size: usize) -> *mut c_void {
-            tagged_alloc(size)
-        }
-
-        pub unsafe extern "C" fn ts_calloc(n: usize, size: usize) -> *mut c_void {
-            let total = n.saturating_mul(size);
-            let p = tagged_alloc(total);
-            if !p.is_null() {
-                std::ptr::write_bytes(p.cast::<u8>(), 0, total);
-            }
-            p
-        }
-
-        pub unsafe extern "C" fn ts_realloc(p: *mut c_void, size: usize) -> *mut c_void {
-            if p.is_null() {
-                return tagged_alloc(size);
-            }
-            let q = tagged_alloc(size);
-            if q.is_null() {
-                return q;
-            }
-            match tagged_size(p) {
-                Some(old) => {
-                    std::ptr::copy_nonoverlapping(p.cast::<u8>(), q.cast::<u8>(), old.min(size));
-                    tagged_free(p);
-                }
-                // Foreign source: its length is unknown, so copying any of it could read past the
-                // end. Zeroed is wrong but this path is unreachable in practice — tree-sitter does
-                // not realloc across an allocator swap — and it is memory-safe, which mis-copying
-                // would not be.
-                None => std::ptr::write_bytes(q.cast::<u8>(), 0, size),
-            }
-            q
-        }
-
-        pub unsafe extern "C" fn ts_free(p: *mut c_void) {
-            tagged_free(p);
-        }
-    }
-
-    /// Re-derive `TREE_BYTES_PER_LINE` from a real corpus, and fail if it is no longer an upper
-    /// bound.
-    ///
-    /// `#[ignore]`d and environment-driven, in the shape of `bloom`'s `#[40]` harness and for the
-    /// same reason: the question only has an answer over a corpus of real source, and no corpus
-    /// broad enough to calibrate a cross-grammar constant can live in this repository. Run it as:
-    ///
-    /// ```text
-    /// TILTH_CALIBRATION_ROOT=<a tree of real source> \
-    ///   cargo test --release calibrate_tree_bytes -- --ignored --exact \
-    ///   lang::parse_budget::tests::calibrate_tree_bytes_per_line --nocapture
-    /// ```
-    ///
-    /// It exists as a committed test rather than the throwaway crate that first produced these
-    /// numbers so that the constant can be re-derived — after a grammar upgrade, or when a new
-    /// language is added — and so the *shape* of the measurement is reviewable rather than asserted.
-    /// The table in the module header came from exactly this procedure over 95 files and four
-    /// grammars.
-    ///
-    /// **Run it alone.** `--exact` is not decoration: `LIVE` is process-wide, so a tree allocated by
-    /// another test running concurrently lands in the same counter and inflates whichever file
-    /// happens to be parsing.
-    ///
-    /// It asserts one thing — that `TREE_BYTES_PER_LINE` still bounds the corpus — because that is
-    /// the property the budget's correctness rests on. Everything else it prints.
-    #[test]
-    #[ignore = "needs a corpus in TILTH_CALIBRATION_ROOT; prints the predictor table and checks the constant still bounds it"]
-    fn calibrate_tree_bytes_per_line() {
-        let Ok(root) = std::env::var("TILTH_CALIBRATION_ROOT") else {
-            eprintln!("set TILTH_CALIBRATION_ROOT to a tree of real source; see this test's doc");
-            return;
-        };
-
-        // Smaller files cannot move a ceiling, and their trees are dominated by fixed per-parse
-        // overhead — a 500-byte file's tree is ~23 KB, which is 46 B/byte and pure noise for a
-        // constant meant to bound large ones. The module header's table uses the same floor.
-        const MIN_BYTES: usize = 10_000;
-
-        unsafe {
-            tree_sitter::set_allocator(
-                Some(alloc_probe::ts_malloc),
-                Some(alloc_probe::ts_calloc),
-                Some(alloc_probe::ts_realloc),
-                Some(alloc_probe::ts_free),
-            );
-        }
-
-        struct Row {
-            lang: crate::types::Lang,
-            live: usize,
-            bytes: usize,
-            lines: usize,
-            path: String,
-        }
-        let mut rows: Vec<Row> = Vec::new();
-
-        for entry in ignore::WalkBuilder::new(&root).build().flatten() {
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
-                continue;
-            };
-            let Some(ts_lang) = crate::lang::outline::outline_language(lang) else {
-                continue;
-            };
-            let Ok(src) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            if src.len() < MIN_BYTES {
-                continue;
-            }
-
-            let before = alloc_probe::LIVE.load(Ordering::Relaxed);
-            let Some(tree) = super::super::parse_masked(&src, Some(lang), &ts_lang) else {
-                continue;
-            };
-            let live = alloc_probe::LIVE
-                .load(Ordering::Relaxed)
-                .saturating_sub(before);
-            drop(tree);
-
-            rows.push(Row {
-                lang,
-                live,
-                bytes: src.len(),
-                lines: src.lines().count().max(1),
-                path: path.display().to_string(),
-            });
-        }
-
-        assert!(
-            rows.len() >= 8,
-            "only {} files >= {MIN_BYTES} B with a grammar under {root}; too few to calibrate a \
-             cross-grammar constant",
-            rows.len()
-        );
-
-        // Each predictor's corpus maximum is what a conservative constant has to clear; the mean
-        // over-estimate is what that costs in admitted parallelism. See the module header.
-        let report = |name: &str, of: &dyn Fn(&Row) -> usize| {
-            let ratios: Vec<f64> = rows
-                .iter()
-                .map(|r| r.live as f64 / of(r).max(1) as f64)
-                .collect();
-            let max = ratios.iter().copied().fold(f64::MIN, f64::max);
-            let min = ratios.iter().copied().fold(f64::MAX, f64::min);
-            let mean_over = ratios.iter().map(|x| max / x).sum::<f64>() / ratios.len() as f64;
-            println!(
-                "  {name:6} max={max:9.1} B  spread={:5.1}x  mean over-estimate={mean_over:5.2}x",
-                max / min
-            );
-            max
-        };
-
-        let mut langs: Vec<String> = rows.iter().map(|r| format!("{:?}", r.lang)).collect();
-        langs.sort_unstable();
-        langs.dedup();
-        println!(
-            "\n{} files >= {MIN_BYTES} B, grammars: {}",
-            rows.len(),
-            langs.join(", ")
-        );
-        report("byte", &|r: &Row| r.bytes);
-        let per_line = report("line", &|r: &Row| r.lines);
-        report("token", &|r: &Row| {
-            // The token proxy the module header compares against: each identifier run is one token,
-            // each other non-whitespace byte is one.
-            let mut n = 0usize;
-            let mut in_word = false;
-            for b in std::fs::read(&r.path).unwrap_or_default() {
-                let word = b.is_ascii_alphanumeric() || b == b'_';
-                if word && !in_word {
-                    n += 1;
-                } else if !word && !b.is_ascii_whitespace() {
-                    n += 1;
-                }
-                in_word = word;
-            }
-            n
-        });
-
-        // The densest few, not just the maximum: one outlier is a fixture question, a cluster is a
-        // property of the corpus, and the constant has to be set against the latter.
-        rows.sort_by(|a, b| {
-            (b.live as f64 / b.lines as f64).total_cmp(&(a.live as f64 / a.lines as f64))
-        });
-        println!("  densest per line:");
-        for r in rows.iter().take(5) {
-            println!(
-                "    {:6.0} B/line  {:5} lines  {}",
-                r.live as f64 / r.lines as f64,
-                r.lines,
-                r.path
-            );
-        }
-        let worst = &rows[0];
-
-        assert!(
-            per_line <= TREE_BYTES_PER_LINE as f64,
-            "TREE_BYTES_PER_LINE ({TREE_BYTES_PER_LINE}) no longer bounds this corpus: {} needs \
-             {per_line:.0} B/line. The budget under-charges by that ratio, so raise the constant \
-             (and re-measure the default ceiling, which was chosen against the old value).",
-            worst.path
-        );
+    fn an_empty_file_still_reserves() {
+        assert_eq!(estimate_bytes(""), TREE_BYTES_PER_SOURCE_BYTE);
     }
 }

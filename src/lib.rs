@@ -60,6 +60,46 @@ pub mod __fuzz {
     }
 }
 
+/// Re-exports for `examples/calibrate_parse_budget.rs`. Not stable; do not depend on this.
+///
+/// Same convention and same reason as `__fuzz` above: the calibration example is a separate crate,
+/// and these three items are `pub(crate)` everywhere else. It composes the *real* detection and parse
+/// functions rather than carrying its own extension table, so the corpus it calibrates over cannot
+/// drift from the files a search actually parses — which matters, because a predictor is only ever
+/// validated on whatever its corpus happened to contain.
+#[doc(hidden)]
+pub mod __calibration {
+    use std::path::Path;
+
+    pub use crate::types::Lang;
+
+    /// The grammar a parsing walk would use for `path`, or `None` if it would not parse it.
+    #[must_use]
+    pub fn grammar_for(path: &Path) -> Option<Lang> {
+        match crate::lang::detect_file_type(path) {
+            crate::types::FileType::Code(lang) => Some(lang),
+            _ => None,
+        }
+    }
+
+    /// Wrapper: `outline_language` lives behind a `pub(crate)` module.
+    #[must_use]
+    pub fn language_of(lang: Lang) -> Option<tree_sitter::Language> {
+        crate::lang::outline::outline_language(lang)
+    }
+
+    /// Wrapper: the parse every walk performs, masking included, so the measurement is of the tree
+    /// production code actually builds.
+    #[must_use]
+    pub fn parse(
+        content: &str,
+        lang: Lang,
+        ts_lang: &tree_sitter::Language,
+    ) -> Option<tree_sitter::Tree> {
+        crate::lang::parse_masked(content, Some(lang), ts_lang)
+    }
+}
+
 use std::path::Path;
 
 use cache::OutlineCache;
