@@ -692,6 +692,113 @@ fn assemble(parts: &[&str]) -> String {
 }
 
 #[cfg(test)]
+mod bom_blast_radius_tests {
+    use super::analyze_deps;
+    use std::path::Path;
+
+    /// `n` BOMs prepended, built from their bytes per the #35/#41 convention.
+    fn write_with_boms(path: &Path, n: usize, body: &str) {
+        let mut v = Vec::new();
+        for _ in 0..n {
+            v.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        }
+        v.extend_from_slice(body.as_bytes());
+        std::fs::write(path, v).unwrap();
+    }
+
+    /// The whole result, with absolute paths reduced to file names so two tempdirs compare.
+    fn describe(root: &Path, target: &str) -> String {
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let r = analyze_deps(&root.join(target), root, &bloom).unwrap();
+        let names = |ps: Vec<String>| {
+            let mut v: Vec<String> = ps;
+            v.sort();
+            v.join(",")
+        };
+        format!(
+            "exported={} searched={} total_dependents={} used_by=[{}] uses_local=[{}] uses_external=[{}]",
+            r.exported_count,
+            r.searched_count,
+            r.total_dependents,
+            names(
+                r.used_by
+                    .iter()
+                    .map(|d| d.path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                    .collect()
+            ),
+            names(
+                r.uses_local
+                    .iter()
+                    .map(|d| d.path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                    .collect()
+            ),
+            names(r.uses_external.clone()),
+        )
+    }
+
+    /// #88: `tilth_deps` on a BOM'd file must report the same blast radius as its BOM-free twin.
+    ///
+    /// The end-to-end half of the `get_outline_entries` strip. Phase 1 extracts the target's
+    /// exported symbols through that call; Phase 3 then searches the tree for *those names* to
+    /// find dependents. So a symbol lost or renamed in Phase 1 is not merely missing from a
+    /// listing — it silently removes a real dependent from the reverse search, and the output
+    /// says `0 dependents` rather than admitting it never looked.
+    ///
+    /// Both languages the grammar survey found, because they fail differently and only one of
+    /// them looks like a failure:
+    ///
+    ///   * **Kotlin** loses the definition, so `exported_count` drops to 0 and Phase 3 searches
+    ///     for nothing.
+    ///   * **Bash** keeps a definition named `\u{feff}line_one`, so `exported_count` is
+    ///     *unchanged* and the search runs — against a name no caller spells. The count looks
+    ///     healthy and the dependent list is empty, which is the worse of the two to debug.
+    ///
+    /// Doubled, because a single BOM never reached this: every code grammar skips one on its own.
+    /// See `lang::outline::get_outline_entries` for the measurement across all nineteen `Lang`s.
+    #[test]
+    fn a_bom_does_not_shrink_the_reported_blast_radius() {
+        // (target, dependent, target body, dependent body)
+        let cases: &[(&str, &str, &str, &str)] = &[
+            (
+                "lib.kt",
+                "consumer.kt",
+                "fun exported_on_line_one(): Int { return 1 }\n",
+                "fun use_it(): Int { return exported_on_line_one() }\n",
+            ),
+            (
+                "lib.sh",
+                "consumer.sh",
+                "exported_on_line_one() {\n  echo 1\n}\n",
+                "source ./lib.sh\nuse_it() {\n  exported_on_line_one\n}\n",
+            ),
+        ];
+
+        for (target, dependent, target_body, dependent_body) in cases {
+            let bommed = tempfile::tempdir().unwrap();
+            let plain = tempfile::tempdir().unwrap();
+            for (dir, n) in [(bommed.path(), 2), (plain.path(), 0)] {
+                write_with_boms(&dir.join(target), n, target_body);
+                std::fs::write(dir.join(dependent), dependent_body).unwrap();
+            }
+
+            let without = describe(plain.path(), target);
+            // The BOM-free twin has to find something, or the parity below is `0 == 0` — the
+            // fake-coverage shape `mcp::bom_surfaces` was written to kill.
+            assert!(
+                without.contains(&format!("used_by=[{dependent}]")),
+                "the BOM-free {target} found no dependent, so this row cannot detect an \
+                 under-report: {without}"
+            );
+            assert_eq!(
+                describe(bommed.path(), target),
+                without,
+                "a BOM on {target} changed its reported dependencies"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

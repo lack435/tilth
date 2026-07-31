@@ -887,10 +887,17 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
     let start_row = node.start_position().row;
     if start_row < lines.len() {
         // BOM-aware, because `str::trim` is not. Signatures are rendered text: they reach
-        // `tilth_diff`'s `[~:sig]` lines (via `diff::overlay`, which reads content
-        // unstripped) and `ResolvedCallee.signature` in search's `-- calls --` block and
-        // grok's `## callees`. A definition on line 1 of a BOM'd file therefore printed the
-        // glyph inside its own signature — on both sides of a diff.
+        // `tilth_diff`'s `[~:sig]` lines (via `diff::overlay`), `ResolvedCallee.signature` in
+        // search's `-- calls --` block and grok's `## callees`. A definition on line 1 of a
+        // BOM'd file therefore printed the glyph inside its own signature — on both sides of
+        // a diff.
+        //
+        // Belt-and-braces since #88: both routes into `walk_top_level` now hand it stripped
+        // content — `get_outline_entries` strips (which is what `diff::overlay` reaches), and
+        // `read::outline::generate` has since #42 — so no live caller can put a BOM in front
+        // of this. Kept for the same reason `search::rank`'s strips are: the two callers are
+        // the invariant, not this line, and a third added later would reintroduce the glyph
+        // silently.
         let line = crate::lang::outline::trim_start_bom_aware(lines[start_row]).trim_end();
         // Truncate at opening brace
         if let Some(pos) = line.find('{') {
@@ -1467,10 +1474,10 @@ pub(crate) fn strip_bom(content: &str) -> &str {
 /// three on the read side use this and must agree, because one stripping while another does
 /// not is how an outline came to advertise a heading anchor that the section resolver then
 /// denied: `read::outline::generate`'s markdown arm, `resolve_heading`, and
-/// `suggest_headings`. Two more parse markdown on the *search* side —
-/// `search::symbol`'s definition matcher and `search::mod`'s enclosing-scope lookup — and
-/// still do not strip, so they disagree with the read side about a doubled-BOM file's first
-/// heading; that is tracked in #51, not fixed here.
+/// `suggest_headings`. Two more parse markdown on the *search* side — `search::symbol`'s
+/// definition matcher and `search::mod`'s enclosing-scope lookup — and both strip as well,
+/// via the `&str` form `strip_bom`. All five agree, so no surface disagrees with another
+/// about a doubled-BOM file's first heading (#51/#87).
 ///
 /// A BOM contains no newline, so removing it never shifts a line number — only column 0 of
 /// row 0, which no caller tests.
@@ -1614,10 +1621,40 @@ fn skip_leading_comments(s: &str) -> &str {
 }
 
 /// Get structured outline entries for file content.
+///
+/// The BOM is stripped here rather than at each caller (#88). This is the shared entry point
+/// for `deps`' exported-symbol extraction, `diff`'s structural overlays and `read`'s
+/// `[signature]` view, and it was the one outline path that parsed unstripped — `read::outline::
+/// generate` has stripped since #42.
+///
+/// **A single BOM was never the problem, and that is why this went unnoticed.** Measured across
+/// all nineteen `Lang` variants: every code grammar skips one leading U+FEFF by itself, so names,
+/// line numbers and signatures are identical with it and without. The damage needs a *doubled*
+/// BOM — a real artifact of a tool that prepends one without checking for an existing one, and
+/// the same spelling #51 needed to expose tree-sitter-md. Two of nineteen grammars break on it,
+/// in two different ways:
+///
+///   * **Kotlin** drops the line-1 definition from the outline entirely (one entry becomes zero).
+///     For `deps` that means Phase 1 under-counts exported symbols and Phase 3's reverse search
+///     never looks for them, so `tilth_deps` silently under-reports its blast radius.
+///   * **Bash** fuses the BOM onto the *name*, yielding `\u{feff}line_one`. Worse than dropping
+///     it: the symbol is searched for under a name no call site spells, so the miss looks like a
+///     real absence of dependents, and the U+FEFF rides into any surface rendering the name.
+///
+/// Safe at this depth because an `OutlineEntry` carries line numbers and no byte offsets, and a
+/// BOM contains no newline — so stripping shifts nothing a caller could hold against the
+/// unstripped content it still owns. `mcp::tools::read::read_signature_file` relies on exactly
+/// that: it keeps hashing its own unstripped lines for the `{line}:{hash}|` anchors while reading
+/// entries from here, so the anchor contract of the `read:signature` surface is untouched — as
+/// `bom_surfaces`' `KeepsForAnchors` row for it still asserts.
 pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
     let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();
     };
+
+    // Once, before both the parse and the line split — they must see the same string, or the
+    // rows tree-sitter reports would index into a `lines` that no longer matches them.
+    let content = strip_bom(content);
 
     // Budgeted: `diff` builds overlays with `par_iter`, calling this twice per changed file
     // (old and new content), so this is a walk-time transient tree like the search paths (#70).
@@ -1628,6 +1665,127 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 
     let lines: Vec<&str> = content.lines().collect();
     walk_top_level(tree.root_node(), &lines, lang)
+}
+
+#[cfg(test)]
+mod outline_entry_bom_tests {
+    use super::get_outline_entries;
+    use crate::types::Lang;
+
+    /// A definition on line 1 for every language that has a grammar, plus the three that do not.
+    ///
+    /// Line 1 specifically: a BOM occurs once, at file start, so it is the only line any of this
+    /// can reach. Where a language forbids a definition there — Go needs its `package` clause, PHP
+    /// its open tag — the definition sits as early as the grammar allows and the row still proves
+    /// the file's *first* bytes do not perturb what follows.
+    const CASES: &[(Lang, &str)] = &[
+        (Lang::Rust, "pub fn line_one() -> u32 {\n    1\n}\n"),
+        (
+            Lang::TypeScript,
+            "export function lineOne(): number {\n  return 1;\n}\n",
+        ),
+        (
+            Lang::Tsx,
+            "export function LineOne(): JSX.Element {\n  return <div />;\n}\n",
+        ),
+        (
+            Lang::JavaScript,
+            "export function lineOne() { return 1; }\n",
+        ),
+        (Lang::Python, "def line_one():\n    return 1\n"),
+        (
+            Lang::Go,
+            "package p\n\nfunc LineThree() int {\n\treturn 3\n}\n",
+        ),
+        (Lang::Java, "class LineOne {\n  int m() { return 1; }\n}\n"),
+        (Lang::Scala, "class LineOne {\n  def m(): Int = 1\n}\n"),
+        (Lang::C, "int line_one(void) { return 1; }\n"),
+        (Lang::Cpp, "int line_one() { return 1; }\n"),
+        (Lang::Ruby, "class LineOne\n  def m\n    1\n  end\nend\n"),
+        (Lang::Php, "<?php\nfunction line_two() { return 2; }\n"),
+        (Lang::Swift, "func lineOne() -> Int { return 1 }\n"),
+        (Lang::Kotlin, "fun lineOne(): Int { return 1 }\n"),
+        (
+            Lang::CSharp,
+            "class LineOne {\n  int M() { return 1; }\n}\n",
+        ),
+        (Lang::Elixir, "defmodule LineOne do\n  def m, do: 1\nend\n"),
+        (Lang::Bash, "line_one() {\n  echo 1\n}\n"),
+        (Lang::Dockerfile, "FROM scratch\n"),
+        (Lang::Make, "line_one:\n\techo 1\n"),
+    ];
+
+    /// `n` BOMs, built from their bytes per the #35/#41 convention.
+    fn with_boms(n: usize, s: &str) -> String {
+        let mut v = Vec::new();
+        for _ in 0..n {
+            v.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        }
+        v.extend_from_slice(s.as_bytes());
+        String::from_utf8(v).unwrap()
+    }
+
+    /// Compare the whole entry, not just the name — a shifted line or a lost signature is the
+    /// same class of wrong answer and neither shows up in a name-only check.
+    fn describe(src: &str, lang: Lang) -> Vec<String> {
+        get_outline_entries(src, lang)
+            .iter()
+            .map(|e| {
+                format!(
+                    "{:?}:{}@{}-{}:{:?}",
+                    e.kind, e.name, e.start_line, e.end_line, e.signature
+                )
+            })
+            .collect()
+    }
+
+    /// #88: a BOM'd file must outline exactly as its BOM-free twin, in every language.
+    ///
+    /// Asserted for **every** `Lang`, not only the two that were broken, and as parity against
+    /// the BOM-free spelling rather than against expected entries — so it keeps holding as the
+    /// grammars are bumped, and a grammar that starts mishandling a BOM fails here rather than
+    /// silently under-reporting through `deps`.
+    ///
+    /// Two BOMs, not one, is the load-bearing half. Every code grammar skips a single leading
+    /// U+FEFF by itself, so a one-BOM fixture passes with or without the strip and would be the
+    /// fake coverage `mcp::bom_surfaces` exists to kill. Both spellings are checked, and the
+    /// doubled one is what fails without the fix: `Kotlin` returned **zero** entries for a
+    /// one-definition file, and `Bash` named its function `\u{feff}line_one`.
+    #[test]
+    fn a_bom_does_not_change_the_outline_entries_in_any_language() {
+        for (lang, src) in CASES {
+            let plain = describe(src, *lang);
+            for n in [1, 2] {
+                assert_eq!(
+                    describe(&with_boms(n, src), *lang),
+                    plain,
+                    "{n} BOM(s) changed the outline entries for {lang:?}"
+                );
+            }
+        }
+    }
+
+    /// The fixtures have to actually produce entries, or the parity above is `[] == []`.
+    ///
+    /// Three languages legitimately yield none — `Dockerfile` and `Make` have no grammar at all
+    /// (`outline_language` returns `None`), and the Ruby arm emits no top-level entry for a class.
+    /// Naming them here is what stops a *fourth* joining them unnoticed and quietly turning its
+    /// parity row into a comparison of two empty vectors.
+    #[test]
+    fn every_language_whose_outline_can_be_empty_is_named() {
+        const KNOWN_EMPTY: &[Lang] = &[Lang::Dockerfile, Lang::Make, Lang::Ruby];
+        for (lang, src) in CASES {
+            let empty = describe(src, *lang).is_empty();
+            assert_eq!(
+                empty,
+                KNOWN_EMPTY.contains(lang),
+                "{lang:?} renders {} outline entries, but KNOWN_EMPTY says the opposite — either \
+                 the fixture stopped exercising the parity check above, or a grammar gained \
+                 support and the list is stale",
+                if empty { "no" } else { "some" }
+            );
+        }
+    }
 }
 
 #[cfg(test)]

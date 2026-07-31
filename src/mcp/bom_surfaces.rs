@@ -62,6 +62,10 @@ enum Bom {
     /// Stronger than "contains no U+FEFF", deliberately, and it is what found the seventh leak: a
     /// BOM surviving into a scope lookup, a rank, a column or a count leaves no U+FEFF anywhere and
     /// is still a wrong answer. #51's ranking leak was exactly that shape.
+    ///
+    /// That last one now has a row of its own — `search:symbol/rank-order` (#85). Byte-identity is
+    /// what makes it expressible: a reordering changes no character of either match, only which
+    /// comes first, so nothing weaker than this comparison could state the contract.
     Strips,
     /// Emits `{line}:{hash}|` anchors, so the BOM must survive for `edit::apply_batch` to verify
     /// them. Round-tripped by `every_anchor_bearing_surface_round_trips_through_a_write`.
@@ -191,6 +195,20 @@ const SURFACES: &[Surface] = &[
     },
     Surface {
         label: "search:symbol/expand=0",
+        tool: "tilth_search",
+        edit_mode: false,
+        view: None,
+        expect: Bom::Strips,
+    },
+    // The ordering row (#85). Same render path as `search:symbol/expand=0`, deliberately — what
+    // differs is the *fixture*, not the formatter: two definitions of one symbol whose rank order
+    // depends on the BOM being stripped before scoring. Every other `Strips` row would still pass
+    // if ranking silently regressed, because they each render one match and a reordering needs two.
+    //
+    // `expand: 0` because the `-> [line]` preview lists matches in rank order compactly; an
+    // expansion would bury the order in code fences read from the file rather than from `m.text`.
+    Surface {
+        label: "search:symbol/rank-order",
         tool: "tilth_search",
         edit_mode: false,
         view: None,
@@ -418,6 +436,13 @@ const ENUM_VARIANT_ALIASES: &[(&str, &str, &str)] = &[
 /// implied it guarded the class. Recording the map keeps that honest, and recording the gaps keeps
 /// them from being rediscovered as new bugs. Re-derive by replacing a call with a no-op and running
 /// only this module.
+///
+/// A few entries name a test **outside** this module instead of a row, and say so. That is not a
+/// category error: the list answers "is this site guarded, and by what", and #85 was filed on the
+/// strength of a `SITES_NOT_CAUGHT` entry that said a site was unguarded when a unit test had been
+/// guarding it all along. A site covered elsewhere belongs here, named, or the next reader files
+/// the same issue again. Mutations for those are run against the whole suite, not `only this
+/// module` — the note on each entry says which.
 const SITES_CAUGHT: &[(&str, &str)] = &[
     (
         "src/search/scope.rs",
@@ -440,6 +465,26 @@ const SITES_CAUGHT: &[(&str, &str)] = &[
         "write:overwrite/diff — the human-facing diff block, found the moment the diff-source fix let \
          the guard reach the write rows",
     ),
+    (
+        "src/types.rs (match_text, ranking half)",
+        "search:symbol/rank-order — #51's ranking leak, the row #85 asked for. Distinct from the \
+         `match_text` entry above, which catches the *glyph*: this one catches the **order**. \
+         Established by the mutation `match_text`'s own doc warns about — strip moved out to the \
+         four render sites in `search/mod.rs`, plus `rank.rs`'s belt-and-braces removed. Under it \
+         `rank_high.rs` and `rank_low.rs` swap places with **no U+FEFF anywhere in either \
+         output**, and `search:symbol` and `search:symbol/expand=0` both still pass — so this is \
+         the only row that can see it.",
+    ),
+    (
+        "src/search/rank.rs",
+        "NOT by a row here — by `rank::tests::a_bom_on_line_one_does_not_change_the_score`, which \
+         hand-builds a BOM'd `Match` and compares scores. Recorded because #85 was filed believing \
+         nothing caught it: no-op'ing all four of `rank.rs`'s strips takes the suite from 14 \
+         failures to 15, and that test is the fifteenth. It cannot be an end-to-end row, and no \
+         fixture will ever make it one — `match_text` strips first, so no live search can put a \
+         BOM in front of `rank.rs` to begin with (its own comment says as much). The end-to-end \
+         property that *is* reachable is the ordering row above.",
+    ),
 ];
 
 /// Sites this module still does not reach, named so they are not mistaken for covered.
@@ -451,12 +496,6 @@ const SITES_NOT_CAUGHT: &[(&str, &str)] = &[
          arrays, both resolved to `[full]`, because a keys outline lists every key and so does not \
          compress. The row was dropped rather than shipped with a `view` assertion showing it tested \
          full content while claiming the outline. Its own follow-up.",
-    ),
-    (
-        "src/search/rank.rs",
-        "#51's ranking leak. Needs a fixture where the BOM changes the *order* of two matches, not \
-         just their text — and review found nothing in the whole suite catches it either. Its own \
-         issue.",
     ),
     (
         "src/search/grok.rs",
@@ -473,9 +512,12 @@ const SITES_NOT_CAUGHT: &[(&str, &str)] = &[
          render reproduces. It targets `consumer.rs`, whose edges derive from `use lib::bom_target` \
          on the BOM-free line 2 and from callee resolution, not from the BOM'd line 1 (`mod lib;`). \
          Confirmed by mutation: no-op'ing `trim_start_bom_aware` (the import-detection strip) leaves \
-         the row green. Falsifying it would mean targeting a file whose exported symbol is *defined* \
-         on the BOM'd line — but `analyze_deps` hands unstripped content to `get_outline_entries`, so \
-         that would test tree-sitter's BOM tolerance, not a strip site. Its own follow-up, like grok.",
+         the row green. The Phase 1 half of this is now covered, but **not from here** — see \
+         `deps::bom_blast_radius_tests` (#88), which drives `analyze_deps` over a doubled-BOM \
+         Kotlin and Bash target and asserts the whole dependent set against a BOM-free twin. That \
+         needed a doubled BOM and a language whose grammar mishandles one, neither of which this \
+         single-BOM Rust fixture has; forcing them in here would have distorted every other row. \
+         What remains genuinely uncaught from this module is the *import-detection* strip.",
     ),
 ];
 
@@ -499,6 +541,9 @@ fn args_for(label: &str, root: &Path) -> Value {
         "search:symbol" => json!({"query": "bom_target", "kind": "symbol", "scope": scope}),
         "search:symbol/expand=0" => {
             json!({"query": "bom_target", "kind": "symbol", "scope": scope, "expand": 0})
+        }
+        "search:symbol/rank-order" => {
+            json!({"query": "ranked_target", "kind": "symbol", "scope": scope, "expand": 0})
         }
         "search:content" => json!({"query": "bom_target", "kind": "content", "scope": scope}),
         "search:regex" => json!({"query": "bom_tar[g]et", "kind": "regex", "scope": scope}),
@@ -642,6 +687,27 @@ fn write_fixture(root: &Path, bom: bool) {
         format!(
             "{b}pub fn helper() -> u32 {{ 1 }}\n\npub fn calls_it() -> u32 {{\n    helper()\n}}\n"
         ),
+    )
+    .unwrap();
+
+    // Two definitions of one symbol, ranked close enough that the points a BOM'd line-1 definition
+    // loses flip their order (#85). `rank_high.rs` is `pub fn`, so it carries both the kind boost
+    // and the exported-API boost; `rank_low.rs` is a bare `fn`, so it carries only the kind boost
+    // and sits just below. Strip the BOM and the first outranks the second; leave it and the first
+    // loses both boosts and falls behind — an ordering change with no U+FEFF in the output to show
+    // for it, which is the shape #51 was filed about and the one no `Strips` row could reach.
+    //
+    // **`rank_low.rs` deliberately never carries the BOM**, in either tree. Giving it one would
+    // cost it its own kind boost in the BOM'd tree, both sides would fall together, and the
+    // relative order would survive — the row would then pass no matter what the strip did.
+    std::fs::write(
+        root.join("rank_high.rs"),
+        format!("{b}pub fn ranked_target() -> u32 {{\n    1\n}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("rank_low.rs"),
+        "fn ranked_target() -> u32 {\n    2\n}\n",
     )
     .unwrap();
 
