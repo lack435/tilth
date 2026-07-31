@@ -175,7 +175,7 @@ pub fn read_file(
     // edit-mode anchor agrees with verification. So the rule across the read surface is:
     // rendered file content keeps the BOM (full view, section reads), the outline funnel
     // strips it (a derived view, no hash), and synthesised text strips it (heading
-    // suggestions, the query in `resolve_range`). Search rendering strips too, since #51/#56 —
+    // suggestions, the query in `resolve_range`). Search rendering strips too, since #51 —
     // it carries no hash, and `types::match_text` has to strip anyway because the same string
     // is what `search::rank` scores. The rule is therefore hash contract, not surface: a
     // rendered line keeps the BOM exactly where an anchor is computed over it.

@@ -707,6 +707,11 @@ mod bom_blast_radius_tests {
     }
 
     /// The whole result, with absolute paths reduced to file names so two tempdirs compare.
+    ///
+    /// The name lists are **sorted**, so this compares set membership rather than order. That is
+    /// deliberate — the property here is "a dependent went missing", and dependent ordering is
+    /// `search::rank`'s business, guarded by `mcp::bom_surfaces`' `search:symbol/rank-order` row.
+    /// Stated because a sorted comparison reads like a full-output check and is not one.
     fn describe(root: &Path, target: &str) -> String {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let r = analyze_deps(&root.join(target), root, &bloom).unwrap();
@@ -744,14 +749,19 @@ mod bom_blast_radius_tests {
     /// listing — it silently removes a real dependent from the reverse search, and the output
     /// says `0 dependents` rather than admitting it never looked.
     ///
-    /// Both languages the grammar survey found, because they fail differently and only one of
-    /// them looks like a failure:
+    /// The two grammars whose failure actually reaches *this* surface, and they fail differently
+    /// — only one of them looks like a failure:
     ///
     ///   * **Kotlin** loses the definition, so `exported_count` drops to 0 and Phase 3 searches
     ///     for nothing.
     ///   * **Bash** keeps a definition named `\u{feff}line_one`, so `exported_count` is
     ///     *unchanged* and the search runs — against a name no caller spells. The count looks
     ///     healthy and the dependent list is empty, which is the worse of the two to debug.
+    ///
+    /// Five grammars break in total; the other three (Rust, Scala, Swift) lose only the *doc
+    /// comment*, which `deps` never reads — so they are guarded at the outline level instead, by
+    /// `lang::outline::outline_entry_bom_tests`. Splitting them that way keeps each test able to
+    /// fail for the reason it names.
     ///
     /// Doubled, because a single BOM never reached this: every code grammar skips one on its own.
     /// See `lang::outline::get_outline_entries` for the measurement across all nineteen `Lang`s.
