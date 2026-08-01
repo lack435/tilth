@@ -306,22 +306,7 @@ pub fn analyze_deps(
             .map(|(dep_path, mut pairs)| {
                 pairs.sort();
                 pairs.dedup();
-                // Classify on the path *relative to the scope*. `is_test_file` substring-matches
-                // the whole path, so classifying the absolute one lets the directories above the
-                // project decide: a checkout under `__tests__/` marks every dependent a test and
-                // sinks them all in the sort below. That was already true wherever the scope was
-                // absolute, and #97 would have made it true everywhere by canonicalizing the walk
-                // root — so the exposure is closed here rather than widened.
-                //
-                // The `__tests__/` half of that is Unix-only, because `is_test_file` matches the
-                // literal with a forward slash and a Windows path has none. `.test.`/`.spec.` are
-                // separator-free and bite on both. Said exactly, because "a checkout under
-                // `__tests__/`" reads as a cross-platform hazard and is not one.
-                //
-                // Only this call site changed. The others (`grok`, `rank`, `blast`, `read::
-                // outline`) still classify whole paths, so the crate now carries two conventions —
-                // deliberate, since #97 is not a licence to sweep, and filed rather than left
-                // silent.
+                // Scope-relative, like every caller that has a scope to strip. See `is_test_file`.
                 let is_test = is_test_file(dep_path.strip_prefix(scope).unwrap_or(&dep_path));
                 Dependent {
                     path: dep_path,
