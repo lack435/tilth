@@ -629,8 +629,14 @@ enum Nameless {
     /// The truth is "this is a workspace root and the names are one level down", and the member
     /// count is sitting right there in the manifest.
     CargoWorkspace(usize),
-    /// A `pyproject.toml` with `[build-system]` but no `[project]`: the ordinary Python layout
-    /// with metadata in `setup.cfg`.
+    /// A `pyproject.toml` declaring a build backend and no packaging metadata: the ordinary
+    /// Python layout with the name in `setup.cfg` or `setup.py`.
+    ///
+    /// "No packaging metadata" means both `[project]` (PEP 621) and `[tool.poetry]` absent. Other
+    /// `[tool.*]` sections do not count and must not suppress this — `[tool.black]` is formatter
+    /// settings, `[tool.setuptools]` is build configuration, and a project keeping its name in
+    /// `setup.cfg` commonly has one or both. Requiring *nothing* but `[build-system]` would push
+    /// those onto [`Nameless::NoNameDeclared`], which says strictly less about the same file.
     BuildSystemOnly,
     /// Parses, holds real content, and still declares no name.
     ///
@@ -645,8 +651,11 @@ impl Nameless {
     fn label(self) -> String {
         match self {
             Nameless::Empty => "empty".to_string(),
-            // A bare `[workspace]` with no `members` key: still worth saying it is a workspace,
-            // but there is no count to report.
+            // No count to report. Three inputs land here and all three deserve the same line: no
+            // `members` key at all, `members = []`, and a `members` that is not an array (which
+            // is read leniently rather than failing the manifest — see `CargoToml::workspace`).
+            // "0 members" would be worse than silence for the first and the third, since neither
+            // actually declares zero of anything.
             Nameless::CargoWorkspace(0) => "workspace".to_string(),
             // Declared *entries*, which is what the manifest says rather than what Cargo would
             // resolve — `members = ["crates/*"]` is one entry and may expand to many crates. The
@@ -790,13 +799,15 @@ fn read_manifest(path: &Path) -> Result<String, String> {
 /// **BOM-driven only, and deliberately so.** A BOM makes the encoding and the byte order
 /// unambiguous. Without one, detection is a heuristic — and worse, UTF-16 LE holding ASCII is
 /// *valid UTF-8*, since NUL is a legal UTF-8 byte, so a BOM-less file never reaches this at all:
-/// `String::from_utf8` succeeds and hands NUL-interleaved text to the parser. `parse_go_mod`'s "no
-/// module directive" guard is what catches that, and `a_bomless_utf16_go_mod_reports_a_reason`
-/// pins it. The other three formats report their parser's reason — `malformed TOML` or
-/// `malformed JSON` — which is an encoding problem wearing a syntax error's clothes. Unchanged from
-/// before #65 and not closable from here: the file *is* valid UTF-8, so "not UTF-8" would be a
-/// false statement about it, and anything better needs either a new reason string or the heuristic
-/// detection this deliberately avoids. Worth its own issue rather than a guess made here.
+/// `String::from_utf8` succeeds and hands NUL-interleaved text to the parser.
+///
+/// That case is #79, and it is now handled — but in `read_manifest`, on the `from_utf8` **success**
+/// arm, not here. The reasoning this comment used to record still stands and is exactly why it
+/// could not be closed from inside this function: reaching it means reporting `not UTF-8`, which
+/// would be a false statement about a file that just passed UTF-8 validation. A reason of its own
+/// (`NUL bytes, probably UTF-16 without a BOM`) has no such problem, so all four formats now name
+/// the encoding rather than reporting `malformed TOML` / `malformed JSON` / `no module directive`.
+/// See `a_bomless_utf16_manifest_reports_the_encoding_not_the_syntax`.
 ///
 /// The BOM is consumed rather than translated, so the returned text starts at the first real
 /// character. A *doubled* BOM therefore leaves one U+FEFF, which the TOML and JSON parsers strip
@@ -850,11 +861,12 @@ fn decode_utf16_with_bom(bytes: &[u8]) -> Option<String> {
     // No manifest format has a legitimate raw NUL — JSON writes one as a six-character escape — so
     // rejecting all of them costs nothing real.
     //
-    // **This covers the decode path only, which is less than the argument above might suggest.** A
-    // BOM-*less* UTF-16 file is valid UTF-8 and never arrives here, so it still reaches the parser
-    // and still reports `malformed TOML`/`malformed JSON`. See this function's doc comment for why
-    // that is left alone rather than closed by moving the test up to the `from_utf8` success arm:
-    // there the file really is UTF-8, and "not UTF-8" would be false.
+    // **This covers the decode path only**, and the reason that is not the whole story is worth
+    // keeping straight: a BOM-*less* UTF-16 file is valid UTF-8 and never arrives here. It is
+    // caught on the `from_utf8` success arm in `read_manifest` instead, under a different reason,
+    // because the two situations are genuinely different claims. Here the BOM lied about the
+    // encoding, so `not UTF-8` is true. There the file really is UTF-8 and really is not text, so
+    // it says so (#79).
     if text.contains('\0') {
         return None;
     }
@@ -866,18 +878,22 @@ fn parse_cargo_toml(root: &Path) -> Result<ManifestInfo, String> {
     struct CargoToml {
         package: Option<Package>,
         dependencies: Option<toml::Table>,
-        workspace: Option<Workspace>,
+        // `toml::Value` rather than a typed `Workspace`, and that is not laziness. A typed field
+        // makes the **whole manifest** fail to parse when its shape is unexpected, which moves the
+        // failure into a branch #80 promised not to touch: measured against the parent commit,
+        // `workspace = ".."` and `members = "a"` alongside a perfectly good `[package]` rendered
+        // `manifest: Cargo.toml (widget)` before and `— unusable: malformed TOML` after — a named
+        // manifest losing its whole block, name, version and `deps:` line together. Those inputs
+        // are invalid Cargo either way, but "reading a field for presence must not change whether
+        // an unrelated manifest parses" is the rule that keeps the change confined where the
+        // safety argument says it is.
+        workspace: Option<toml::Value>,
     }
     #[derive(Deserialize)]
     struct Package {
         name: Option<String>,
         version: Option<String>,
     }
-    #[derive(Deserialize)]
-    struct Workspace {
-        members: Option<Vec<String>>,
-    }
-
     let content = read_manifest(&root.join("Cargo.toml"))?;
     // The `toml` crate strips exactly *one* BOM, so a doubled one still fails — and
     // `.ok()?` turned that into the same silent loss of the whole manifest block as the
@@ -889,7 +905,11 @@ fn parse_cargo_toml(root: &Path) -> Result<ManifestInfo, String> {
     // Order matters: `[workspace]` beats emptiness, because a manifest holding a `[workspace]`
     // table is not empty. Emptiness is only consulted once nothing else has anything to say.
     let nameless = match &parsed.workspace {
-        Some(ws) => Nameless::CargoWorkspace(ws.members.as_ref().map_or(0, Vec::len)),
+        Some(ws) => Nameless::CargoWorkspace(
+            ws.get("members")
+                .and_then(toml::Value::as_array)
+                .map_or(0, Vec::len),
+        ),
         None if toml_declares_nothing(stripped) => Nameless::Empty,
         None => Nameless::NoNameDeclared,
     };
@@ -978,11 +998,15 @@ fn parse_go_mod(root: &Path) -> Result<ManifestInfo, String> {
     // a reason — a file that yields neither a module name nor a require entry produced a
     // bare `manifest: go.mod` and looked like an unnamed module rather than a broken file.
     //
-    // Reachable in exactly the way #43 is about, and not covered by the read check above:
-    // UTF-16 LE *without* a BOM is valid UTF-8, because NUL is a legal UTF-8 byte. So
-    // `read_manifest` returns `Ok("m\0o\0d\0u\0l\0e\0 …")`, every `strip_prefix` misses, and
-    // the failure is silent again. `module` is mandatory in a real `go.mod`, so requiring
-    // one signal or the other costs nothing on a valid file.
+    // The input this was written for — BOM-less UTF-16, valid UTF-8 because NUL is a legal UTF-8
+    // byte — no longer reaches here: `read_manifest` rejects a NUL-bearing file with a reason that
+    // names the encoding (#79), which is the more accurate of the two, since such a file is not
+    // missing a module directive so much as unreadable as text. This guard still covers what
+    // remains: a NUL-free `go.mod` that genuinely declares neither a module nor a require, which
+    // would otherwise render a bare `manifest: go.mod` and read as an unnamed module rather than a
+    // broken file. `module` is mandatory in a real `go.mod`, so requiring one signal or the other
+    // costs nothing on a valid file. Pinned by
+    // `a_go_mod_with_no_module_line_still_reports_its_own_reason`.
     if name.is_none() && deps.is_empty() {
         return Err("no module directive".to_string());
     }
@@ -1005,8 +1029,13 @@ fn parse_pyproject_toml(root: &Path) -> Result<ManifestInfo, String> {
     #[derive(Default, Deserialize)]
     struct PyProject {
         project: Option<Project>,
+        // `toml::Value`, not a typed table: this field exists only to be tested for presence, and
+        // a typed one would make the *whole manifest* fail to parse for a spelling that previously
+        // parsed fine. See `parse_cargo_toml`'s `workspace` for the measurement.
         #[serde(rename = "build-system")]
-        build_system: Option<toml::Table>,
+        build_system: Option<toml::Value>,
+        /// Poetry keeps its metadata under `[tool.poetry]` rather than `[project]`.
+        tool: Option<toml::Value>,
     }
     #[derive(Default, Deserialize)]
     struct Project {
@@ -1019,8 +1048,30 @@ fn parse_pyproject_toml(root: &Path) -> Result<ManifestInfo, String> {
     // Doubled BOM — see `parse_cargo_toml`.
     let stripped = crate::lang::outline::strip_bom(&content);
     let parsed: PyProject = toml::from_str(stripped).map_err(|_| "malformed TOML".to_string())?;
-    // Same precedence as Cargo's: a `[build-system]` table means the file is not empty.
-    let nameless = if parsed.build_system.is_some() {
+
+    // Poetry declares its name under `[tool.poetry]`, and `[build-system]` is effectively
+    // mandatory in a Poetry project — so testing `build-system` alone reported `(build-system
+    // only)` for a manifest carrying a perfectly good name and version. That is worse than the
+    // bare line #80 set out to replace: vague became *wrong*, on every Poetry 1.x project. Read
+    // the name instead of labelling its absence.
+    //
+    // Only `name` and `version` are read here. `[tool.poetry.dependencies]` is deliberately not
+    // folded into `deps` — its keys include `python`, which is an interpreter constraint rather
+    // than a package, so merging it needs a judgement this change does not need to make. A Poetry
+    // manifest therefore renders its name with no `deps:` line, exactly as it did before.
+    let poetry = parsed.tool.as_ref().and_then(|t| t.get("poetry"));
+    let poetry_str = |key: &str| {
+        poetry
+            .and_then(|p| p.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+    };
+
+    // `[build-system]` only means "build-system only" when there is genuinely nothing else. A
+    // `[project]` table that happens to omit `name` is a different situation and must not claim
+    // to be this one.
+    let nameless = if parsed.build_system.is_some() && parsed.project.is_none() && poetry.is_none()
+    {
         Nameless::BuildSystemOnly
     } else if toml_declares_nothing(stripped) {
         Nameless::Empty
@@ -1028,6 +1079,8 @@ fn parse_pyproject_toml(root: &Path) -> Result<ManifestInfo, String> {
         Nameless::NoNameDeclared
     };
     let project = parsed.project.unwrap_or_default();
+    let name = project.name.or_else(|| poetry_str("name"));
+    let version = project.version.or_else(|| poetry_str("version"));
     let (deps, dep_total) = cap_deps(
         project
             .dependencies
@@ -1043,8 +1096,8 @@ fn parse_pyproject_toml(root: &Path) -> Result<ManifestInfo, String> {
             .collect(),
     );
     Ok(ManifestInfo {
-        name: project.name,
-        version: project.version,
+        name,
+        version,
         deps,
         dep_total,
         nameless,
@@ -2076,6 +2129,115 @@ mod tests {
                 line, *expected,
                 "nameless {manifest} (body {body:?}) rendered the wrong line"
             );
+        }
+    }
+
+    /// A manifest that declares a name must never be labelled by what it lacks.
+    ///
+    /// `(build-system only)` was a *false* claim on every Poetry 1.x project: `[build-system]` is
+    /// effectively mandatory there, Poetry keeps its metadata under `[tool.poetry]` rather than
+    /// `[project]`, and testing `build-system` alone matched both. That is worse than the bare line
+    /// #80 replaced — vague became wrong — and it is exactly the trade the issue warned against
+    /// when it argued the failure marker would mislabel a valid manifest.
+    ///
+    /// The `[project]`-without-`name` rows are the same defect from the other side: a manifest that
+    /// has a `[project]` table is not "build-system only", whatever it does or does not name.
+    #[test]
+    fn a_pyproject_is_not_called_build_system_only_when_it_is_not() {
+        let cases: &[(&str, &str)] = &[
+            // The ordinary Poetry layout: name and version live under `[tool.poetry]`.
+            (
+                "[tool.poetry]\nname = \"widget\"\nversion = \"0.1.0\"\n\n\
+                 [build-system]\nrequires = [\"poetry-core\"]\n",
+                "  manifest: pyproject.toml (widget v0.1.0)",
+            ),
+            // Poetry without a version still resolves a name.
+            (
+                "[tool.poetry]\nname = \"widget\"\n\n[build-system]\nrequires = [\"poetry-core\"]\n",
+                "  manifest: pyproject.toml (widget)",
+            ),
+            // `[project]` wins when both are present — PEP 621 is the standard spelling.
+            (
+                "[project]\nname = \"standard\"\n\n[tool.poetry]\nname = \"legacy\"\n",
+                "  manifest: pyproject.toml (standard)",
+            ),
+            // A `[project]` table with no name is not "build-system only" either.
+            (
+                "[project]\nversion = \"1.0\"\n\n[build-system]\nrequires = [\"setuptools\"]\n",
+                "  manifest: pyproject.toml (no name declared)",
+            ),
+            // A `[tool.*]` section that is not poetry must not be mistaken for one — and must not
+            // stop the build-system verdict either. Black config is formatter settings, not
+            // packaging metadata, so this really is a `setup.cfg` project and the label holds.
+            (
+                "[tool.black]\nline-length = 88\n\n[build-system]\nrequires = [\"setuptools\"]\n",
+                "  manifest: pyproject.toml (build-system only)",
+            ),
+            // And the case the variant is actually for: nothing but a build backend.
+            (
+                "[build-system]\nrequires = [\"setuptools\"]\n",
+                "  manifest: pyproject.toml (build-system only)",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("pyproject.toml"), body).unwrap();
+
+            let out = fingerprint(dir.path());
+            let line = out
+                .lines()
+                .find(|l| l.trim_start().starts_with("manifest:"))
+                .unwrap_or("<no manifest line>");
+            assert_eq!(line, *expected, "pyproject body {body:?}");
+        }
+    }
+
+    /// Reading a field for its presence must not change whether an unrelated manifest parses.
+    ///
+    /// #80 added `workspace` to `CargoToml` and `build-system` to `PyProject` purely to test for
+    /// presence. Typed as tables, they made the **whole manifest** fail for a spelling that used to
+    /// parse — measured against the parent commit, each of these rendered its name before and
+    /// `— unusable: malformed TOML` after, losing the name, version and `deps:` line together.
+    ///
+    /// The inputs are invalid per their own format specs, so nothing real broke; the point is that
+    /// the safety argument for #80 is "the change lives in the `name: None` branch", and a typed
+    /// field moves failures *outside* that branch. Read as `toml::Value` they cannot.
+    #[test]
+    fn a_presence_only_field_cannot_make_a_named_manifest_fail_to_parse() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "Cargo.toml",
+                "workspace = \"..\"\n[package]\nname = \"widget\"\n",
+                "  manifest: Cargo.toml (widget)",
+            ),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"widget\"\n[workspace]\nmembers = \"a\"\n",
+                "  manifest: Cargo.toml (widget)",
+            ),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"widget\"\n[workspace]\nmembers = [1, 2]\n",
+                "  manifest: Cargo.toml (widget)",
+            ),
+            (
+                "pyproject.toml",
+                "build-system = \"setuptools\"\n[project]\nname = \"widget\"\n",
+                "  manifest: pyproject.toml (widget)",
+            ),
+        ];
+
+        for (manifest, body, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(manifest), body).unwrap();
+
+            let out = fingerprint(dir.path());
+            let line = out
+                .lines()
+                .find(|l| l.trim_start().starts_with("manifest:"))
+                .unwrap_or("<no manifest line>");
+            assert_eq!(line, *expected, "{manifest} body {body:?}");
         }
     }
 
