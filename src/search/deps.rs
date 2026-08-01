@@ -46,7 +46,7 @@ const MAX_EXTERNAL_DEPS: usize = 20;
 ///
 /// What #97 fixed is narrower than "one domain", and worth stating as what it is: `target` and
 /// `used_by` now agree well enough to be compared, and `scope` is spelled the way `used_by` is
-/// prefixed, so an in-scope path strips. The residual is the symlink case in the last bullet.
+/// prefixed, so an in-scope path strips. The residual is the symlink case in the last bullet, #98.
 pub struct DepsResult {
     /// The scope every other path here is rendered against, recorded rather than re-derived so
     /// `format_deps` cannot render against a different spelling than the analysis compared
@@ -287,7 +287,7 @@ pub fn analyze_deps(
             // "Agree", not "are canonical": the walker follows links without rewriting the
             // spelling, so a symlink *below* the walk root still reaches the target by an
             // uncanonical path and still lands here as its own dependent. Measured with a
-            // directory junction while reviewing #97, and filed separately — #97's fix closes
+            // directory junction while reviewing #97, and filed as #98 — #97's fix closes
             // the scope-spelling half, which is the one the default flow hits, not the class.
             if caller_match.path == *path {
                 continue;
