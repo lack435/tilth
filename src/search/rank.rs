@@ -279,7 +279,10 @@ fn score_inner(
     s -= non_code_penalty(&m.path);
     s -= incidental_text_penalty(m, query);
 
-    if is_test_file(&m.path) && !looks_like_test_query(query) {
+    // Scope-relative: a `__tests__` directory *above* the searched tree must not dock every
+    // result in it 120 points. See `is_test_file`.
+    if is_test_file(m.path.strip_prefix(scope).unwrap_or(&m.path)) && !looks_like_test_query(query)
+    {
         s -= 120;
     }
     s -= fixture_penalty(m);

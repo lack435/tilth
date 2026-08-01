@@ -462,7 +462,8 @@ pub fn grok(
 
     let (mut prod_callers, mut test_callers): (Vec<_>, Vec<_>) = prod_and_test
         .into_iter()
-        .partition(|m| !is_test_file(&m.path));
+        // Scope-relative, like the other callers that have a scope. See `is_test_file`.
+        .partition(|m| !is_test_file(m.path.strip_prefix(scope).unwrap_or(&m.path)));
     // `find_callers_batch` returns matches in walk order — thread-scheduling order. The
     // caps below truncate without ranking, so without a total order here grok showed a
     // different "5 of 40" on each run for the same symbol. Order by location: stable,

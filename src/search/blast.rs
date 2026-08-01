@@ -108,7 +108,8 @@ fn format_blast_radius(
     let mut by_symbol: HashMap<&str, (Vec<&CallerMatch>, Vec<&CallerMatch>)> = HashMap::new();
     for (sym, m) in callers {
         let entry = by_symbol.entry(sym.as_str()).or_default();
-        if is_test_file(&m.path) {
+        // Scope-relative, like the other callers that have a scope. See `is_test_file`.
+        if is_test_file(m.path.strip_prefix(scope).unwrap_or(&m.path)) {
             entry.1.push(m);
         } else {
             entry.0.push(m);
@@ -150,7 +151,8 @@ fn format_blast_radius(
     // Test summary — group all test callers by file, across all symbols.
     let mut test_counts: HashMap<String, usize> = HashMap::new();
     for (_, m) in callers {
-        if is_test_file(&m.path) {
+        // Scope-relative, like the other callers that have a scope. See `is_test_file`.
+        if is_test_file(m.path.strip_prefix(scope).unwrap_or(&m.path)) {
             let rel = m
                 .path
                 .strip_prefix(scope)

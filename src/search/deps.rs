@@ -306,15 +306,8 @@ pub fn analyze_deps(
             .map(|(dep_path, mut pairs)| {
                 pairs.sort();
                 pairs.dedup();
-                // Classified on the whole path, like every other caller. #97 stripped the scope off
-                // here first, because `is_test_file` matched its markers anywhere in the path and
-                // canonicalizing the walk root would have let the directories above the project
-                // decide. That was the right guard in the wrong place: it left the crate with two
-                // conventions and protected only this caller, while `search::rank`'s 120-point
-                // penalty had the far larger stake. `is_test_file` now matches the file-name
-                // markers against the file name, so the guard is unnecessary and the crate has one
-                // convention again.
-                let is_test = is_test_file(&dep_path);
+                // Scope-relative, like every caller that has a scope to strip. See `is_test_file`.
+                let is_test = is_test_file(dep_path.strip_prefix(scope).unwrap_or(&dep_path));
                 Dependent {
                     path: dep_path,
                     symbols: pairs,

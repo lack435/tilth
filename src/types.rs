@@ -273,30 +273,37 @@ pub enum OutlineKind {
 ///
 /// The old spelling was `s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")`
 /// against the whole path, which let the directories *above* the project decide: a checkout at
-/// `/home/u/proj.spec.v2/` classified every file in it as a test. That is not hypothetical for the
-/// callers that get absolute paths, and the stakes are not uniform — `search::rank` docks a test
-/// file **120 points**, so an unlucky ancestor silently reorders every search result, and
-/// `read::outline` switches the file into test-file rendering entirely. The other three callers
-/// (`grok`, `blast`, `deps`) only group prod and test in their output.
+/// `/home/u/proj.spec.v2/` classified every file in it as a test. Not hypothetical for the callers
+/// that get absolute paths, and `search::rank` docks a test file **120 points**.
 ///
 /// Matching `__tests__` by component rather than by `"__tests__/"` also fixes it on Windows, where
 /// the embedded forward slash meant it never matched at all — so a `__tests__` tree was classified
 /// one way on Linux and another on Windows, the kind of platform split `overview`'s
-/// `path_bearing_lines_are_identical_across_platforms` exists to refuse.
+/// `path_bearing_lines_are_identical_across_platforms` exists to refuse. That is a *widening* on
+/// Windows, and the only one here: a file under `__tests__` now takes the ranking penalty and the
+/// test grouping there, as it always has on Linux.
 ///
-/// **Residual, deliberately not fixed here:** a `__tests__` component *above* the project still
-/// matches, because distinguishing "inside the project" from "above it" needs a root and two of the
-/// five callers (`read::outline`, `blast`) have no scope to offer one. Narrow enough to accept —
-/// `__tests__` is a specific name, unlike a substring — and uniform across all five callers, which
-/// the pre-existing alternative was not.
+/// **Pass a project-relative path when you have one.** Matching each marker where it means
+/// something removes the ancestor exposure for the two file-name markers, but `__tests__` is a
+/// directory name and an ancestor called `__tests__` is indistinguishable from a local one without
+/// a root. Four of the five callers have a scope and strip it (`search::rank`, `search::grok`,
+/// `search::blast`, `search::deps`); `read::outline` has none and passes the path it was given.
+/// An earlier version of this note claimed two callers had no scope, which review disproved —
+/// `blast` uses its `scope` two lines below each call.
 pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
     let name_is_test = path
         .file_name()
         .map(|n| n.to_string_lossy())
         .is_some_and(|n| n.contains(".test.") || n.contains(".spec."));
 
-    // Case-sensitive, as the old `contains("__tests__/")` was. Matching `__TESTS__` too would be a
-    // separate widening, and this change is meant to narrow.
+    // Case-sensitive, which is what the old `contains("__tests__/")` was on Linux — on Windows it
+    // matched nothing at all, so there is no prior behaviour there to preserve or depart from.
+    // Matching `__TESTS__` would be a widening, and this change is meant to narrow; the cost is
+    // that on a case-insensitive volume `__TESTS__` names the same directory and is classified
+    // differently. Left as-is deliberately rather than unnoticed.
+    //
+    // `file_name()` is `None` for a path ending in `..`, which therefore classifies on components
+    // alone — `a.test.ts/..` was `true` and is now `false`. No caller builds such a path.
     name_is_test || path.components().any(|c| c.as_os_str() == "__tests__")
 }
 
@@ -326,8 +333,29 @@ mod is_test_file_tests {
         parts.iter().collect()
     }
 
+    /// Which of these are tripwires and which are regression guards, since the two are not the
+    /// same and a reader cannot tell by looking:
+    ///
+    ///   * `the_conventions_are_still_recognised` — a tripwire **only on Windows**, where
+    ///     `"__tests__/"` never matched a backslash path. It passes under the old spelling on
+    ///     Linux, so on CI it guards nothing.
+    ///   * `an_ancestor_directory_does_not_make_a_file_a_test` — the reported defect. Tripwire on
+    ///     both platforms.
+    ///   * `a_partial_component_is_not_the_directory_convention` — tripwire on both, but only
+    ///     because of the `my__tests__` cases: `contains("__tests__/")` needed a *trailing*
+    ///     separator, so a suffix partial like `__tests__extra` was already `false` and only a
+    ///     prefix partial distinguishes the two spellings. Review found this test was originally
+    ///     written with the two non-distinguishing cases alone, and passed in every revert.
+    ///   * `the_directory_convention_is_case_sensitive`, `an_ordinary_tests_directory_is_unchanged`
+    ///     — regression guards. They pass with the fix reverted, by design.
+    ///
+    /// That accounting exists because the `__tests__` half of this change is guarded on the Linux
+    /// runner by exactly one of these — the partial-component test — and it was not obvious.
+
     /// The conventions themselves must still be recognised. Without this the narrowing below
     /// passes against a function that returns `false` for everything.
+    ///
+    /// A tripwire on Windows only; see the module note above.
     #[test]
     fn the_conventions_are_still_recognised() {
         for parts in [
@@ -347,13 +375,13 @@ mod is_test_file_tests {
     /// inside it, because the markers were matched against the whole path.
     ///
     /// `search::rank` docks a test file 120 points, so under the old spelling a checkout at
-    /// `~/proj.spec.v2/` reordered every search result in it.
+    /// `~/proj.spec.v2/` sank every file in it relative to a genuine test file beside them, and
+    /// relative to everything in an untainted tree the same search reached.
     #[test]
     fn an_ancestor_directory_does_not_make_a_file_a_test() {
         for parts in [
             vec!["home", "u", "proj.spec.v2", "src", "main.rs"],
             vec!["home", "u", "app.test.stuff", "src", "main.rs"],
-            vec!["C:", "work", "x.test.y", "repo", "src", "lib.rs"],
         ] {
             assert!(
                 !is_test_file(&p(&parts)),
@@ -363,8 +391,27 @@ mod is_test_file_tests {
     }
 
     /// `__tests__` is matched as a whole component, not as a substring.
+    ///
+    /// The first two cases are the ones that matter, and are the only guard the `__tests__` half of
+    /// this change has on the Linux runner: `contains("__tests__/")` required a trailing separator,
+    /// so a directory *ending* in `__tests__` matched it and a directory merely *containing* the
+    /// text did not. Reverting the component match makes those two fail on either platform. The
+    /// last two are regression guards — already `false` under both spellings — kept because they
+    /// are the cases a reader assumes are at issue.
     #[test]
     fn a_partial_component_is_not_the_directory_convention() {
+        // Spelled with forward slashes deliberately, and not through `p()`. `Path::components`
+        // splits on `/` on both platforms, but `contains("__tests__/")` only ever matched a
+        // forward-slash path — so this is the one spelling under which reverting the component
+        // match fails on the Linux runner as well as here. Without it the `__tests__` half of this
+        // change is guarded on Windows only, which review measured and which is invisible locally.
+        assert!(
+            !is_test_file(std::path::Path::new("repo/my__tests__/a.ts")),
+            "a directory ending in `__tests__` matched the old `contains(\"__tests__/\")` and \
+             must not match the component test"
+        );
+        assert!(!is_test_file(&p(&["repo", "my__tests__", "a.ts"])));
+        assert!(!is_test_file(&p(&["repo", "x__tests__", "a.ts"])));
         assert!(!is_test_file(&p(&["repo", "not__tests__here", "a.ts"])));
         assert!(!is_test_file(&p(&["repo", "__tests__extra", "a.ts"])));
     }
