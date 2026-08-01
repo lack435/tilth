@@ -98,6 +98,26 @@ const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const PER_ENTRY_OVERHEAD: usize =
     std::mem::size_of::<CachedFilter>() + std::mem::size_of::<PathBuf>() + 128;
 
+/// Consecutive sweeps an entry may go unprobed before the cache reclaims its bytes.
+///
+/// **Sweeps, not passes.** A sweep runs at the close of a pass that refused an admission, and only
+/// then — see `BloomFilterCache::end_pass` — so a pass with room to spare neither ages an entry nor
+/// clears its `probed` bit. The distinction is easy to lose and quiet when it is: a first version
+/// of `scopes_visited_in_alternation_do_not_evict_each_other` oversubscribed the *pair* of scopes
+/// while leaving each one fitting on its own, so half the passes refused nothing, no sweep ran on
+/// them, the resident bits survived the round, and the test passed at 1 and at 2 alike —
+/// discriminating nothing.
+///
+/// What this constant buys is tolerance of a workload that alternates between scopes rather than
+/// staying in one. 2 is the smallest value with that property, and the property is structural
+/// rather than tuned: a scope walked every other pass reads probed on its own pass, so its idle
+/// count returns to 0 before it can reach 2. At 1 the two scopes take turns evicting each other,
+/// each clearing the other's filters immediately before they are needed — the corrected test shows
+/// the resident scope fully evicted in the first round at 1, against zero evictions across four
+/// rounds at 2. Any k tolerates a cycle of period <= k; 2 covers the alternation and costs one
+/// extra sweep of latency before a genuinely dead resident set is released.
+const IDLE_SWEEPS_BEFORE_EVICTION: u8 = 2;
+
 /// Real byte cost of caching `filter`.
 ///
 /// An earlier version estimated this from the identifier count, on the stated grounds that
@@ -113,27 +133,54 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// Thread-safe cache of per-file Bloom filters, keyed by path and validated
 /// by mtime. Stale entries are automatically rebuilt on access.
 ///
-/// Bounded by `ceiling`. Once the budget is reached the cache stops accepting new entries
-/// rather than evicting, because eviction needs an access order `DashMap` does not keep and a
-/// miss only costs a rebuild.
+/// Bounded by `ceiling`, and **adaptive** within it: admission is refused when the budget is
+/// full, and entries the workload has stopped probing are released so the refusal does not become
+/// permanent. `begin_pass` carries the design; this is what it is for and what it cost to arrive
+/// at.
 ///
-/// Known limitation, stated because the first version of this comment justified the design with
-/// a claim that does not hold ("repeated walks visit files in a similar order, so what gets in
-/// early is also what gets re-probed"). Successive tool calls routinely supply *different*
-/// scopes, and the natural agent shape is adversarial to this: a broad query at the repo root
-/// fills the budget with whatever the walk reached first, then the agent narrows to one subtree
-/// for the next fifty calls and nothing it touches is ever admitted. In that regime the cache
-/// is dead weight — bounded, but useless. A generational reset (clear and start over when the
-/// ceiling is hit) would fix it without needing an access order; not done here.
+/// # The regime this exists to fix
 ///
-/// #40 tracks that, and this module now carries the instrumentation and measurement for it. The
-/// regime is real and worse than the paragraph above guesses: on a ~147k-file C++ tree, five
-/// `kind: "callers"` queries scoped to one subtree after one broad query at the root score 0.0%
-/// against 80.0% for the same five queries on a cache that was never poisoned — and the subtree
-/// caches completely in 1.9 MB, so the budget is being spent keeping 32 MB that cannot be used.
+/// The cache used to refuse and nothing more, on the grounds that eviction needs an access order
+/// `DashMap` does not keep and a miss only costs a rebuild. The justification originally offered
+/// for that — "repeated walks visit files in a similar order, so what gets in early is also what
+/// gets re-probed" — does not hold. Successive tool calls routinely supply *different* scopes, and
+/// the natural agent shape is adversarial: a broad query at the repo root fills the budget with
+/// whatever the walk reached first, then the agent narrows to one subtree for the next fifty calls
+/// and nothing it touches is ever admitted. Bounded, but useless.
 ///
-/// A first attempt at the reset was written, measured, and **rejected**. What it established is
-/// worth more than the code was, because all of it is about why the obvious fixes do not work:
+/// #40 measured it, and it was worse than that paragraph guessed. A ~147k-file C++ tree, five
+/// `kind: "callers"` calls scoped to one subtree after one broad call at the root,
+/// `TILTH_THREADS=1`, against the same five on a cache that was never poisoned:
+///
+/// ```text
+///                        hit rate   resident after
+/// refusing (before)          0.0%          32.0 MB
+/// sweeping (now)            40.0%           1.9 MB
+/// fresh cache (control)     80.0%           1.9 MB
+/// ```
+///
+/// The subtree caches completely in 1.9 MB, so the old cache was refusing the 1.9 MB that would
+/// make it perfect in order to hold 32 MB it could never use. Both halves of that are now fixed —
+/// the hit rate and the 30 MB of dead residency.
+///
+/// **The 40% is adaptation latency, not the steady state.** Per call, sweeping arm: calls 0 and 1
+/// age the dead set out, call 2 admits the subtree, calls 3 and 4 run at 100.0%. The fresh
+/// control's 80.0% is 4/5 by construction — it pays one cold call and then hits — so a long
+/// session converges above it, not below. Five calls is the window #40 specified; it is short
+/// enough that two sweeps of latency cost 40 points of it.
+///
+/// It is not an artefact of one subtree size or one tree. A 182-probe scope on the same tree:
+/// 0.0% / 40.0% / 80.0%, resident 32.0 MB -> 0.3 MB. A ~23.5k-file mixed-language tree with a
+/// 2129-probe subtree: 0.0% / 40.0% / 80.0%, resident 32.0 MB -> 1.2 MB. The per-call trace is the
+/// same in all three, which is what should happen — the latency is two sweeps regardless of how big
+/// the new scope is or what it is written in.
+///
+/// # Why the obvious fixes do not work
+///
+/// A generational reset — clear the map when the ceiling is hit — is what #40's body proposed, and
+/// a first attempt at it was written, measured, and **rejected**. What that established is worth
+/// more than the code was, because all of it is about why the obvious fixes fail, and because
+/// every one of these failure modes is a way the present policy could have been written wrong:
 ///
 /// * Refusal is a *good* policy when the working set genuinely exceeds the ceiling. Hit rate
 ///   degrades smoothly with the ceiling's share of the working set, because whatever got in keeps
@@ -187,7 +234,66 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 ///   forgiven by any hit — an overloaded cache re-hits the block admitted just before each clear,
 ///   so the penalty never accumulates and the cache resets once per walk forever.
 ///
-/// `peak_miss_run` exists to feed the next attempt at this.
+/// `peak_miss_run` remains as instrumentation. Nothing branches on it, and after the above nothing
+/// should: it is the counter-example, not the signal.
+///
+/// # What works instead
+///
+/// Every rejected trigger above thresholds a **count**, and each has a regime where a cache that is
+/// full and earning reads exactly like a cache that is full and dead. Fullness cannot be the
+/// signal, because both are full.
+///
+/// What separates them is a **set**, not a count: which resident entries the workload is still
+/// probing. An overloaded cache probes every resident entry on every walk — that is precisely why
+/// refusal degrades gracefully there — while the #40 cache probes none of them. So the decision is
+/// per-entry and needs no threshold at all: an entry that survived a whole walk unprobed is not
+/// part of the current working set. `begin_pass` is where that is implemented and argued;
+/// `IDLE_SWEEPS_BEFORE_EVICTION` is the one number, and it exists to tolerate a workload that
+/// alternates between scopes rather than to tune a rate.
+///
+/// The overloaded case therefore comes out **identical**, not merely close. Repeated walks over one
+/// scope, ceiling as a fraction of that scope's working set, paired within a single run so both
+/// arms see the same tree in the same state (`TILTH_THREADS=1`):
+///
+/// ```text
+/// ceiling / working set   ~147k-file C++ tree        ~23.5k-file mixed tree
+///                         refusing  sweeping  evicted   refusing  sweeping  evicted
+/// 0.25x                      25.6%     25.6%        0      12.4%     12.4%        0
+/// 0.50x                      45.7%     45.7%        0      35.0%     35.0%        0
+/// 0.75x                      64.6%     64.6%        0      57.0%     57.0%        0
+/// 1.00x                      80.0%     80.0%        0      80.0%     80.0%        0
+/// ```
+///
+/// Equal to the probe on every row, on two trees, because no sweep found anything to age. That is
+/// the point of pairing the arms rather than comparing against the table in `mod adaptivity`: those
+/// rows carry up to 15.9 points of run-to-run spread, so "within noise" would have been weak
+/// evidence for the one property this policy must not break. Identical is not.
+///
+/// The shape that *can* defeat "unprobed for a whole pass" is alternation between two scopes, which
+/// none of the earlier attempts had a fixture for. Four rounds of A, B against two disjoint
+/// subtrees, ceiling as a fraction of the pair's combined working set:
+///
+/// ```text
+/// ceiling / working set   C++ pair                   C# pair
+///                         refusing  sweeping  evicted   refusing  sweeping  evicted
+/// 0.25x                      21.6%     21.6%        0       9.8%      9.8%        0
+/// 0.50x                      42.1%     42.1%        0      36.4%     36.4%        0
+/// 0.75x                      59.7%     59.7%        0      53.3%     53.3%        0
+/// ```
+///
+/// Also identical, and for a reason rather than by luck — see `IDLE_SWEEPS_BEFORE_EVICTION`, and
+/// `scopes_visited_in_alternation_do_not_evict_each_other`, which fails at a bound of 1.
+///
+/// Peak memory is bounded exactly as before. The sweep only ever frees, and frees in place —
+/// `retain` erases each bucket under its shard's write lock, so no transient holds two generations
+/// and the ceiling bounds resident bytes during a sweep as it does outside one. The trace above
+/// shows the accounting going 32.0 MB -> 0.0 -> 1.9 MB with nothing in between above the ceiling.
+/// What this does *not* claim is that process RSS falls by the same 30 MB: the allocator is under
+/// no obligation to return freed pages to the OS. The bound is what is asserted, not the return.
+///
+/// Output is unaffected, as it must be and as it has been across #32 and #37: a filter is only ever
+/// a pre-filter ahead of a real `memmem` check and a parse, so an evicted entry costs a rebuild and
+/// never a wrong answer.
 pub struct BloomFilterCache {
     filters: DashMap<PathBuf, CachedFilter>,
     /// Sum of `CachedFilter::bytes` over the map.
@@ -246,6 +352,29 @@ pub struct BloomFilterCache {
     /// bound is a per-tree tuning parameter in disguise. Recording the real distribution is what
     /// lets the next attempt normalise against something scale-free instead of guessing again.
     peak_miss_run: std::sync::atomic::AtomicUsize,
+    /// Passes currently in flight. See `begin_pass`.
+    ///
+    /// A count rather than a flag because passes nest and overlap: `analyze_deps` and `grok` each
+    /// drive one, `edit::apply_batch` fans out with `into_par_iter` and every task can reach
+    /// `find_callers_batch` at once. Only the pass that takes this back to zero may sweep — an
+    /// eviction decided while another walk is still probing would read "unprobed" for files that
+    /// walk simply has not reached yet.
+    active_passes: std::sync::atomic::AtomicUsize,
+    /// Refusals since the current sweep window opened; zeroed by `end_pass`.
+    ///
+    /// The gate on sweeping at all. No refusals means the ceiling was never in the way during
+    /// this pass, so there is no demand the resident set is crowding out and nothing to gain by
+    /// dropping any of it. Distinct from `refusals`, which is cumulative and report-only.
+    pass_refusals: std::sync::atomic::AtomicUsize,
+    /// Set while a sweep is running, so two passes ending together sweep once.
+    ///
+    /// A second concurrent sweep would be *correct* — `retain` takes each shard's write lock and
+    /// the accounting rides inside it — but it would double-count the idle increment, ageing every
+    /// entry two passes for one pass of elapsed work.
+    sweeping: std::sync::atomic::AtomicBool,
+    /// Sweeps run, and entries they dropped. Report-only, for the harness in `mod adaptivity`.
+    sweeps: std::sync::atomic::AtomicUsize,
+    evictions: std::sync::atomic::AtomicUsize,
 }
 
 struct CachedFilter {
@@ -253,6 +382,17 @@ struct CachedFilter {
     mtime: SystemTime,
     /// What this entry contributed to `bytes`, so replacing a stale entry can subtract it.
     bytes: usize,
+    /// Probed since the last sweep. Set by every hit, cleared by the sweep that reads it.
+    ///
+    /// Atomic because the hit path holds only the `DashMap` shard *read* guard — `contains_any`
+    /// deliberately does not take the write lock to record a hit, since that would serialise
+    /// every probe of a shard behind every other. The sweep reads it through `&mut V` under the
+    /// write lock, so the two never overlap; the atomic is what makes probes from *different*
+    /// walk threads sound.
+    probed: std::sync::atomic::AtomicBool,
+    /// Consecutive sweeps that found this entry unprobed. Only ever touched under the shard write
+    /// lock `retain` holds, so a plain integer is enough.
+    idle: u8,
 }
 
 impl Default for BloomFilterCache {
@@ -280,6 +420,11 @@ impl BloomFilterCache {
             refusals: std::sync::atomic::AtomicUsize::new(0),
             miss_run: std::sync::atomic::AtomicUsize::new(0),
             peak_miss_run: std::sync::atomic::AtomicUsize::new(0),
+            active_passes: std::sync::atomic::AtomicUsize::new(0),
+            pass_refusals: std::sync::atomic::AtomicUsize::new(0),
+            sweeping: std::sync::atomic::AtomicBool::new(false),
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
+            evictions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -337,6 +482,137 @@ impl BloomFilterCache {
     pub(crate) fn take_peak_miss_run(&self) -> usize {
         self.miss_run.store(0, Relaxed);
         self.peak_miss_run.swap(0, Relaxed)
+    }
+
+    /// Open a pass, and reclaim the bytes of anything the previous one did not touch.
+    ///
+    /// A **pass** is one walk over a scope — `find_callers_batch`, the only place a whole tree is
+    /// enumerated against this cache. The guard closes it on drop, including on the `?` paths.
+    ///
+    /// The pass is the unit that makes eviction possible here at all. `DashMap` keeps no access
+    /// order, so the cache cannot rank entries by recency, and #40 measured what the alternative —
+    /// refusing every admission once full — costs: 0.0% hit rate against 80.0% achievable, holding
+    /// 32 MB to serve a subtree that caches completely in 1.9 MB. But it also measured why the
+    /// obvious repairs fail. Every trigger tried before this one thresholded a *count* — hit rate
+    /// over a window, refused bytes against the ceiling, consecutive misses — and each one has a
+    /// regime where a cache that is full and earning reads the same as a cache that is full and
+    /// dead. Fullness is not the signal, because both are full.
+    ///
+    /// What separates them is not a count but a *set*: which resident entries the workload is
+    /// still probing. An overloaded cache — working set genuinely larger than the ceiling — probes
+    /// **every** resident entry on every pass; that is what makes refusal degrade gracefully there,
+    /// since whatever got in keeps earning. The #40 cache probes **none** of them. So the trigger
+    /// is per-entry and needs no threshold: an entry that survived a whole pass without being
+    /// probed is not part of the current working set, and its bytes are better spent on something
+    /// that is. (`IDLE_SWEEPS_BEFORE_EVICTION` requires two such sweeps rather than one, which is
+    /// not a rate threshold in disguise — it is what makes a workload alternating between two
+    /// scopes stable. See there.)
+    ///
+    /// That gives the overloaded case a guarantee rather than a measurement. Every resident entry
+    /// is probed each pass, so every `probed` bit is set, so the sweep evicts nothing and the cache
+    /// behaves exactly as refusal did. The thrash rows in `mod adaptivity` are noisy enough that a
+    /// measured no-regression would have been weak evidence; this one is structural.
+    ///
+    /// Nesting and concurrency are why this is a counter and not a flag — see `active_passes`.
+    pub(crate) fn begin_pass(&self) -> PassGuard<'_> {
+        self.active_passes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PassGuard {
+            cache: self,
+            sweep: true,
+        }
+    }
+
+    /// Close a pass and sweep if this was the last one in flight.
+    fn end_pass(&self, sweep: bool) {
+        if self
+            .active_passes
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            != 1
+        {
+            // Another walk is still probing. Its files would read as unprobed only because it has
+            // not reached them.
+            return;
+        }
+        if !sweep {
+            return;
+        }
+        if self.pass_refusals.swap(0, Relaxed) == 0 {
+            // Nothing was refused, so the ceiling never got in the way and no admission is waiting
+            // on these bytes. Ageing entries here would evict a cache with room to spare.
+            return;
+        }
+        self.sweep();
+    }
+
+    /// Drop entries unprobed for `IDLE_SWEEPS_BEFORE_EVICTION` consecutive sweeps.
+    ///
+    /// `retain` takes one shard's write lock at a time and calls the closure while holding it, so
+    /// the `sub_bytes` below is inside the lock for the key it is un-charging. That is the same
+    /// discipline `admit` follows and for the same reason — see the note on `bytes`, where doing
+    /// this arithmetic outside the lock double-billed permanently.
+    ///
+    /// Frees in place: `retain` erases each bucket as it goes, so the peak never holds two
+    /// generations and the ceiling bounds resident bytes during a sweep exactly as it does outside
+    /// one. That is the whole reason this is a `retain` rather than "build the survivor set, then
+    /// swap the map".
+    fn sweep(&self) {
+        if self
+            .sweeping
+            .swap(true, std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let mut evicted = 0usize;
+        self.filters.retain(|_, entry| {
+            if entry.probed.swap(false, Relaxed) {
+                entry.idle = 0;
+                return true;
+            }
+            entry.idle = entry.idle.saturating_add(1);
+            if entry.idle < IDLE_SWEEPS_BEFORE_EVICTION {
+                return true;
+            }
+            self.sub_bytes(entry.bytes);
+            evicted += 1;
+            false
+        });
+        self.sweeps.fetch_add(1, Relaxed);
+        self.evictions.fetch_add(evicted, Relaxed);
+        self.sweeping
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Sweeps run since construction. Test/diagnostic accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn sweeps_run(&self) -> usize {
+        self.sweeps.load(Relaxed)
+    }
+
+    /// Entries dropped by sweeps since construction. Test/diagnostic accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn entries_evicted(&self) -> usize {
+        self.evictions.load(Relaxed)
+    }
+
+    /// Filters currently resident. Test/diagnostic accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn resident_entries(&self) -> usize {
+        self.filters.len()
+    }
+
+    /// What the map actually holds, summed by walking it. Test/diagnostic accessor.
+    ///
+    /// `cached_bytes` is the running counter; this is ground truth. The two must agree, and the
+    /// only reason to have both is to assert that they do — the counter has been wrong before, in
+    /// a way that pinned the budget permanently with a fraction of it real.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn summed_entry_bytes(&self) -> usize {
+        self.filters.iter().map(|e| e.value().bytes).sum()
     }
 
     /// Extend the current miss run and record it if it is the longest so far.
@@ -465,6 +741,9 @@ impl BloomFilterCache {
             if entry.mtime == mtime {
                 self.hits.fetch_add(1, Relaxed);
                 self.miss_run.store(0, Relaxed);
+                // This entry is part of the working set of whatever pass is running. `sweep`
+                // reads and clears the bit; see `begin_pass`.
+                entry.probed.store(true, Relaxed);
                 return targets.any(|t| entry.filter.contains(t.as_ref()));
             }
         }
@@ -502,31 +781,29 @@ impl BloomFilterCache {
                 self.sub_bytes(stale);
                 if self.fits(cost) {
                     self.bytes.fetch_add(cost, Relaxed);
-                    occupied.insert(CachedFilter {
-                        filter,
-                        mtime,
-                        bytes: cost,
-                    });
+                    occupied.insert(fresh_entry(filter, mtime, cost));
                 } else {
                     // Its budget is already reclaimed and its mtime can never match again, so
                     // keeping it would be resident memory the counter no longer knows about.
-                    self.refusals.fetch_add(1, Relaxed);
+                    self.note_refusal();
                     occupied.remove();
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 if self.fits(cost) {
                     self.bytes.fetch_add(cost, Relaxed);
-                    vacant.insert(CachedFilter {
-                        filter,
-                        mtime,
-                        bytes: cost,
-                    });
+                    vacant.insert(fresh_entry(filter, mtime, cost));
                 } else {
-                    self.refusals.fetch_add(1, Relaxed);
+                    self.note_refusal();
                 }
             }
         }
+    }
+
+    /// Record a refused admission, both cumulatively and against the current sweep window.
+    fn note_refusal(&self) {
+        self.refusals.fetch_add(1, Relaxed);
+        self.pass_refusals.fetch_add(1, Relaxed);
     }
 
     /// Would `cost` more bytes stay inside the ceiling? `saturating_add` so a corrupted counter
@@ -541,6 +818,53 @@ impl BloomFilterCache {
         let _ = self
             .bytes
             .fetch_update(Relaxed, Relaxed, |b| Some(b.saturating_sub(amount)));
+    }
+}
+
+/// A newly built entry, born already probed.
+///
+/// `probed: true` is not bookkeeping symmetry — it is a grace period, and without it the fix
+/// eats its own work. Admission happens *during* a pass, so the sweep at the end of that same
+/// pass would find every entry admitted after the last hit on it still unprobed, and start ageing
+/// a filter the walk had just paid to build. Marking it probed says what is already true: the
+/// probe that built it was a probe.
+fn fresh_entry(filter: BloomFilter, mtime: SystemTime, cost: usize) -> CachedFilter {
+    CachedFilter {
+        filter,
+        mtime,
+        bytes: cost,
+        probed: std::sync::atomic::AtomicBool::new(true),
+        idle: 0,
+    }
+}
+
+/// Open pass marker. Closing it is what may trigger a sweep; see `BloomFilterCache::begin_pass`.
+///
+/// RAII rather than a paired call so an early `?` inside a walk driver cannot leave the count
+/// raised — a leaked pass would suppress every future sweep for the life of the process, which is
+/// exactly the "bounded but useless" state #40 is about, reintroduced by a bookkeeping slip.
+pub(crate) struct PassGuard<'a> {
+    cache: &'a BloomFilterCache,
+    sweep: bool,
+}
+
+impl PassGuard<'_> {
+    /// Close this pass without sweeping, because the walk did not finish.
+    ///
+    /// A walk that quits early — a cancelled request, a per-request timeout — enumerated only part
+    /// of its scope, so "unprobed" for everything past the cut means "not reached", not "no longer
+    /// wanted". Ageing on that would let two consecutive timeouts evict a live working set. The
+    /// cost of skipping is nothing: the next complete pass sweeps, and the bits it reads are
+    /// conservative in the safe direction — a file the truncated walk *did* probe stays marked, so
+    /// the skipped sweep can only retain entries, never drop one it should have kept.
+    pub(crate) fn abandon(mut self) {
+        self.sweep = false;
+    }
+}
+
+impl Drop for PassGuard<'_> {
+    fn drop(&mut self) {
+        self.cache.end_pass(self.sweep);
     }
 }
 
@@ -780,8 +1104,15 @@ fn is_ident_continue(b: u8) -> bool {
 ///
 /// ```text
 /// TILTH_ADAPTIVITY_ROOT=<large tree> TILTH_ADAPTIVITY_SUBTREE=<a subdir of it> \
+///   TILTH_ADAPTIVITY_SUBTREE_B=<a second, disjoint subdir> \
 ///   cargo test --release adaptivity -- --ignored --nocapture
 /// ```
+///
+/// `TILTH_ADAPTIVITY_SUBTREE_B` is needed only by `adaptivity_alternating_scopes`; the other two
+/// tests skip it. Each test that has a before/after runs both arms **within one execution**, with
+/// sweeping suppressed on one of them by `no_sweeps` — see there for why that is done with the
+/// shipping code path rather than a test-only switch, and see the noise table below for why a
+/// cross-run comparison would not have been usable.
 ///
 /// It exists as a committed test rather than a throwaway script so the numbers in #40 can be
 /// reproduced, and so the *shape* of the measurement is reviewable. It asserts almost nothing —
@@ -834,6 +1165,8 @@ mod adaptivity {
         refusals: usize,
         bytes: usize,
         peak_run: usize,
+        sweeps: usize,
+        evictions: usize,
     }
 
     impl Snap {
@@ -844,6 +1177,8 @@ mod adaptivity {
                 refusals: c.admissions_refused(),
                 bytes: c.cached_bytes(),
                 peak_run: c.peak_miss_run(),
+                sweeps: c.sweeps_run(),
+                evictions: c.entries_evicted(),
             }
         }
 
@@ -880,8 +1215,10 @@ mod adaptivity {
         println!(
             "{label:28} probes={probes:>8}  hits={hits:>8}  builds={builds:>8}  \
              hit_rate={rate:>5.1}%  refused/build={refused_share:>5.1}%  \
-             resident={resident_mb:.1}MB  peak_miss_run={:>7}",
-            after.peak_run
+             resident={resident_mb:.1}MB  peak_miss_run={:>7}  sweeps={:>4}  evicted={:>8}",
+            after.peak_run,
+            after.sweeps - before.sweeps,
+            after.evictions - before.evictions
         );
     }
 
@@ -927,6 +1264,11 @@ mod adaptivity {
     /// can reach when the budget has not already been spent on unrelated files. The gap between
     /// them is the cost of the cache not adapting; if there is no gap, #40 is not a real problem
     /// and the honest outcome is to document it and close.
+    ///
+    /// Since the fix there is a second control: the same poisoned sequence with sweeping
+    /// **suppressed**, which is what this cache did before it could evict. See `no_sweeps` for how
+    /// that is arranged without a test-only switch. Three arms, then: refusal, adaptive, and the
+    /// fresh-cache upper bound.
     #[test]
     #[ignore = "needs a tree large enough to fill the 32 MB ceiling; see module docs"]
     #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
@@ -944,7 +1286,27 @@ mod adaptivity {
             .unwrap_or(5);
         let t = targets();
 
-        // --- Arm A: broad query first, then narrow (the adversarial agent shape) ---
+        // --- Arm R: the pre-fix behaviour — poisoned, and never allowed to sweep ---
+        let refusing = BloomFilterCache::new();
+        let suppress = no_sweeps(&refusing);
+        let r0 = Snap::of(&refusing);
+        let _ = crate::search::callers::find_callers_batch(&t, &root, &refusing, None);
+        let r1 = Snap::of(&refusing);
+        report("R broad (fills budget)", r0, r1);
+        for i in 0..narrow_calls {
+            let before = Snap::of(&refusing);
+            let _ = crate::search::callers::find_callers_batch(&t, &sub, &refusing, None);
+            report(&format!("R narrow #{i}"), before, Snap::of(&refusing));
+        }
+        let r_end = Snap::of(&refusing);
+        report("R narrow total", r1, r_end);
+        assert_eq!(
+            r_end.sweeps, 0,
+            "the suppressed arm swept, so it is not measuring refusal"
+        );
+        drop(suppress);
+
+        // --- Arm A: the same shape, sweeping live ---
         let poisoned = BloomFilterCache::new();
         let a0 = Snap::of(&poisoned);
         let _ = crate::search::callers::find_callers_batch(&t, &root, &poisoned, None);
@@ -972,22 +1334,37 @@ mod adaptivity {
         let b_end = Snap::of(&fresh);
         report("B narrow total", b0, b_end);
 
-        let (ah, ab, _) = a_end.since(a1);
-        let (bh, bb, _) = b_end.since(b0);
-        let (ar, br) = (
-            ah as f64 / (ah + ab).max(1) as f64,
-            bh as f64 / (bh + bb).max(1) as f64,
+        let rr = hit_rate(r1, r_end);
+        let ar = hit_rate(a1, a_end);
+        let br = hit_rate(b0, b_end);
+        println!(
+            "\nnarrow-phase hit rate: refusing {rr:.1}%  adaptive {ar:.1}%  fresh {br:.1}%  \
+             (adaptive recovers {:.1} of the {:.1} points refusal gave up)",
+            ar - rr,
+            br - rr
         );
         println!(
-            "\nnarrow-phase hit rate: poisoned {:.1}% vs fresh {:.1}%  (gap {:.1} points)",
-            ar * 100.0,
-            br * 100.0,
-            (br - ar) * 100.0
+            "if the refusing/fresh gap is ~0, a full cache costs nothing here and #40 should be \
+             documented, not fixed"
         );
-        println!(
-            "if the gap is ~0, a full cache costs nothing here and #40 should be documented, \
-             not fixed"
-        );
+    }
+
+    /// Hit rate over the interval between two snapshots, as a percentage.
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn hit_rate(before: Snap, after: Snap) -> f64 {
+        let (hits, builds, _) = after.since(before);
+        hits as f64 / (hits + builds).max(1) as f64 * 100.0
+    }
+
+    /// Hold sweeping off for as long as the returned guard lives.
+    ///
+    /// No test-only switch, and deliberately so: the arm that is supposed to reproduce the old
+    /// behaviour has to run the *shipping* code path, or it measures a second implementation
+    /// instead of the one under test. An outer pass that never closes is exactly the state
+    /// `end_pass` refuses to sweep in — another walk is still in flight — so the whole sequence
+    /// runs with admission-refusal as its only policy and every other line of the cache unchanged.
+    fn no_sweeps(cache: &BloomFilterCache) -> PassGuard<'_> {
+        cache.begin_pass()
     }
 
     /// The case that constrains the fix: a working set genuinely larger than the ceiling.
@@ -1038,30 +1415,115 @@ mod adaptivity {
         );
 
         // Ceiling as a fraction of the working set. 1.0 is the adequate case for reference.
+        //
+        // Each row runs twice — sweeping suppressed and live — because the noise on these rows is
+        // wide enough (up to 15.9 points at 0.50x on one fixture) that a live number compared
+        // against a table in a comment proves nothing. Paired within one run, against the same
+        // tree in the same state, they answer the only question that matters here: did the policy
+        // move this row at all?
         for frac in [0.25_f64, 0.5, 0.75, 1.0] {
             #[allow(clippy::cast_sign_loss, reason = "frac and needed are both positive")]
             #[allow(clippy::cast_possible_truncation, reason = "byte count fits usize")]
             let ceiling = (needed as f64 * frac) as usize;
-            let cache = BloomFilterCache::with_ceiling(ceiling);
-            let b0 = Snap::of(&cache);
-            // Sample the peak miss run per walk, not cumulatively. Walk 0 over a fresh cache has no
-            // hits available to interrupt it, so its run is the whole probe count at *every*
-            // ceiling — including a ceiling that fits the working set entirely. Reading a running
-            // maximum therefore reports that constant and hides the steady-state run, which is the
-            // number an adaptive trigger would actually have to threshold on. Reporting both is
-            // what reconciles two measurements of "the miss run" that disagreed by 6x.
-            let mut runs = Vec::new();
-            for _ in 0..5 {
-                let _ = crate::search::callers::find_callers_batch(&t, &sub, &cache, None);
-                runs.push(cache.take_peak_miss_run());
+            for sweeping in [false, true] {
+                let cache = BloomFilterCache::with_ceiling(ceiling);
+                let suppress = (!sweeping).then(|| no_sweeps(&cache));
+                let b0 = Snap::of(&cache);
+                // Sample the peak miss run per walk, not cumulatively. Walk 0 over a fresh cache
+                // has no hits available to interrupt it, so its run is the whole probe count at
+                // *every* ceiling — including a ceiling that fits the working set entirely.
+                // Reading a running maximum therefore reports that constant and hides the
+                // steady-state run, which is the number an adaptive trigger would actually have to
+                // threshold on. Reporting both is what reconciles two measurements of "the miss
+                // run" that disagreed by 6x.
+                let mut runs = Vec::new();
+                for _ in 0..5 {
+                    let _ = crate::search::callers::find_callers_batch(&t, &sub, &cache, None);
+                    runs.push(cache.take_peak_miss_run());
+                }
+                let b1 = Snap::of(&cache);
+                let policy = if sweeping { "sweeping" } else { "refusing" };
+                report(&format!("ceiling={frac:.2}x  {policy}"), b0, b1);
+                println!("{:30} per-walk peak miss run: {runs:?}", "");
+                drop(suppress);
             }
-            let b1 = Snap::of(&cache);
-            report(&format!("ceiling={frac:.2}x working set"), b0, b1);
-            println!("{:30} per-walk peak miss run: {runs:?}", "");
         }
         println!(
-            "\nthese hit rates are what refusal already achieves; a reset policy that scores \
-             below them on this row is a regression, however well it does on the narrow case"
+            "\nthe refusing rows are what refusal already achieves; a policy that scores below \
+             them here is a regression, however well it does on the narrow case. Zero evictions \
+             on the sweeping rows is the expected result, not a lucky one — every resident entry \
+             is probed on every walk, so no sweep has anything to age."
+        );
+    }
+
+    /// The regression case this policy invents, and the one the earlier attempts did not have:
+    /// a workload that **alternates** between two scopes.
+    ///
+    /// The thrash test above oversubscribes the ceiling with a single repeated walk, where every
+    /// resident entry is probed every time and no sweep can drop one. Alternation is the shape that
+    /// can defeat "unprobed for a whole sweep", because each scope genuinely goes unprobed while
+    /// the other is walked. `IDLE_SWEEPS_BEFORE_EVICTION` is what holds the line, and this is where
+    /// the claim is measured on real trees rather than argued from a synthetic fixture.
+    ///
+    /// Needs a second subtree, disjoint from the first: `TILTH_ADAPTIVITY_SUBTREE_B`.
+    #[test]
+    #[ignore = "needs TILTH_ADAPTIVITY_SUBTREE and TILTH_ADAPTIVITY_SUBTREE_B; see module docs"]
+    #[allow(clippy::cast_precision_loss, reason = "diagnostic output only")]
+    fn adaptivity_alternating_scopes() {
+        let (Some(a), Some(b)) = (
+            std::env::var_os("TILTH_ADAPTIVITY_SUBTREE").map(std::path::PathBuf::from),
+            std::env::var_os("TILTH_ADAPTIVITY_SUBTREE_B").map(std::path::PathBuf::from),
+        ) else {
+            println!(
+                "SKIPPED (need TILTH_ADAPTIVITY_SUBTREE and TILTH_ADAPTIVITY_SUBTREE_B) — \
+                 measured nothing"
+            );
+            return;
+        };
+        let t = targets();
+        println!("walk threads: {}", walk_threads());
+
+        // Size the pair together, then squeeze. At 0.5x neither scope can be fully resident, which
+        // is the regime where an over-eager trigger ping-pongs.
+        let sizing = BloomFilterCache::with_ceiling(usize::MAX / 2);
+        let _ = crate::search::callers::find_callers_batch(&t, &a, &sizing, None);
+        let _ = crate::search::callers::find_callers_batch(&t, &b, &sizing, None);
+        let needed = sizing.cached_bytes();
+        assert_eq!(
+            sizing.admissions_refused(),
+            0,
+            "sizing run hit its ceiling, so every row below is mislabelled"
+        );
+        println!(
+            "both scopes need {:.2}MB to cache fully",
+            needed as f64 / (1024.0 * 1024.0)
+        );
+
+        for frac in [0.25_f64, 0.5, 0.75] {
+            #[allow(clippy::cast_sign_loss, reason = "frac and needed are both positive")]
+            #[allow(clippy::cast_possible_truncation, reason = "byte count fits usize")]
+            let ceiling = (needed as f64 * frac) as usize;
+            for sweeping in [false, true] {
+                let cache = BloomFilterCache::with_ceiling(ceiling);
+                let suppress = (!sweeping).then(|| no_sweeps(&cache));
+                let start = Snap::of(&cache);
+                for _ in 0..4 {
+                    for scope in [&a, &b] {
+                        let _ = crate::search::callers::find_callers_batch(&t, scope, &cache, None);
+                    }
+                }
+                let policy = if sweeping { "sweeping" } else { "refusing" };
+                report(
+                    &format!("alternating {frac:.2}x  {policy}"),
+                    start,
+                    Snap::of(&cache),
+                );
+                drop(suppress);
+            }
+        }
+        println!(
+            "\nthe sweeping rows must not score below the refusing ones. If they do, the idle \
+             bound is too tight for this alternation and the two scopes are clearing each other."
         );
     }
 }
@@ -1330,6 +1792,310 @@ mod tests {
         assert_eq!(
             charged, single,
             "{threads} concurrent probes of one path charged {charged} bytes for a {single}-byte              entry — the accounting is outside the shard lock again"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass-scoped eviction (#40)
+    // -----------------------------------------------------------------------
+
+    /// One probe of one synthetic file, as a walk would make it.
+    fn probe(cache: &BloomFilterCache, path: &str, content: &str) {
+        assert!(
+            cache.contains(
+                &PathBuf::from(path),
+                SystemTime::UNIX_EPOCH,
+                content,
+                "ident_7"
+            ),
+            "a present symbol must be found regardless of admission ({path})"
+        );
+    }
+
+    /// Bytes one entry of this content costs, so ceilings below are exact multiples of an entry
+    /// rather than guesses that happen to admit "about" the intended number.
+    fn cost_of(content: &str) -> usize {
+        entry_bytes(&build_filter(content, None))
+    }
+
+    /// The #40 regime, in miniature: a broad pass fills the budget, then the workload narrows to a
+    /// set that is disjoint from it. The resident set has to be released, or the narrow set is
+    /// refused forever.
+    ///
+    /// The assertion is on the **last** narrow pass costing no builds at all. Under refusal it
+    /// costs one per file, for ever, which is the 0.0% hit rate #40 measured on a real tree.
+    #[test]
+    fn a_resident_set_the_workload_stopped_probing_is_released() {
+        let content = ident_content(200);
+        // Room for the broad set alone. The narrow set cannot fit alongside it, so it can only be
+        // admitted if the broad set goes.
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 20);
+
+        {
+            let _pass = cache.begin_pass();
+            for f in 0..40 {
+                probe(&cache, &format!("/broad/{f}.rs"), &content);
+            }
+        }
+        assert!(
+            cache.admissions_refused() > 0,
+            "the broad pass never filled the budget, so nothing below is about a full cache"
+        );
+        assert_eq!(cache.resident_entries(), 20);
+
+        // The agent narrows. Passes 1 and 2 age the broad set out, pass 3 admits the narrow set,
+        // pass 4 is served entirely from cache.
+        for _ in 0..3 {
+            let _pass = cache.begin_pass();
+            for f in 0..10 {
+                probe(&cache, &format!("/narrow/{f}.rs"), &content);
+            }
+        }
+
+        let before = (cache.filters_built(), cache.cache_hits());
+        {
+            let _pass = cache.begin_pass();
+            for f in 0..10 {
+                probe(&cache, &format!("/narrow/{f}.rs"), &content);
+            }
+        }
+        let built = cache.filters_built() - before.0;
+        let hit = cache.cache_hits() - before.1;
+        assert_eq!(
+            (built, hit),
+            (0, 10),
+            "the narrow set is still not resident: {built} builds and {hit} hits in a pass over \
+             10 files the workload has probed four times"
+        );
+        assert_eq!(
+            cache.resident_entries(),
+            10,
+            "the broad set is still holding budget it has not earned since pass 0"
+        );
+        assert_eq!(
+            cache.cached_bytes(),
+            cache.summed_entry_bytes(),
+            "eviction lost track of the budget"
+        );
+    }
+
+    /// The case the fix must **not** touch: a working set genuinely larger than the ceiling.
+    ///
+    /// Refusal degrades gracefully here — whatever got in keeps earning — and #40 ruled out three
+    /// earlier triggers precisely because they cleared this cache. Every resident entry is probed
+    /// on every pass, so no sweep may drop one. This is a property, not a measurement: the
+    /// assertion is exactly zero evictions, not "not many".
+    ///
+    /// Neuter it by making the sweep clear unconditionally — the "generational reset" #40's body
+    /// proposed. That is the policy this test exists to reject.
+    #[test]
+    fn a_working_set_larger_than_the_ceiling_is_never_evicted() {
+        let content = ident_content(200);
+        // Ceiling at a quarter of the working set — the worst row in #40's thrash table.
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 10);
+
+        for _ in 0..5 {
+            let _pass = cache.begin_pass();
+            for f in 0..40 {
+                probe(&cache, &format!("/tree/{f}.rs"), &content);
+            }
+        }
+
+        assert!(
+            cache.sweeps_run() >= 4,
+            "no sweep ran ({}), so this asserts nothing about sweeping",
+            cache.sweeps_run()
+        );
+        assert_eq!(
+            cache.entries_evicted(),
+            0,
+            "an overloaded cache was cleared; refusal already scores ~25% here and this policy \
+             has to beat that, not reset it"
+        );
+        assert_eq!(cache.resident_entries(), 10);
+        assert!(
+            cache.cache_hits() >= 40,
+            "the resident tenth stopped earning: {} hits over five passes",
+            cache.cache_hits()
+        );
+    }
+
+    /// Two scopes visited in alternation must not evict each other.
+    ///
+    /// This is what `IDLE_SWEEPS_BEFORE_EVICTION` is for, and the test fails at 1: a scope goes
+    /// unprobed for exactly the pass its neighbour is being walked, so a one-pass trigger clears
+    /// each of them just before it is needed. At 2 the idle count returns to 0 on the scope's own
+    /// pass and never reaches the bound.
+    ///
+    /// The ceiling is below **each** scope, not merely below the two together. That is what makes
+    /// the test discriminate, and a first version that only oversubscribed the pair did not: the
+    /// idle count advances per *sweep*, and a sweep only runs on a pass that refused something, so
+    /// with room to spare on one scope's pass the resident set's `probed` bits survived the round
+    /// and even a one-pass trigger evicted nothing. Refusing on every pass is what puts a sweep at
+    /// the end of every pass.
+    #[test]
+    fn scopes_visited_in_alternation_do_not_evict_each_other() {
+        let content = ident_content(200);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 6);
+
+        for round in 0..4 {
+            for scope in ["a", "b"] {
+                let _pass = cache.begin_pass();
+                for f in 0..10 {
+                    probe(&cache, &format!("/{scope}/{f}.rs"), &content);
+                }
+            }
+            assert_eq!(
+                cache.entries_evicted(),
+                0,
+                "round {round}: alternating scopes evicted each other's filters"
+            );
+        }
+        assert!(
+            cache.sweeps_run() >= 8,
+            "only {} sweeps over 8 passes; the fixture stopped refusing and the alternation was \
+             never tested",
+            cache.sweeps_run()
+        );
+        assert!(
+            cache.cache_hits() >= 18,
+            "the resident scope stopped earning across the alternation: {} hits",
+            cache.cache_hits()
+        );
+    }
+
+    /// A cache with room to spare must never sweep, however long the session runs.
+    ///
+    /// The gate is `pass_refusals`: with no refusal there is no admission waiting on these bytes,
+    /// so ageing an entry buys nothing and costs a rebuild. Without the gate this session — three
+    /// passes over three disjoint file sets, all of which fit — would age out and evict the first
+    /// set for no reason at all.
+    #[test]
+    fn a_cache_with_room_to_spare_never_sweeps() {
+        let content = ident_content(200);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 100);
+
+        for set in 0..3 {
+            let _pass = cache.begin_pass();
+            for f in 0..10 {
+                probe(&cache, &format!("/set{set}/{f}.rs"), &content);
+            }
+        }
+
+        assert_eq!(cache.admissions_refused(), 0, "the fixture did not fit");
+        assert_eq!(cache.sweeps_run(), 0, "a cache with room to spare swept");
+        assert_eq!(cache.resident_entries(), 30);
+    }
+
+    /// A nested pass must not sweep — the outer walk is still probing, so its untouched files are
+    /// untouched only because it has not reached them yet.
+    ///
+    /// Reachable in production: `analyze_deps` and `grok` each drive a callers walk, and
+    /// `edit::apply_batch` fans out with `into_par_iter` so several run at once against the one
+    /// process-lifetime cache.
+    #[test]
+    fn a_nested_pass_does_not_sweep_before_the_outer_one_closes() {
+        // Every admission refused, so a sweep is always due on the refusal gate and the count is
+        // about pass nesting and nothing else.
+        let cache = BloomFilterCache::with_ceiling(0);
+        let content = ident_content(200);
+
+        let outer = cache.begin_pass();
+        {
+            let _inner = cache.begin_pass();
+            probe(&cache, "/nested/a.rs", &content);
+        }
+        assert_eq!(
+            cache.sweeps_run(),
+            0,
+            "the inner pass swept while the outer walk was still running"
+        );
+        drop(outer);
+        assert_eq!(cache.sweeps_run(), 1, "the outer close did not sweep");
+    }
+
+    /// A sweep running against concurrent admissions must leave `cached_bytes` equal to what the
+    /// map actually holds.
+    ///
+    /// The shape asked for by `concurrent_probes_of_one_path_charge_the_budget_once`, applied to
+    /// the other direction of the same hazard. Eviction un-charges, so it can desynchronise the
+    /// counter the way double-billing did — and the failure mode is the same: a permanently wrong
+    /// budget rather than a crash, leaving the cache strictly worse than no cache with nothing to
+    /// show why. `retain` calls its closure under the shard write lock, which is what keeps the
+    /// arithmetic on the right side of the lock; this is the assertion that it stays there.
+    #[test]
+    fn a_sweep_cannot_desynchronise_cached_bytes_from_the_map() {
+        use std::sync::{Arc, Barrier};
+
+        let content = Arc::new(ident_content(200));
+        // Small enough that admissions are refused throughout, so every pass close is due a sweep.
+        let cache = Arc::new(BloomFilterCache::with_ceiling(cost_of(&content) * 12));
+
+        // Two roles, and exactly **one** walker, because a fleet of identical pass-holders tests
+        // nothing: only the close that takes `active_passes` to zero may sweep, so overlapping
+        // passes suppress each other and the run ends with one sweep that raced nothing. Measured
+        // — two walkers produced 2 sweeps and 0 evictions across 400 rounds, and the test failed
+        // its own precondition about one run in eight. One walker sweeps on every close, so the
+        // race under test — a sweep un-charging while six other threads admit — runs hundreds of
+        // times per execution.
+        //
+        // What this does *not* cover is two sweeps at once. That needs thread X to observe the
+        // 1 -> 0 transition and begin sweeping while thread Y opens and closes a whole pass inside
+        // that window; only one thread can observe any given decrement, so the window is a sweep
+        // long and there is no way to hold it open from a test. The `sweeping` CAS is what makes
+        // it safe, and it is reasoned about rather than measured — stated because an untested
+        // guard should be labelled as one.
+        let probers = 6;
+        let walkers = 1;
+        let barrier = Arc::new(Barrier::new(probers + walkers));
+        let mut handles = Vec::new();
+
+        for t in 0..probers {
+            let cache = Arc::clone(&cache);
+            let content = Arc::clone(&content);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for round in 0..200 {
+                    // Two shared paths, which contend on one shard entry and stay hot, and eight
+                    // one-shot paths, which keep the budget moving and are exactly what a sweep
+                    // has to age out.
+                    probe(&cache, "/shared/a.rs", &content);
+                    probe(&cache, "/shared/b.rs", &content);
+                    for f in 0..8 {
+                        probe(&cache, &format!("/t{t}/r{round}/{f}.rs"), &content);
+                    }
+                }
+            }));
+        }
+
+        for w in 0..walkers {
+            let cache = Arc::clone(&cache);
+            let content = Arc::clone(&content);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for round in 0..200 {
+                    let _pass = cache.begin_pass();
+                    probe(&cache, &format!("/w{w}/r{round}.rs"), &content);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            cache.sweeps_run() > 0 && cache.entries_evicted() > 0,
+            "no sweep evicted anything ({} sweeps, {} evictions), so the race was never run",
+            cache.sweeps_run(),
+            cache.entries_evicted()
+        );
+        assert_eq!(
+            cache.cached_bytes(),
+            cache.summed_entry_bytes(),
+            "the counter and the map disagree after concurrent sweeps and admissions"
         );
     }
 
