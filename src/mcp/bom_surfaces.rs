@@ -967,25 +967,43 @@ fn every_dispatchable_and_advertised_tool_is_named() {
 /// removed the tool, so the exception is gone and the rule can be stated generally, which is the
 /// version that catches the *next* one.
 ///
-/// `tool_definitions(true)` on purpose: `tilth_write` is dispatchable but advertised only in edit
-/// mode, so the read-only schema is a strict subset and comparing against it would fail for a tool
-/// that is correctly gated. That exemption is only sound if the gate runs the other way too — a
-/// read-only server must *refuse* the tool it does not advertise — so the second half asserts it
-/// rather than trusting `dispatch_tool`'s `if edit_mode` arm by reading.
+/// The const-level half compares against `tool_definitions(true)`: `tilth_write` is dispatchable but
+/// advertised only in edit mode, so the read-only schema is a strict subset and comparing against it
+/// would fail for a tool that is correctly gated.
+///
+/// That exemption is why the second half exists, and why it is stated per mode rather than as a
+/// spot check. `tools/list` returns `tool_definitions(edit_mode)`, and read-only is the **default** —
+/// so an edit-only *definition* whose dispatch arm is ungated puts the read-only server back in
+/// exactly #86's state, answering a tool its own `tools/list` omits. The first version of this test
+/// named `tilth_write` twice by hand instead, which proved nothing about any other tool: moving
+/// `tilth_savings`'s definition inside `if edit_mode` while leaving its dispatch arm ungated left
+/// the whole suite green at 883 passed. Seven of the eight arms are ungated, so that shape is the
+/// default one, not an exotic one.
+///
+/// The oracle is `dispatch_tool`'s own answer under a `Services` built for each mode, not a reading
+/// of the `if edit_mode` arm — and it is the *message*, not merely `is_err()`. Every argument shape
+/// a tool rejects on its own errors identically whether the gate is there or not, so an `is_err()`
+/// assertion passes with `if edit_mode` deleted. Verified: it did. Only the `unknown tool` spelling
+/// comes from the gate, and it is the one a client sees.
 #[test]
 fn every_dispatchable_tool_is_advertised() {
-    let advertised: Vec<String> = tool_definitions(true)
-        .iter()
-        .map(|d| {
-            d["name"]
-                .as_str()
-                .expect("every definition has a name")
-                .to_string()
-        })
-        .collect();
+    let advertised = |edit_mode: bool| -> Vec<String> {
+        tool_definitions(edit_mode)
+            .iter()
+            .map(|d| {
+                d["name"]
+                    .as_str()
+                    .expect("every definition has a name")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // Const level: a name here with no definition in *either* mode is undiscoverable outright.
+    let in_edit_mode = advertised(true);
     let undiscoverable: Vec<&&str> = DISPATCHABLE_TOOLS
         .iter()
-        .filter(|t| !advertised.iter().any(|a| a == *t))
+        .filter(|t| !in_edit_mode.iter().any(|a| a == *t))
         .collect();
     assert!(
         undiscoverable.is_empty(),
@@ -994,25 +1012,35 @@ fn every_dispatchable_tool_is_advertised() {
          add a definition or remove the dispatch arm — see #86."
     );
 
-    // The one tool exempted above, checked in the direction the exemption depends on.
-    assert!(
-        !tool_definitions(false)
-            .iter()
-            .any(|d| d["name"] == "tilth_write"),
-        "`tilth_write` is advertised without --edit, so the edit-mode exemption above is unearned"
-    );
-    // The *message*, not merely `is_err()`. Every argument shape `tool_write` would reject on its
-    // own — an empty `files`, a missing one, a bad mode — errors identically whether the gate is
-    // there or not, so an `is_err()` assertion here passes with `if edit_mode` deleted. Verified:
-    // it did. Only the `unknown tool` spelling comes from the gate, and it is the one a client sees.
-    let read_only = Services::new(false);
-    let refusal = dispatch_tool("tilth_write", &json!({"files": []}), &read_only);
-    assert_eq!(
-        refusal.as_deref().map_err(String::as_str),
-        Err("unknown tool: tilth_write"),
-        "a read-only server did not refuse `tilth_write` as unknown — it never advertised the tool, \
-         so reaching its argument validation at all means the edit-mode gate is gone"
-    );
+    // Per mode: what the server *answers* and what it *announces* must be the same set. Empty
+    // arguments on purpose — every tool rejects them, and the assertion reads only whether the
+    // rejection is the gate's `unknown tool` spelling, so nothing here reaches real work.
+    for edit_mode in [false, true] {
+        let services = Services::new(edit_mode);
+        let announced = advertised(edit_mode);
+        for tool in DISPATCHABLE_TOOLS {
+            let answer = dispatch_tool(tool, &json!({}), &services);
+            let refused_as_unknown =
+                answer.as_deref().map_err(String::as_str) == Err(&*format!("unknown tool: {tool}"));
+            assert_eq!(
+                announced.iter().any(|a| a == tool),
+                !refused_as_unknown,
+                "with edit_mode={edit_mode}, `{tool}` is {} but {} — `tools/list` returns \
+                 `tool_definitions(edit_mode)`, so the two must agree per mode or a client sees a \
+                 tool list that does not match what the server answers (#86)",
+                if refused_as_unknown {
+                    "refused as unknown"
+                } else {
+                    "answered"
+                },
+                if announced.iter().any(|a| a == tool) {
+                    "advertised"
+                } else {
+                    "not advertised"
+                },
+            );
+        }
+    }
 }
 
 /// Recursively collect `(property name, enum variants)` from a schema, at any depth.

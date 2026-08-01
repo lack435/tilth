@@ -33,8 +33,8 @@ src/
 │                    InvalidQuery, IoError, ParseError)
 ├── format.rs        Output headers, line numbering, hashlines
 ├── budget.rs        Token cap (truncate output to a token budget)
-├── session.rs       Per-MCP-process counters: reads, searches, top
-│                    queries, hot dirs, expanded-set dedup
+├── session.rs       Per-MCP-process state: expanded-set dedup +
+│                    token-savings counters
 ├── cache.rs         OutlineCache: rendered outlines + parsed
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── overview.rs      Project fingerprint emitted at MCP `initialize`
@@ -172,8 +172,11 @@ methods worth describing in detail:
   and goes through `handle_tool_call`.
 
 Tool dispatch is routed by name through `dispatch_tool` to
-`tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_diff` /
-`tool_session` / `tool_edit` (the last only in edit mode).
+`tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_grok` /
+`tool_diff` / `tool_savings` / `tool_write` (the last only in edit mode).
+`dispatch_tool` gates on `DISPATCHABLE_TOOLS` before matching, and that
+list must equal what `tool_definitions` advertises in the same mode —
+`every_dispatchable_tool_is_advertised` in `mcp/bom_surfaces.rs` pins it.
 `tilth_map` is no longer reachable through MCP — its schema is omitted
 from `tools/list` and the dispatch stub has been removed. The CLI
 still has `tilth --map`; the MCP boundary was retired after benchmark
@@ -635,17 +638,26 @@ callers fall back to text-based heuristics.
 
 ### `Session` (`session.rs`)
 
-Per-MCP-process counters for the `tilth_session` tool. Tracks read
-counts, search counts, top queries, hot directories (each indexed
-file's parent), and an `expanded` set keyed by `path:line` so re-expanding
-a previously shown definition can return `[shown earlier]` instead of
-duplicating the source body.
+Per-MCP-process state, all of it read by a tool a client can call: an
+`expanded` map keyed by `path:line` (with the file's mtime at expand
+time) so re-expanding a previously shown definition returns
+`[shown earlier]` instead of duplicating the source body, and two
+cumulative token counters that are the sole input to `tilth_savings`.
 
-Concurrency: `AtomicUsize` counters; `Mutex<HashMap/HashSet>` for the
-maps. Poison handling is uniform via
+It used to hold more — read counts, search counts, top queries and hot
+directories — whose only reader was the `tilth_session` tool. #86
+removed that tool, which left them write-only, so they went with it.
+Anything added here needs a reader a client can reach.
+
+Concurrency: `AtomicU64` for the token counters, `Mutex<HashMap>` for
+`expanded`. Poison handling is uniform via
 `unwrap_or_else(PoisonError::into_inner)` — tilth deliberately doesn't
-try to handle a poisoned mutex specially; the data is best-effort
-telemetry.
+try to handle a poisoned mutex specially. Note this is no longer
+best-effort telemetry: `expanded` decides whether a client is shown a
+body or a `[shown earlier]` marker, so a lost write is a visible
+difference in output rather than a counter being off by one. Both
+writers refuse an abandoned request for that reason (see
+`cancel::worker_request_cancelled`).
 
 ### `BloomFilterCache` (`index/bloom.rs`)
 
@@ -710,7 +722,7 @@ and emits a structural change list per commit.
 
 Hash-anchored line edits. The `Edit` struct carries a start line
 and hash (`<line>:<hash>`), an end line and hash (equal to the start
-for single-line edits — the MCP `tool_edit` parser fills these in
+for single-line edits — the MCP `tool_write` parser fills these in
 when the JSON payload omits `end`), and a content string (empty =
 delete). `apply_edits` reads the file, hashes each line, validates
 that the supplied anchors match, and rewrites the file with the
@@ -725,7 +737,7 @@ compact `-`/`+` rendering of every edit site, `context` is the
 hashlined window around each rewrite. The formatter (`format_diffs`,
 also in `edit.rs`) produces the diff string itself.
 
-The callee-callers warning lives one layer up. `mcp::tool_edit`, on a
+The callee-callers warning lives one layer up. `mcp::tool_write`, on a
 successful `Applied` result, calls `search::blast::blast_radius` with
 the same `Edit` list and appends its output. The check is
 unconditional in MCP (every successful edit gets the warning); the
@@ -839,10 +851,18 @@ Concrete "if you wanted to change X, edit Y":
   `classify::classify` (place by precedence) → match arms in
   `lib::run_query_basic` and `lib::run_query_expanded` → handler in
   `search/`.
-- **Add a new MCP tool.** Schema in `mcp::tool_definitions(edit_mode)`
-  → dispatch arm in `mcp::dispatch_tool` → `tool_*` function near the
-  others. If the tool needs cross-call state, add it to the
-  `Session`/`OutlineCache` argument list and propagate.
+- **Add a new MCP tool.** Name in `mcp::DISPATCHABLE_TOOLS` → schema in
+  `mcp::tool_definitions(edit_mode)` → dispatch arm in
+  `mcp::dispatch_tool` → `tool_*` function near the others → row in
+  `mcp::bom_surfaces::SURFACES` with its arguments in `args_for`. The
+  first step is not optional: `dispatch_tool` gates on that list and
+  answers `unknown tool` before matching, so an arm without an entry is
+  unreachable. Skipping the second gives the inverse — a tool the
+  server answers and never announces, which is #86. Both directions are
+  asserted, per mode, so either omission fails the suite rather than
+  shipping. If the tool needs cross-call state, add it to the
+  `Session`/`OutlineCache` argument list and propagate — but only if a
+  tool a client can call will read it.
 - **Add a new search facet.** `FacetTotals` field in `types.rs` →
   `FacetedResult` field + partition rule in `search/facets.rs` →
   per-facet limit in `search/truncate.rs` → renderer entry in
