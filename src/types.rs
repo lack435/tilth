@@ -263,9 +263,41 @@ pub enum OutlineKind {
 }
 
 /// Detect test files by path patterns.
+///
+/// Each marker is matched where it actually means something, which is not what a whole-path
+/// `contains` does:
+///
+///   * `.test.` / `.spec.` are **file name** conventions — `auth.test.ts`, `parser.spec.js`. Nothing
+///     about a *directory* called `app.test.stuff` says its contents are tests.
+///   * `__tests__` is a **directory** convention, so it is matched as a whole path component.
+///
+/// The old spelling was `s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")`
+/// against the whole path, which let the directories *above* the project decide: a checkout at
+/// `/home/u/proj.spec.v2/` classified every file in it as a test. That is not hypothetical for the
+/// callers that get absolute paths, and the stakes are not uniform — `search::rank` docks a test
+/// file **120 points**, so an unlucky ancestor silently reorders every search result, and
+/// `read::outline` switches the file into test-file rendering entirely. The other three callers
+/// (`grok`, `blast`, `deps`) only group prod and test in their output.
+///
+/// Matching `__tests__` by component rather than by `"__tests__/"` also fixes it on Windows, where
+/// the embedded forward slash meant it never matched at all — so a `__tests__` tree was classified
+/// one way on Linux and another on Windows, the kind of platform split `overview`'s
+/// `path_bearing_lines_are_identical_across_platforms` exists to refuse.
+///
+/// **Residual, deliberately not fixed here:** a `__tests__` component *above* the project still
+/// matches, because distinguishing "inside the project" from "above it" needs a root and two of the
+/// five callers (`read::outline`, `blast`) have no scope to offer one. Narrow enough to accept —
+/// `__tests__` is a specific name, unlike a substring — and uniform across all five callers, which
+/// the pre-existing alternative was not.
 pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
-    let s = path.to_string_lossy();
-    s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")
+    let name_is_test = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .is_some_and(|n| n.contains(".test.") || n.contains(".spec."));
+
+    // Case-sensitive, as the old `contains("__tests__/")` was. Matching `__TESTS__` too would be a
+    // separate widening, and this change is meant to narrow.
+    name_is_test || path.components().any(|c| c.as_os_str() == "__tests__")
 }
 
 /// Tokens ≈ bytes / 4. Ceiling division, no float.
@@ -281,5 +313,73 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
         s
     } else {
         &s[..s.floor_char_boundary(max)]
+    }
+}
+
+#[cfg(test)]
+mod is_test_file_tests {
+    use super::is_test_file;
+    use std::path::PathBuf;
+
+    /// Build a path from components so the test says the same thing on both platforms.
+    fn p(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
+    }
+
+    /// The conventions themselves must still be recognised. Without this the narrowing below
+    /// passes against a function that returns `false` for everything.
+    #[test]
+    fn the_conventions_are_still_recognised() {
+        for parts in [
+            vec!["repo", "src", "auth.test.ts"],
+            vec!["repo", "src", "parser.spec.js"],
+            vec!["repo", "src", "__tests__", "auth.ts"],
+            vec!["repo", "__tests__", "nested", "deep.ts"],
+        ] {
+            assert!(
+                is_test_file(&p(&parts)),
+                "stopped recognising a test path: {parts:?}"
+            );
+        }
+    }
+
+    /// The reported defect: a directory *above* the project decided the answer for everything
+    /// inside it, because the markers were matched against the whole path.
+    ///
+    /// `search::rank` docks a test file 120 points, so under the old spelling a checkout at
+    /// `~/proj.spec.v2/` reordered every search result in it.
+    #[test]
+    fn an_ancestor_directory_does_not_make_a_file_a_test() {
+        for parts in [
+            vec!["home", "u", "proj.spec.v2", "src", "main.rs"],
+            vec!["home", "u", "app.test.stuff", "src", "main.rs"],
+            vec!["C:", "work", "x.test.y", "repo", "src", "lib.rs"],
+        ] {
+            assert!(
+                !is_test_file(&p(&parts)),
+                "a directory above the project still decides this file is a test: {parts:?}"
+            );
+        }
+    }
+
+    /// `__tests__` is matched as a whole component, not as a substring.
+    #[test]
+    fn a_partial_component_is_not_the_directory_convention() {
+        assert!(!is_test_file(&p(&["repo", "not__tests__here", "a.ts"])));
+        assert!(!is_test_file(&p(&["repo", "__tests__extra", "a.ts"])));
+    }
+
+    /// Case-sensitive, as the previous spelling was. Pinned so the narrowing is not read as a
+    /// licence to widen.
+    #[test]
+    fn the_directory_convention_is_case_sensitive() {
+        assert!(!is_test_file(&p(&["repo", "__TESTS__", "a.ts"])));
+    }
+
+    /// A plain `test` or `tests` directory is not one of the three markers, and never was.
+    #[test]
+    fn an_ordinary_tests_directory_is_unchanged() {
+        assert!(!is_test_file(&p(&["repo", "tests", "integration.rs"])));
+        assert!(!is_test_file(&p(&["repo", "test", "helper.rs"])));
     }
 }
