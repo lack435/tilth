@@ -295,6 +295,22 @@ pub fn analyze_deps(
 /// 2. Truncate "Uses (external)" to count only
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
+///
+/// The three `strip_prefix(scope).unwrap_or(...)` sites below keep their absolute-path fallback,
+/// which #94 asked for a decision on rather than a fix.
+///
+/// The fallback is reachable, and more easily than that issue's survey suggests: `analyze_deps`
+/// passes `canonical_boundary(scope)`, so `tilth_deps` with an absolute `path` outside the
+/// server's cwd renders every one of these lines as a host path. It is the right output anyway,
+/// for the reason `search/grok.rs`'s `display_rel` already gives — this is a search result, and
+/// an absolute path is a usable answer the agent can hand straight back to a read. It is also
+/// the path the *caller supplied*, so echoing it relative to an unrelated scope would be the
+/// misleading spelling, not the honest one.
+///
+/// `overview`'s hot line is different in both respects, which is why only it changed: nobody
+/// asked for that path, it is injected at every `initialize` under a fixed size budget, and the
+/// rest of the payload is relative to the launch directory — so an absolute path there is both
+/// noise and machine-specific output in an otherwise portable blurb.
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
     let dep_count = result.total_dependents;
     let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
