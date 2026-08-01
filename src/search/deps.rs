@@ -284,12 +284,12 @@ pub fn analyze_deps(
             // `caller_match.path` from a walk of the canonicalized `scope`. When they did not,
             // this never matched and the target appeared in its own `Used by` list.
             //
-            // "Agree", not "are canonical": the walker follows links without rewriting the
-            // spelling, so a symlink *below* the walk root still reaches the target by an
-            // uncanonical path and still lands here as its own dependent. Measured with a
-            // directory junction while reviewing #97, and filed as #98 — #97's fix closes
-            // the scope-spelling half, which is the one the default flow hits, not the class.
-            if caller_match.path == *path {
+            // Compared on `identity`, not on `path`, since #98. `path` is the spelling the walk
+            // used, and a symlink below the walk root gives the target a second one that never
+            // equals the canonicalized `path` here — so this filter missed and the target was
+            // reported as its own dependent. The canonical scope from #97 is what makes the
+            // *rendering* work; this is the separate question of which file a match is in.
+            if caller_match.identity == *path {
                 continue;
             }
             by_file.entry(caller_match.path).or_default().push((
@@ -861,6 +861,53 @@ mod scope_spelling_tests {
                 scope.display()
             );
         }
+    }
+
+    /// #98: a target reached through a symlinked directory is not its own dependent.
+    ///
+    /// The link is named `aaa_link` **on purpose**, and the test is worth nothing otherwise.
+    /// `dedup_by_identity` keeps the lexicographically smallest spelling of a duplicated file, so
+    /// with a link named `link` the *canonical* spelling (`real/…`) survives and the old
+    /// `caller_match.path == *path` comparison accidentally succeeds. Written that way first, the
+    /// test passed with the fix reverted. A link that sorts ahead of the real directory makes the
+    /// surviving spelling the non-canonical one, which is the case the identity field exists for.
+    #[test]
+    fn a_target_reached_through_a_symlink_is_not_its_own_dependent() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join("target.rs"),
+            "pub fn shared() -> u32 { 1 }\npub fn inner() -> u32 { shared() + 1 }\n",
+        )
+        .unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(
+                real.join(name),
+                "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
+            )
+            .unwrap();
+        }
+        crate::search::callers::symlink_identity_tests::link_dir(
+            &real,
+            &dir.path().join("aaa_link"),
+        );
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let r = analyze_deps(&dir.path().join("aaa_link/target.rs"), dir.path(), &bloom).unwrap();
+        let out = format_deps(&r, None);
+
+        assert_eq!(
+            r.total_dependents, 2,
+            "each real dependent must be counted once, whichever spelling reached it (#98):\n{out}"
+        );
+        assert!(
+            !r.used_by
+                .iter()
+                .any(|d| d.path.file_name() == Some("target.rs".as_ref())),
+            "the target is listed as its own dependent — the self-reference filter compared a \
+             spelling against a canonicalized path (#98):\n{out}"
+        );
     }
 
     /// A target genuinely *outside* the scope still renders absolutely.

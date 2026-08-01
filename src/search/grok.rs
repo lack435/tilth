@@ -417,9 +417,16 @@ pub fn grok(
         .cloned()
         .collect();
 
-    // The target's path may differ from canonical form (symlinks, `../` segments).
-    // The walker hands us canonical absolute paths in match/callee results; we
-    // canonicalize once so the self-reference filter below can compare cleanly.
+    // The target's path may differ from canonical form (symlinks, `../` segments), so it is
+    // canonicalized once here for the two self-reference filters below to compare against.
+    //
+    // This used to claim "the walker hands us canonical absolute paths in match/callee results".
+    // It does not, and that belief is the whole of #98: `ignore` builds child paths by joining onto
+    // the walk root and follows links without rewriting them, so a file under a symlinked directory
+    // arrives spelled through the link. `CallerMatch` now carries an `identity` for this comparison
+    // and `is_recursive_call_site` uses it; `ResolvedCallee` has no equivalent, so
+    // `is_self_definition` canonicalizes per callee — see the note there.
+    //
     // Fallback to raw target.path is harmless — comparisons will simply never
     // match, and recursion will surface in the callers section (still correct,
     // just unfiltered).
@@ -464,7 +471,8 @@ pub fn grok(
         .into_iter()
         // Scope-relative, like the other callers that have a scope. See `is_test_file`.
         .partition(|m| !is_test_file(m.path.strip_prefix(scope).unwrap_or(&m.path)));
-    // `find_callers_batch` returns matches in walk order — thread-scheduling order. The
+    // `find_callers_batch` returns matches ordered by identity since #98, which is not the order
+    // this renders in. The
     // caps below truncate without ranking, so without a total order here grok showed a
     // different "5 of 40" on each run for the same symbol. Order by location: stable,
     // and it groups a file's call sites together, which is how the section reads.
@@ -893,7 +901,21 @@ fn is_self_definition(
     canonical_target: &Path,
     target: &ResolvedTarget,
 ) -> bool {
-    callee.file == canonical_target && callee.start_line == target.start_line
+    // Canonicalized per callee rather than compared directly (#98). `ResolvedCallee.file` is a walk
+    // spelling, like `CallerMatch.path` was, so through a symlinked directory it never equalled the
+    // canonicalized target and the target was reported as its own callee. `deps` is immune at the
+    // equivalent site only because it canonicalizes its target *before* calling `resolve_callees`;
+    // grok does not, so the fix belongs here.
+    //
+    // A syscall per callee, not per file, which is the ugly part. It is bounded by the callee caps
+    // grok already applies (a few dozen at most), and it is paid only on the self-reference filter
+    // rather than on the resolve. Giving `ResolvedCallee` an `identity` the way `CallerMatch` got
+    // one would be the tidier fix and a wider change than this one; recorded rather than done.
+    let callee_identity = callee
+        .file
+        .canonicalize()
+        .unwrap_or_else(|_| callee.file.clone());
+    callee_identity == canonical_target && callee.start_line == target.start_line
 }
 
 /// Is this caller match a recursive call from inside the target's own body?
@@ -906,7 +928,9 @@ fn is_recursive_call_site(
     // Edge case: a legitimately distinct same-named call site nested inside the
     // target body (e.g. a recursive closure with the same name) would also be
     // filtered here. Acceptable tradeoff — true self-recursion is the common case.
-    m.path == canonical_target
+    // `identity`, not `path` — the name says which question this is, and comparing the spelling
+    // against a canonicalized target is what let a symlinked path escape this filter (#98).
+    m.identity == canonical_target
         && m.line >= target.start_line
         && m.line <= target.end_line
         && m.calling_function == target.name
@@ -969,7 +993,8 @@ mod tests {
     }
 
     /// grok truncates its caller list to `max_callers` with no ranking, straight off
-    /// `find_callers_batch`'s vector — which is in walk order, i.e. thread order. With more
+    /// `find_callers_batch`'s vector — which since #98 is ordered by identity, not by the
+    /// rendered path. With more
     /// callers than the cap, identical runs therefore showed a different "5 of 40" each
     /// time (measured: 3 distinct top-5 subsets in 6 runs). Making the walk's *total*
     /// deterministic did not fix that; a total order before the truncation does.
@@ -2262,5 +2287,47 @@ impl OutlineCache {
                 "exactly one `get_or_parse` definition in the fixture"
             );
         }
+    }
+
+    /// #98: a recursive function reached through a symlinked directory is not its own callee.
+    ///
+    /// `is_recursive_call_site` compares `CallerMatch.identity` and was fixed with the rest of #98.
+    /// `is_self_definition` compares `ResolvedCallee.file`, which is still a walk spelling, and was
+    /// missed — review measured one self-callee through the link against none at the real path, on
+    /// a branch whose commit message claimed every self-reference filter had been converted. `deps`
+    /// is immune at its equivalent site only because it canonicalizes its target first.
+    #[test]
+    fn a_recursive_target_reached_through_a_symlink_is_not_its_own_callee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(
+            real.join("t.rs"),
+            "pub fn fact(n: u32) -> u32 {\n    if n <= 1 { 1 } else { n * fact(n - 1) }\n}\n",
+        )
+        .unwrap();
+        crate::search::callers::symlink_identity_tests::link_dir(
+            &real,
+            &tmp.path().join("aaa_link"),
+        );
+
+        let bloom = BloomFilterCache::new();
+        let session = crate::session::Session::new();
+        let spec = format!("{}:1", tmp.path().join("aaa_link/t.rs").display());
+        let via_link = grok(&spec, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+
+        assert!(
+            !via_link
+                .callees_internal
+                .iter()
+                .any(|c| c.name == "fact" && c.start_line == 1),
+            "the target is listed as its own callee when reached through a link — \
+             `is_self_definition` compared a spelling against a canonicalized path (#98): {:?}",
+            via_link
+                .callees_internal
+                .iter()
+                .map(|c| (c.name.as_str(), c.start_line))
+                .collect::<Vec<_>>()
+        );
     }
 }
