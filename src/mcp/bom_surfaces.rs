@@ -46,6 +46,37 @@
 //! guard before it did anything. A row that cannot fail is worse than a missing row, because it reads
 //! as coverage. [`SITES_CAUGHT`] records which production strip site each row actually protects,
 //! established by mutation rather than by reading, and names what is still uncovered.
+//!
+//! # Five rows read ambient process state, and one of them lies when it fails
+//!
+//! `diff:log`, the three `diff:source=*` rows and `diff:files` all reach `Command::new("git")` with
+//! the inherited working directory. `tool_diff` accepts no `root`, so there is nothing else they
+//! can do; `args_for` records why a `scope` does not substitute for one. That belongs in the
+//! accounting above, because it is the other way a row can be dishonest: not "cannot fail", but
+//! *fails for a reason that has nothing to do with a BOM*.
+//!
+//! **`diff:files` is the one to worry about.** The other four are [`Bom::NoFileText`] and fail
+//! loudly — a git error propagates and the panic names it. `diff:files` is [`Bom::Strips`], so it
+//! renders twice and compares byte-for-byte, and `run_git_diff` returns `Ok(stdout)` regardless of
+//! exit status. A git that fails because the cwd is vanishing therefore yields `""` → `"No changes."`
+//! for one spelling and a real diff for the other, and the row reports **a BOM leak that did not
+//! happen**. Observed while diagnosing #95, and it is the most dishonest failure shape this module
+//! has: a fabricated leak in the guard whose whole purpose is to make leaks credible. An earlier
+//! version of this section said "four rows" and missed it.
+//!
+//! It did. `diff`'s tests move the cwd, and until #95 they serialized only against each other, so
+//! this table would spawn `git` with the cwd inside a fixture repo mid-teardown — `.git` present,
+//! `.git/HEAD` already gone — and report "not a git repository" or "your current branch appears to
+//! be broken" from a test whose whole premise is that a red run means a BOM leak. The tests that
+//! move the cwd and the tests here that spawn git under it now take the same
+//! [`crate::testlock::cwd`].
+//!
+//! What the four `NoFileText` rows prove is correspondingly narrow: that the ambient repository's
+//! diff is BOM-free, which it is regardless of the fixture, so they carry no file text from the
+//! tree under test. A stronger form would need a git fixture the row could point at, which needs
+//! `tool_diff` to take a root. `diff:files` is the exception — it passes two absolute paths to
+//! `git diff --no-index`, which is genuinely cwd-independent, so its *output* is about the fixture
+//! and only its failure mode was ambient.
 
 use super::{dispatch_tool, tool_definitions, Services, DISPATCHABLE_TOOLS};
 use serde_json::{json, Value};
@@ -870,6 +901,53 @@ fn blank_estimate(line: &str) -> String {
 /// `normalise_header_token_estimate` for why it is narrow and what the first version got wrong.
 #[test]
 fn every_surface_strips_the_bom_or_is_declared_to_keep_it() {
+    // Held for the whole table because four rows read the ambient process cwd (#95).
+    //
+    // `diff:log` and the three `diff:source=*` rows run git against wherever the test binary
+    // happens to stand — `tool_diff` takes no `root`, so there is nothing else they *can* do, and
+    // `args_for` records why. `diff`'s own tests move that cwd. They used to serialize only against
+    // each other, so this test would spawn `git` with the cwd inside a fixture repo that was being
+    // torn down: `.git` still present, `.git/HEAD` already deleted, and git reporting either "not a
+    // git repository" or "your current branch appears to be broken" on a test whose entire job is
+    // to make BOM leaks visible.
+    //
+    // Rates for `cargo test --lib -- diff:: mcp::bom_surfaces::`:
+    //
+    //             unfixed    fixed
+    //   Windows   10 / 40    0 / 120
+    //   Linux CI   0 / 100    0 / 100
+    //
+    // The first Windows baseline recorded here was 3 in 5, which review rightly called a sample too
+    // small to reify as a rate — its 95% interval runs from 15% to 95%. Remeasured at n=40 it is
+    // 25%, and an independent reviewer got 35% at n=20; the effect was never in doubt, the number
+    // was. Against 25%, 0 in 120 is p ≈ 1e-15. #95 asked for "a few hundred runs of the two
+    // modules, not a handful", and 160 runs across both arms is the honest position: it settles
+    // this comfortably, and it is not a few hundred.
+    //
+    // **The Linux row is not a typo, and on reflection not a surprise either.** The mechanism
+    // predicts it: the window is [git spawned with the cwd inside a fixture] ∩ [that fixture
+    // deleted during git's repository discovery]. Windows process creation is far slower than
+    // fork/exec, so the window is much wider; a 4-vCPU runner overlaps far fewer test threads than
+    // this machine; and on Windows the running child holds its cwd open, so `remove_dir_all`
+    // half-completes and leaves exactly the `.git`-without-`HEAD` state the instrumentation caught,
+    // where Linux unlinks cleanly. So the rate is *platform-dependent*, which is a more useful
+    // statement than "surprising" — an earlier version of this note called it that.
+    //
+    // What it does correct is #95's argument for urgency: "CI is the merge gate, and this is a red
+    // run for a reason unrelated to the change under test", at an estimated 1 in 15. Every figure
+    // in that issue came from one Windows machine, which it said. On the runner that gates merges
+    // the unfixed code failed 0 times in 100 — enough to rule out 1-in-15 (p ≈ 0.001), not enough
+    // to rule out something rarer. The fix is here because the race is real and was confirmed by
+    // instrumentation, not because CI was red.
+    //
+    // Both variants asserted their own identity before measuring: a `git checkout main -- …` that
+    // silently did nothing would otherwise report a clean "before" and read as proof the bug never
+    // existed, which is how the first attempt at this measurement failed.
+    //
+    // Nothing under `dispatch_tool` takes this lock, so holding it across the table cannot deadlock
+    // — it is a test-only lock and no production path knows about it.
+    let _cwd = crate::testlock::cwd();
+
     let bom_dir = tempfile::tempdir().unwrap();
     let plain_dir = tempfile::tempdir().unwrap();
     write_fixture(bom_dir.path(), true);
@@ -1015,6 +1093,14 @@ fn every_dispatchable_tool_is_advertised() {
     // Per mode: what the server *answers* and what it *announces* must be the same set. Empty
     // arguments on purpose — every tool rejects them, and the assertion reads only whether the
     // rejection is the gate's `unknown tool` spelling, so nothing here reaches real work.
+    //
+    // The cwd lock all the same (#95): `tilth_diff` with `{}` resolves to `GitUncommitted` and does
+    // spawn `git` in the ambient cwd before being judged. It cannot fail from a moved cwd today —
+    // `run_git_diff` swallows a non-zero exit and this only inspects the refusal spelling — so this
+    // is a guard against the next reader of that output, not a fix. Review found it while checking
+    // the claim that every git-spawning test here was covered; it was not.
+    let _cwd = crate::testlock::cwd();
+
     for edit_mode in [false, true] {
         let services = Services::new(edit_mode);
         let announced = advertised(edit_mode);
