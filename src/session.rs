@@ -1,17 +1,20 @@
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 /// Tracks MCP activity across calls.
 /// Stored alongside `OutlineCache` in server state.
+///
+/// Every field here is read by a tool a client can actually call: `expanded` by every expanding
+/// surface, the token counters by `tilth_savings`. That is the invariant, and it is newer than it
+/// looks — this type also carried reads, searches and per-query/per-directory histograms whose only
+/// reader was `tilth_session`, a tool the server stopped advertising in 6ea62e8 and kept answering.
+/// Removing it (#86) left them write-only, so they went with it, and with them a mutex acquisition
+/// on every read and every search. Anything added here needs a reader a client can reach, or it is
+/// the same mistake.
 pub struct Session {
-    reads: AtomicUsize,
-    searches: AtomicUsize,
-    symbols: Mutex<HashMap<String, usize>>, // query → search count
-    dir_hits: Mutex<HashMap<String, usize>>, // dir → count
     /// `path:line` → file mtime at expand-time. mtime versioning lets
     /// `is_expanded` detect stale records when the file has been edited
     /// since the expansion was first shown.
@@ -25,38 +28,9 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Session {
-            reads: AtomicUsize::new(0),
-            searches: AtomicUsize::new(0),
-            symbols: Mutex::new(HashMap::new()),
-            dir_hits: Mutex::new(HashMap::new()),
             expanded: Mutex::new(HashMap::new()),
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
-        }
-    }
-
-    pub fn record_read(&self, path: &Path) {
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        self.record_dir(path);
-    }
-
-    pub fn record_search(&self, query: &str) {
-        self.searches.fetch_add(1, Ordering::Relaxed);
-        let mut syms = self
-            .symbols
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *syms.entry(query.to_string()).or_insert(0) += 1;
-    }
-
-    fn record_dir(&self, path: &Path) {
-        if let Some(dir) = path.parent() {
-            let key = dir.to_string_lossy().to_string();
-            let mut dirs = self
-                .dir_hits
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *dirs.entry(key).or_insert(0) += 1;
         }
     }
 
@@ -82,73 +56,6 @@ impl Session {
             self.baseline_tokens.load(Ordering::Relaxed),
             self.saved_tokens.load(Ordering::Relaxed),
         )
-    }
-
-    pub fn summary(&self) -> String {
-        let reads = self.reads.load(Ordering::Relaxed);
-        let searches = self.searches.load(Ordering::Relaxed);
-
-        let mut out = format!("Files read: {reads} | Searches: {searches}");
-
-        // Top symbols
-        let syms = self
-            .symbols
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !syms.is_empty() {
-            let mut sorted: Vec<_> = syms.iter().collect();
-            // Count descending, then name — the name tie-break is required, not cosmetic.
-            // `syms` is a `HashMap`, `sort_by` is stable, and `take(5)` decides membership,
-            // so equal counts were ordered by hash iteration and `RandomState` reseeds per
-            // process. Ties are the *normal* case here: most queries are seen once. Same
-            // defect as the `dirs:` line in `overview.rs` and the truncations fixed in
-            // `callers`, `symbol`/`content` and `glob`.
-            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-            let top: Vec<String> = sorted
-                .iter()
-                .take(5)
-                .map(|(name, count)| format!("{name} ({count})"))
-                .collect();
-            let _ = write!(out, "\nTop queries: {}", top.join(", "));
-        }
-
-        // Hot paths
-        let dirs = self
-            .dir_hits
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !dirs.is_empty() {
-            let mut sorted: Vec<_> = dirs.iter().collect();
-            // Count descending, then path. Same reasoning as `Top queries` above.
-            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-            let top: Vec<String> = sorted
-                .iter()
-                .take(5)
-                .map(|(dir, count)| format!("{dir} ({count})"))
-                .collect();
-            let _ = write!(out, "\nHot paths: {}", top.join(", "));
-        }
-
-        out
-    }
-
-    pub fn reset(&self) {
-        self.reads.store(0, Ordering::Relaxed);
-        self.searches.store(0, Ordering::Relaxed);
-        self.symbols
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.dir_hits
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.expanded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.baseline_tokens.store(0, Ordering::Relaxed);
-        self.saved_tokens.store(0, Ordering::Relaxed);
     }
 
     /// Return true only when this `(path, line)` was previously expanded
@@ -189,51 +96,6 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `summary` feeds `tilth_session`, so it must not vary run to run.
-    ///
-    /// `Top queries` and `Hot paths` both sorted a `HashMap`'s entries by count only, with a
-    /// stable sort, then `take(5)`. Equal counts therefore kept hash-iteration order and
-    /// `take` chose membership from it. Ties are the normal case, not an edge case: most
-    /// queries in a session are seen exactly once, which is what this fixture reproduces —
-    /// twelve distinct queries all at count 1, against a cap of five.
-    ///
-    /// A fresh `Session` per iteration is deliberate: `RandomState` reseeds per `HashMap`
-    /// instantiation, so reusing one would test far less than it appears to.
-    #[test]
-    fn summary_is_byte_identical_across_sessions_with_tied_counts() {
-        let render = || {
-            let session = Session::new();
-            for q in [
-                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
-                "juliett", "kilo", "lima",
-            ] {
-                session.record_search(q);
-            }
-            for d in 0..12 {
-                session.record_read(Path::new(&format!("d{d:02}/f.rs")));
-            }
-            session.summary()
-        };
-
-        let runs: Vec<String> = (0..8).map(|_| render()).collect();
-        assert!(
-            runs[0].contains("Top queries:"),
-            "fixture produced no Top queries line, so this proves nothing:\n{}",
-            runs[0]
-        );
-        assert!(
-            runs.windows(2).all(|w| w[0] == w[1]),
-            "summary varied across 8 sessions with identical input:\n{}",
-            runs.join("\n---\n")
-        );
-        // All counts tie at 1, so the five shown must be the alphabetically first five.
-        assert!(
-            runs[0].contains("alpha (1), bravo (1), charlie (1), delta (1), echo (1)"),
-            "tied counts must be broken by name:\n{}",
-            runs[0]
-        );
-    }
 
     /// A worker whose request was abandoned must leave no trace in state that outlives it.
     ///
@@ -316,20 +178,5 @@ mod tests {
         let (b2, s2) = session.savings();
         assert_eq!(b2, 300);
         assert_eq!(s2, 250);
-    }
-
-    #[test]
-    fn reset_zeroes_savings_counters() {
-        let session = Session::new();
-        session.record_savings(1000, 100);
-        let (b, s) = session.savings();
-        assert!(
-            b > 0 && s > 0,
-            "precondition: counters non-zero before reset"
-        );
-        session.reset();
-        let (b2, s2) = session.savings();
-        assert_eq!(b2, 0, "baseline_tokens must be zero after reset");
-        assert_eq!(s2, 0, "saved_tokens must be zero after reset");
     }
 }

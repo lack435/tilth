@@ -6,7 +6,6 @@ mod grok;
 mod read;
 mod savings;
 mod search;
-mod session;
 mod write;
 
 pub(super) use definitions::tool_definitions;
@@ -17,7 +16,6 @@ pub(super) use grok::tool_grok;
 pub(super) use read::tool_read;
 pub(super) use savings::tool_savings;
 pub(super) use search::tool_search;
-pub(super) use session::tool_session;
 pub(super) use write::tool_write;
 
 use std::path::PathBuf;

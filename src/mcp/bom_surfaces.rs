@@ -362,13 +362,6 @@ const SURFACES: &[Surface] = &[
         view: None,
         expect: Bom::NoFileText("a token ratio over counters; no file text reaches it"),
     },
-    Surface {
-        label: "session",
-        tool: "tilth_session",
-        edit_mode: false,
-        view: None,
-        expect: Bom::NoFileText("summary/reset of dedup and savings counters; no file text"),
-    },
 ];
 
 /// Schema properties that do **not** open an output shape of their own, each with its reason.
@@ -628,7 +621,6 @@ fn args_for(label: &str, root: &Path) -> Value {
             ]}]
         }),
         "savings" => json!({}),
-        "session" => json!({"action": "summary"}),
         other => panic!("no arguments defined for surface `{other}`"),
     }
 }
@@ -947,8 +939,8 @@ fn every_surface_strips_the_bom_or_is_declared_to_keep_it() {
 /// ANCHOR 1 + 2: every dispatchable tool is named, and every advertised tool is dispatchable.
 ///
 /// The dispatch direction is the one that matters and the one the first version lacked: a tool added
-/// to `dispatch_tool` and never advertised was invisible, which is exactly the state `tilth_session`
-/// is in. `dispatch_tool` now gates on `DISPATCHABLE_TOOLS`, so that const is authoritative.
+/// to `dispatch_tool` and never advertised is invisible, which is exactly the state `tilth_session`
+/// was in. `dispatch_tool` now gates on `DISPATCHABLE_TOOLS`, so that const is authoritative.
 #[test]
 fn every_dispatchable_and_advertised_tool_is_named() {
     for tool in DISPATCHABLE_TOOLS {
@@ -965,16 +957,90 @@ fn every_dispatchable_and_advertised_tool_is_named() {
             "`{name}` is advertised but not in DISPATCHABLE_TOOLS, so calling it fails"
         );
     }
-    // `tilth_session` is dispatchable and unadvertised. Pinned rather than tolerated silently: if the
-    // asymmetry is ever closed, this fails and the note comes out.
-    let advertised: Vec<String> = tool_definitions(true)
+}
+
+/// ANCHOR 2, the other direction: nothing the server answers is undiscoverable.
+///
+/// This replaces a negative pin. The guard used to assert that `tilth_session` specifically was
+/// *not* advertised, because it was the one tool `dispatch_tool` answered with no schema to announce
+/// it — dispatchable since the module split, unadvertised since 6ea62e8 deleted its definition. #86
+/// removed the tool, so the exception is gone and the rule can be stated generally, which is the
+/// version that catches the *next* one.
+///
+/// The const-level half compares against `tool_definitions(true)`: `tilth_write` is dispatchable but
+/// advertised only in edit mode, so the read-only schema is a strict subset and comparing against it
+/// would fail for a tool that is correctly gated.
+///
+/// That exemption is why the second half exists, and why it is stated per mode rather than as a
+/// spot check. `tools/list` returns `tool_definitions(edit_mode)`, and read-only is the **default** —
+/// so an edit-only *definition* whose dispatch arm is ungated puts the read-only server back in
+/// exactly #86's state, answering a tool its own `tools/list` omits. The first version of this test
+/// named `tilth_write` twice by hand instead, which proved nothing about any other tool: moving
+/// `tilth_savings`'s definition inside `if edit_mode` while leaving its dispatch arm ungated left
+/// the whole suite green at 883 passed. Seven of the eight arms are ungated, so that shape is the
+/// default one, not an exotic one.
+///
+/// The oracle is `dispatch_tool`'s own answer under a `Services` built for each mode, not a reading
+/// of the `if edit_mode` arm — and it is the *message*, not merely `is_err()`. Every argument shape
+/// a tool rejects on its own errors identically whether the gate is there or not, so an `is_err()`
+/// assertion passes with `if edit_mode` deleted. Verified: it did. Only the `unknown tool` spelling
+/// comes from the gate, and it is the one a client sees.
+#[test]
+fn every_dispatchable_tool_is_advertised() {
+    let advertised = |edit_mode: bool| -> Vec<String> {
+        tool_definitions(edit_mode)
+            .iter()
+            .map(|d| {
+                d["name"]
+                    .as_str()
+                    .expect("every definition has a name")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // Const level: a name here with no definition in *either* mode is undiscoverable outright.
+    let in_edit_mode = advertised(true);
+    let undiscoverable: Vec<&&str> = DISPATCHABLE_TOOLS
         .iter()
-        .map(|d| d["name"].as_str().unwrap_or_default().to_string())
+        .filter(|t| !in_edit_mode.iter().any(|a| a == *t))
         .collect();
     assert!(
-        !advertised.iter().any(|a| a == "tilth_session"),
-        "`tilth_session` is now advertised — good, but remove this assertion and the note beside it"
+        undiscoverable.is_empty(),
+        "{undiscoverable:?} are dispatchable but absent from `tool_definitions`, so the server \
+         answers tools no client can discover and a schema-validating client will refuse. Either \
+         add a definition or remove the dispatch arm — see #86."
     );
+
+    // Per mode: what the server *answers* and what it *announces* must be the same set. Empty
+    // arguments on purpose — every tool rejects them, and the assertion reads only whether the
+    // rejection is the gate's `unknown tool` spelling, so nothing here reaches real work.
+    for edit_mode in [false, true] {
+        let services = Services::new(edit_mode);
+        let announced = advertised(edit_mode);
+        for tool in DISPATCHABLE_TOOLS {
+            let answer = dispatch_tool(tool, &json!({}), &services);
+            let refused_as_unknown =
+                answer.as_deref().map_err(String::as_str) == Err(&*format!("unknown tool: {tool}"));
+            assert_eq!(
+                announced.iter().any(|a| a == tool),
+                !refused_as_unknown,
+                "with edit_mode={edit_mode}, `{tool}` is {} but {} — `tools/list` returns \
+                 `tool_definitions(edit_mode)`, so the two must agree per mode or a client sees a \
+                 tool list that does not match what the server answers (#86)",
+                if refused_as_unknown {
+                    "refused as unknown"
+                } else {
+                    "answered"
+                },
+                if announced.iter().any(|a| a == tool) {
+                    "advertised"
+                } else {
+                    "not advertised"
+                },
+            );
+        }
+    }
 }
 
 /// Recursively collect `(property name, enum variants)` from a schema, at any depth.

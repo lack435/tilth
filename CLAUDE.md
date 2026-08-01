@@ -22,7 +22,6 @@ src/
       files.rs         tool_files — glob file listing, pattern/patterns batch, scope resolution.
       grok.rs          tool_grok — one-call symbol bundle, default vs full caps.
       savings.rs       tool_savings — session token-savings summary vs a naive-read baseline.
-      session.rs       tool_session — summary/reset actions for grok dedup + savings state.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().

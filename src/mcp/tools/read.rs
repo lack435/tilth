@@ -87,7 +87,6 @@ pub(in crate::mcp) fn tool_read(
 
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
-            session.record_read(&path);
             let read = if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
             } else if force_stripped {
@@ -142,7 +141,6 @@ pub(in crate::mcp) fn tool_read(
                 ranges.len()
             ));
         }
-        session.record_read(&path);
         let output = match budget {
             Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
                 .map_err(|e| e.to_string())?,
@@ -152,8 +150,6 @@ pub(in crate::mcp) fn tool_read(
         };
         return Ok(output);
     }
-
-    session.record_read(&path);
 
     // Only genuine AUTO reads are credited with savings — where tilth transparently
     // returns an outline instead of the full file a naive `cat` would dump. An

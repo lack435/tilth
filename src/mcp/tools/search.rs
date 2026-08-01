@@ -49,22 +49,12 @@ pub(in crate::mcp) fn tool_search(
                 .collect();
             match queries.len() {
                 0 => return Err("missing required parameter: query".into()),
-                1 => {
-                    session.record_search(queries[0]);
-                    crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, false,
-                        budget,
-                    )
-                }
-                2..=5 => {
-                    for q in &queries {
-                        session.record_search(q);
-                    }
-                    crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, false,
-                        budget,
-                    )
-                }
+                1 => crate::search::search_symbol_expanded(
+                    queries[0], &scope, cache, session, bloom, expand, context, glob, false, budget,
+                ),
+                2..=5 => crate::search::search_multi_symbol_expanded(
+                    &queries, &scope, cache, session, bloom, expand, context, glob, false, budget,
+                ),
                 _ => {
                     return Err(format!(
                         "multi-symbol search limited to 5 queries (got {})",
@@ -73,14 +63,10 @@ pub(in crate::mcp) fn tool_search(
                 }
             }
         }
-        "content" => {
-            session.record_search(query);
-            crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, false, budget,
-            )
-        }
+        "content" => crate::search::search_content_expanded(
+            query, &scope, cache, session, expand, context, glob, false, budget,
+        ),
         "regex" => {
-            session.record_search(query);
             let result = crate::search::content::search(query, &scope, true, context, glob, false)
                 .map_err(|e| e.to_string())?;
             crate::search::format_raw_result(&result, cache)
@@ -93,20 +79,12 @@ pub(in crate::mcp) fn tool_search(
                 .collect();
             match targets.len() {
                 0 => return Err("missing required parameter: query".into()),
-                1 => {
-                    session.record_search(targets[0]);
-                    crate::search::callers::search_callers_expanded(
-                        targets[0], &scope, bloom, expand, context, glob, false,
-                    )
-                }
-                2..=5 => {
-                    for t in &targets {
-                        session.record_search(t);
-                    }
-                    crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scope, bloom, expand, context, glob, false,
-                    )
-                }
+                1 => crate::search::callers::search_callers_expanded(
+                    targets[0], &scope, bloom, expand, context, glob, false,
+                ),
+                2..=5 => crate::search::callers::search_callers_multi_expanded(
+                    &targets, &scope, bloom, expand, context, glob, false,
+                ),
                 _ => {
                     return Err(format!(
                         "multi-target callers search limited to 5 queries (got {})",
