@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -407,6 +407,87 @@ fn rel_display(path: &Path) -> String {
     } else {
         s.into_owned()
     }
+}
+
+/// Render a resolved import target for the `hot` line, relative to the launch directory —
+/// with `../` when the target resolved *above* it (#94).
+///
+/// `hot_files`' keys are resolved import targets, and resolution is not confined to the launch
+/// directory. `strip_prefix(root).unwrap_or(path)` therefore fell through to the absolute path
+/// and the fingerprint printed a full host path into a payload that is otherwise portable, on
+/// the one line that has a fixed size budget to say something useful.
+///
+/// This is **not** a C/C++ include-root defect, which is how #94 was reported. Every language
+/// with a relative import reaches it, through resolution that never consults a boundary at all:
+///
+///   * Rust — `resolve_rust` anchors `crate::` at `find_src_ancestor`, so launching anywhere
+///     under `src/` renders every crate-level module absolutely. That is this repository, run
+///     from `src/mcp`.
+///   * JS/TS — `resolve_js` joins the source onto the file's directory, so `../../lib/x` is
+///     above a launch inside `src/app`.
+///   * Python — `resolve_python` walks up one directory per leading dot.
+///   * C/C++ — the include root the issue describes, which `boundary_from_file` may put above
+///     `root` on purpose.
+///
+/// That rules out the issue's preferred fix of naming the target relative to the containment
+/// root that resolved it: only C/C++ has one, so the other three would still print host paths.
+/// `../` needs nothing but the two paths, and it is the spelling an agent can act on — the rest
+/// of the line is relative to the launch directory, so a target rendered relative to some *other*
+/// root would be indistinguishable from an in-tree path and resolve to nothing.
+///
+/// The under-`root` case keeps the original `strip_prefix` verbatim rather than falling out of
+/// the component walk below, so the common case is byte-identical by construction and not by
+/// argument.
+///
+/// The `…/` arm is for paths with no shared component at all. On Unix two absolute paths always
+/// share the root, so reaching it takes a Windows target that shares no prefix with `root`: another
+/// drive (`#include "D:/vendor/x.h"`, which `resolve_c_include`'s direct arm returns if the file
+/// exists), a UNC share, or a `\\?\` verbatim spelling against a non-verbatim `root`. It is kept
+/// because the alternative in a case with no relative spelling is the host path this function
+/// exists to remove.
+///
+/// Both callers pass `current_dir().unwrap_or_default()`, whose fallback is the *empty* path — and
+/// an empty `root` takes the first arm, since `strip_prefix("")` succeeds, which would print the
+/// host path this function removes. It is unreachable rather than handled: `read_dir("")` fails, so
+/// the walk yields no files and there is no hot line to render. Said plainly because the earlier
+/// spelling of this note claimed no caller has a relative `root`, which is not true.
+///
+/// One input renders wrongly rather than absolutely: a Windows drive-relative target (`C:foo\x.h`,
+/// from an equally drive-relative `#include`) shares only the disk prefix, so the walk emits a
+/// `../` chain to a location it is not at. Drive-relative paths anchor to a per-drive cwd that is
+/// not recoverable lexically, so no spelling here is right; the old code printed it verbatim. Left
+/// alone deliberately — the shape is absurd, and guarding it would cost a check on every render.
+fn hot_path_display(root: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return rel_display(rel);
+    }
+
+    let mut root_rest = root.components().peekable();
+    let mut path_rest = path.components().peekable();
+    let mut shared = 0usize;
+    while root_rest.peek().is_some() && root_rest.peek() == path_rest.peek() {
+        root_rest.next();
+        path_rest.next();
+        shared += 1;
+    }
+
+    if shared == 0 {
+        // Named components only: a root or a drive prefix in the tail would put the host back
+        // in the line for a target shallow enough that two components reach it.
+        let mut tail: Vec<std::path::Component> = path
+            .components()
+            .rev()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .take(2)
+            .collect();
+        tail.reverse();
+        let tail: PathBuf = tail.into_iter().collect();
+        return format!("…/{}", rel_display(&tail));
+    }
+
+    let ups = "../".repeat(root_rest.count());
+    let rest: PathBuf = path_rest.collect();
+    format!("{ups}{}", rel_display(&rest))
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,8 +1545,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         .iter()
         .filter(|(_, count)| *count >= 2)
         .map(|(path, count)| {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            let rel_str = rel_display(rel);
+            let rel_str = hot_path_display(root, path);
 
             // Derive the module name from the file path
             // src/types.rs → "types", src/lang/mod.rs → "lang", src/error.rs → "error"
@@ -3224,15 +3304,137 @@ mod tests {
         let out = fingerprint(&dir.path().join("src"));
         let hot = hot_line(&out)
             .unwrap_or_else(|| panic!("no hot line when launched inside src/:\n{out}"));
-        // Matched loosely on purpose: a target *above* the launch directory fails
-        // `strip_prefix(root)` in the renderer and falls through to the absolute path, so this
-        // line names a host path rather than a relative one. Pre-existing and unrelated to the
-        // boundary — before #45 the same launch resolved to the same place via `.git` — but this
-        // is the first test to reach it, so it is recorded rather than silently ratified.
+        // Exact, not `contains("util")`. The loose form was recorded here in #93 because the
+        // renderer fell through to the absolute path for a target above the launch directory,
+        // so this line named a host path; #94 fixed that and the spelling is now the assertion.
+        assert_eq!(
+            hot.trim(),
+            "hot (× = importers): ../include/proj/util.h ×3",
+            "a header above the launch directory must be counted (#45) and named relative to \
+             it (#94):\n{out}"
+        );
+    }
+
+    /// The same launch with no `.git` anywhere resolves *nothing*, and that is #45's rule, not
+    /// a #94 defect.
+    ///
+    /// Written while covering #94's "at either a git or a non-git tree root" acceptance, and kept
+    /// because the obvious version of that test asserts a relative spelling and fails. With a
+    /// `.git` above, `boundary_from_file` hands back the repository and the header at
+    /// `<repo>/include/proj/util.h` is inside it. With no `.git` it falls back to the tree root,
+    /// which for a subdirectory launch *is* the launch directory — and there the include root one
+    /// hop up is never even a candidate.
+    ///
+    /// The mechanism is `resolve_c_include`'s `if base == root { break; }`, not `is_within`. With
+    /// `root == dir` the hop loop tests `candidates_at(<tmp>/src, ..)` — `<tmp>/src/proj/util.h`
+    /// and the two conventional roots beneath it — and then breaks before hop 1, so
+    /// `<tmp>/include/proj/util.h` is never generated, never statted, and never reaches the
+    /// containment check at all. Review corrected an earlier version of this comment that blamed
+    /// `is_within`: the one `is_within` call on this path, `boundary.filter(|b| is_within(dir, b))`
+    /// at the adopt site, *succeeds* — it is what makes the launch directory the root in the first
+    /// place. Confirmed by moving the header to hop 0 in the same fixture, where it resolves.
+    ///
+    /// #94's non-git arm is therefore carried by `hot_files_renders_relatively_for_a_non_c
+    /// _language_too`, whose fixture has no `.git` either and whose resolution consults no
+    /// boundary at all.
+    ///
+    /// This test carries no #94 weight and is not meant to: it stays green with the renderer
+    /// reverted, because it asserts a #45 boundary fact about what reaches the renderer rather
+    /// than anything about how the renderer spells it.
+    ///
+    /// The root-launch control is load-bearing: without it this test passes against a fixture
+    /// that resolves nothing for some entirely different reason.
+    #[test]
+    fn hot_files_in_a_non_git_tree_launched_in_a_subdirectory_cannot_reach_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_include_root_cpp_tree(dir.path(), 3);
+
+        let from_root = fingerprint(dir.path());
         assert!(
-            hot.contains("util"),
-            "a header above the launch directory stopped being counted, so the boundary came \
-             from the launch dir rather than from the file (#45):\n{hot}"
+            hot_line(&from_root).is_some_and(|h| h.contains("include/proj/util.h")),
+            "control failed: the same fixture must resolve its include-root header when launched \
+             at the tree root (#45), or the assertion below proves nothing:\n{from_root}"
+        );
+
+        let from_sub = fingerprint(&dir.path().join("src"));
+        assert!(
+            hot_line(&from_sub).is_none(),
+            "a non-git subdirectory launch resolved an include above the launch directory — the \
+             tree root is the only boundary there, so this should be refused (#45). If that is \
+             now intended, this test becomes the relative-spelling assertion #94 asks for:\n\
+             {from_sub}"
+        );
+    }
+
+    /// A target above the launch directory is **not** a C/C++ include-root problem.
+    ///
+    /// #94 was reported against include-root resolution, and its preferred fix — name the target
+    /// relative to the containment root that resolved it — only exists for C/C++. This is the
+    /// fixture that rules it out: `resolve_rust` anchors `crate::` at `find_src_ancestor`, which
+    /// consults no boundary at all, so launching under `src/` puts every crate-level module above
+    /// `root`. It is the ordinary shape of running the server inside a subdirectory of a Rust
+    /// crate — this repository, from `src/mcp` — and before #94 it printed host paths.
+    ///
+    /// `resolve_js` (`../../lib/x`) and `resolve_python` (leading dots) reach it the same way.
+    /// One language is enough to make the point that the renderer is the right place for the fix.
+    #[test]
+    fn hot_files_renders_relatively_for_a_non_c_language_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp = dir.path().join("src/mcp");
+        std::fs::create_dir_all(&mcp).unwrap();
+        std::fs::write(dir.path().join("src/types.rs"), "pub struct Thing;\n").unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                mcp.join(format!("m{i}.rs")),
+                "use crate::types::Thing;\n\npub fn go(_t: Thing) {}\n",
+            )
+            .unwrap();
+        }
+
+        let out = fingerprint(&mcp);
+        let hot = hot_line(&out)
+            .unwrap_or_else(|| panic!("no hot line when launched inside src/mcp:\n{out}"));
+        assert_eq!(
+            hot.trim(),
+            "hot (× = importers): ../types.rs(Thing) ×3",
+            "a Rust module above the launch directory must be named relative to it — no \
+             boundary is involved on this path (#94):\n{out}"
+        );
+    }
+
+    /// `hot_path_display`'s arms, including the one no fixture can reach through `fingerprint`.
+    ///
+    /// The under-`root` case is the one that must not move: it is the common case, and #94's
+    /// acceptance is that it stays byte-identical. It is asserted here as well as through the
+    /// fixtures because this is where a later refactor would break it.
+    #[test]
+    fn hot_path_display_covers_under_above_and_disjoint() {
+        let root = Path::new("/a/b/c");
+
+        // Under the launch directory — unchanged `strip_prefix` output.
+        assert_eq!(hot_path_display(root, Path::new("/a/b/c/x/y.rs")), "x/y.rs");
+        // Directly above it, and several levels above it.
+        assert_eq!(hot_path_display(root, Path::new("/a/b/y.rs")), "../y.rs");
+        assert_eq!(
+            hot_path_display(root, Path::new("/a/inc/y.h")),
+            "../../inc/y.h"
+        );
+        // A sibling of the launch directory is "above then down", not a special case.
+        assert_eq!(
+            hot_path_display(root, Path::new("/a/b/d/y.rs")),
+            "../d/y.rs"
+        );
+
+        // No shared component. Unreachable through `fingerprint`, which is only ever called
+        // with an absolute cwd — on Windows it takes a target on another drive, and a relative
+        // `root` expresses the same disjointness on every platform. What matters is that the
+        // arm does not fall back to naming the host path.
+        let disjoint = hot_path_display(Path::new("rel/root"), Path::new("/vendor/pkg/y.h"));
+        assert_eq!(disjoint, "…/pkg/y.h");
+        assert_eq!(
+            hot_path_display(Path::new("rel/root"), Path::new("/y.h")),
+            "…/y.h",
+            "a single-component target must not lose its name to the two-component tail"
         );
     }
 

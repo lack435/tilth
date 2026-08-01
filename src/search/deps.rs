@@ -295,6 +295,33 @@ pub fn analyze_deps(
 /// 2. Truncate "Uses (external)" to count only
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
+///
+/// The three `strip_prefix(scope).unwrap_or(...)` sites below keep their absolute-path fallback,
+/// which #94 asked for a decision on rather than a fix.
+///
+/// Two of the three reach it, by a plainer route than #94's survey suggests — and *not* the route
+/// that issue proposes. `canonical_boundary(scope)` governs C/C++ include resolution and has no
+/// bearing on `strip_prefix` here; the reachable shape is simply `tilth_deps` with an absolute
+/// `path` and no `scope`, which resolves the scope to the server's cwd. A target outside that cwd
+/// fails `strip_prefix` in the header and in `format_uses_local`, whose paths derive from it. That
+/// is language-independent, which makes it a wider claim than the include-resolution one, not a
+/// narrower one.
+///
+/// The third, `format_used_by`, cannot reach it: its dependents come from
+/// `find_callers_batch(.., scope, ..)`, a walk *under* `scope`, so every path it renders strips. In
+/// the case above it renders nothing at all — nothing under the server's cwd references a file
+/// outside it.
+///
+/// Keeping the fallback is right for the reason `search/grok.rs`'s `display_rel` already gives:
+/// this is a search result, and an absolute path is a usable answer the agent can hand straight
+/// back to a read. It is *not* the caller's own spelling, which an earlier version of this comment
+/// claimed — `analyze_deps` canonicalizes the target before resolving, so on Windows these lines
+/// carry a `\\?\` verbatim prefix the caller never wrote. Ugly, and it still reads.
+///
+/// `overview`'s hot line is different in both respects, which is why only it changed: nobody
+/// asked for that path, it is injected at every `initialize` under a fixed size budget, and the
+/// rest of the payload is relative to the launch directory — so an absolute path there is both
+/// noise and machine-specific output in an otherwise portable blurb.
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
     let dep_count = result.total_dependents;
     let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
