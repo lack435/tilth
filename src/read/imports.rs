@@ -34,6 +34,11 @@ pub fn resolve_related_files(file_path: &Path, boundary: Option<&Path>) -> Vec<P
 /// includes in a non-git tree than `search::deps` did against the same file, so the
 /// post-read hint and `deps` disagreed about whether a header was a local dependency —
 /// the asymmetry #15 is about. Pass `None` only when there genuinely is no scope.
+///
+/// One caller passes a boundary that is neither declared nor canonical: `overview::hot_files`
+/// has a tree but no scope the user named, and builds one with `boundary_from_file`, whose doc
+/// gives both reasons. Do not copy that without reading it — the non-canonical spelling is
+/// load-bearing there and wrong anywhere the boundary is asked the same question twice.
 pub fn resolve_related_files_with_content(
     file_path: &Path,
     content: &str,
@@ -56,7 +61,8 @@ pub fn resolve_related_files_with_content(
 /// a caller that also classifies non-resolving imports has to ask the *same* question here
 /// and there. `search::deps` does exactly that, and an include that resolves under one
 /// boundary but not the other lands in both of its buckets or in neither. Pass `None` when
-/// there is no scope; see `resolve_c_include`.
+/// there is no scope; see `resolve_c_include`. The one exception, and why it is one, is
+/// documented on `boundary_from_file`.
 pub(crate) fn resolve_local_imports(
     file_path: &Path,
     content: &str,
@@ -448,6 +454,40 @@ fn is_include_root_relative(clean: &str) -> bool {
     real >= 2
 }
 
+/// The containment root for a caller that knows the tree it is scanning but has no scope the
+/// user *declared* — the enclosing repository when there is one, `tree_root` when there is not.
+///
+/// This is the inverse precedence to `resolve_c_include`'s own rule, and the inversion is the
+/// whole point. There, a declared scope outranks the repository because the caller stated it:
+/// the user named that tree. Here nothing was stated. `overview::fingerprint` is only ever
+/// called with the process cwd, so a boundary taken from it would be derived from wherever the
+/// server happened to be launched — which is exactly the distinction #10's review turned on. A
+/// root that is not declared has no business outranking one derived from the file.
+///
+/// So it is a *fallback*, and only the case that is currently broken changes. In a git tree the
+/// returned path is bit-for-bit what `resolve_c_include` would have computed for itself — same
+/// walk, same spelling — so the hop loop's `base == root` break lands in the same place and the
+/// probe count is identical. In a tree with no `.git`, resolution used to give up before probing
+/// anything at all and every project-relative include silently bucketed as external (#45).
+///
+/// Deliberately *not* canonicalized, unlike `canonical_boundary` — which every other caller is
+/// told to use, so this is an exception and not an oversight. The identity above is what makes
+/// it safe to hand to a fingerprint whose output is pinned, and canonicalizing would break that
+/// identity: `resolve_c_include`'s hop loop breaks on `base == root`, which compares the two as
+/// *paths* against a `base` carrying the caller's spelling, so a root normalised to a differently
+/// spelled path for the same directory would not stop the walk at the root. Two normalisations
+/// do that and both are ordinary — a `\\?\` verbatim prefix, which `canonicalize` always adds on
+/// Windows, and a resolved symlink or `..` component anywhere in the path. (A `.` or a trailing
+/// slash would not: `Path`'s `PartialEq` is over `Components`, which discards those already.)
+/// `is_within` canonicalizes both sides at the point of comparison, which is where it matters.
+///
+/// The exception is safe only because this boundary is never handed to `search::deps`, whose
+/// doc explains why *it* needs a canonical one: it asks the same resolution question twice and
+/// buckets on the answers. `hot_files` has one bucket.
+pub(crate) fn boundary_from_file(file_dir: &Path, tree_root: &Path) -> PathBuf {
+    enclosing_repo_root(file_dir).unwrap_or_else(|| tree_root.to_path_buf())
+}
+
 /// Nearest ancestor of `dir` (inclusive) containing `.git`, if any.
 ///
 /// `.git` is a directory in a normal clone and a *file* in a linked worktree or
@@ -670,6 +710,113 @@ mod tests {
         assert!(
             resolve_c_include(&root.join("proj/a/b"), "\"x/leak.h\"", None).is_none(),
             "without a .git bound the walk must not run"
+        );
+    }
+
+    /// `boundary_from_file` must return the *repository*, not the tree root it was handed,
+    /// whenever there is one — and that repository path must be the identical spelling
+    /// `resolve_c_include` computes for itself.
+    ///
+    /// Identity, not merely equivalence, is what makes #45 safe to ship against a fingerprint
+    /// whose output is pinned byte-for-byte: the hop loop breaks on `base == root`, a lexical
+    /// comparison, so a root that merely *denotes* the same directory in a different spelling
+    /// would walk past it and change the probe count. Asserted against `enclosing_repo_root`
+    /// directly, because that is the function whose result the `None` arm of
+    /// `resolve_c_include`'s composition rule would have used.
+    ///
+    /// Nested repositories are the interesting case and the reason the walk is nearest-first:
+    /// a submodule or linked worktree inside a checkout must contain resolution to itself.
+    ///
+    /// The `tree_root == outer` arm is the one that carries weight, and it is the shape
+    /// `hot_files` actually produces — `fingerprint(&cwd)` at a checkout root. Review found that
+    /// without it, `if tree_root.join(".git").exists() { return tree_root }` passes every other
+    /// assertion here and all three `hot_files_*` fixtures, while being wrong for exactly this
+    /// case: every file in the submodule would take the *outer* repository as its boundary and
+    /// could resolve an include out into the parent. Arms that only pass a `tree_root` with no
+    /// `.git` cannot distinguish the two implementations.
+    #[test]
+    fn boundary_from_file_prefers_the_repository_over_the_tree_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let inner = outer.join("vendor/inner");
+        fs::create_dir_all(inner.join("src")).unwrap();
+        fs::create_dir_all(outer.join(".git")).unwrap();
+        fs::create_dir_all(outer.join("src")).unwrap();
+        // `.git` as a *file*, the linked-worktree/submodule spelling.
+        fs::write(inner.join(".git"), "gitdir: ../../.git/modules/inner\n").unwrap();
+
+        let outer_src = outer.join("src");
+        assert_eq!(
+            boundary_from_file(&outer_src, tmp.path()),
+            enclosing_repo_root(&outer_src).expect("outer is a repository"),
+            "the tree root outranked the enclosing repository, which is the precedence #45 \
+             specifically rejects"
+        );
+        let inner_src = inner.join("src");
+        assert_eq!(
+            boundary_from_file(&inner_src, tmp.path()),
+            inner,
+            "a nested repository must contain its own resolution, not defer to the outer one"
+        );
+        assert_eq!(
+            boundary_from_file(&inner_src, &outer),
+            inner,
+            "with the tree root itself a repository — the shape `fingerprint(&cwd)` produces at \
+             a checkout root — a nested repository still must not defer to the outer one"
+        );
+
+        // With no `.git` anywhere, and only then, the tree root is the answer.
+        let bare = tmp.path().join("bare/src");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            boundary_from_file(&bare, tmp.path()),
+            tmp.path(),
+            "outside any repository the tree root must be used, or #45's reported bug is back"
+        );
+    }
+
+    /// The returned path must carry the *caller's spelling*, not a canonical one.
+    ///
+    /// `resolve_c_include`'s hop loop breaks on `base == root`, a lexical comparison against a
+    /// `base` derived from the caller's path, so a boundary normalised to a different spelling
+    /// of the same directory would fail to stop the walk there. That is why
+    /// `boundary_from_file` does not canonicalize, and it needs its own guard: the assertions
+    /// above compare against `enclosing_repo_root` and against paths built the same way, so a
+    /// canonicalizing implementation satisfies them wherever `canonicalize` happens to be the
+    /// identity — which on CI, where `/tmp` is a real directory, is everywhere. This is
+    /// therefore the only assertion standing between the design and a silently-broken hop loop
+    /// on the platform that CI does not run.
+    ///
+    /// A `..` component is the portable way to state it, and the choice is not arbitrary.
+    /// `Path`'s `PartialEq` compares *components*, not bytes, and `Components` already discards
+    /// `.` and trailing slashes — so a `<repo>/.` spelling is `==` to `<repo>` and can express
+    /// nothing here. The first draft of this test used one; its own "fixture is broken" guard is
+    /// what caught it. `ParentDir` survives component comparison, `canonicalize` removes it on
+    /// every platform, and it needs no symlink — which would need privileges this repo's own
+    /// symlink tests do not reliably get on Windows.
+    #[test]
+    fn boundary_from_file_does_not_canonicalize_the_spelling_it_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("vendor")).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+
+        // `<repo>/vendor/../src` — the walk finds `.git` one level up, at `<repo>/vendor/..`,
+        // which denotes `<repo>` but is not spelled like it. That spelling must come back.
+        let odd = repo.join("vendor").join("..").join("src");
+        let got = boundary_from_file(&odd, tmp.path());
+        assert_eq!(
+            got,
+            repo.join("vendor").join(".."),
+            "the boundary was normalised; `resolve_c_include`'s `base == root` break compares \
+             lexically, so a renormalised root walks past the containment root instead of \
+             stopping at it"
+        );
+        assert_ne!(
+            got, repo,
+            "fixture is broken: the odd spelling collapsed before it reached the assertion, so \
+             this proves nothing about canonicalization"
         );
     }
 

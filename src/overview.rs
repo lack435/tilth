@@ -1341,6 +1341,32 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // this comment asserted the scan measured well under 100ms even on a large tree; that
     // was never measured, and it was wrong. The tree that motivated #25 is C#, where
     // `is_import_line` returns false for every line, so it never exercised this path at all.
+    //
+    // Remeasured for #45, which made the non-git case actually probe. Until then an
+    // unresolvable include in a tree with no `.git` cost exactly one `enclosing_repo_root`
+    // walk and then short-circuited, so that case was anomalously cheap *because* it was
+    // broken. On a 1,852-file C++ module that is not a git checkout, whole-`fingerprint`
+    // wall time, five warm runs each of a release build:
+    //
+    //   before #45   71-74ms — and no `hot` line at all, nothing resolved
+    //   after #45    83-88ms — five hot files resolved through the include root
+    //
+    // Non-C/C++ projects pay none of it: the boundary is only computed for a file whose own
+    // language reads one. Measured on this repository (Rust, a checkout), before and after are
+    // 76-86ms and 77ms, and the fingerprint is byte-identical.
+    //
+    // So the probes cost ~12ms where there previously were none, and the result stays well
+    // inside the 250ms soft budget. No new ceiling: the worst case is still a tree full of
+    // *unresolvable* includes, which was already probing before #45 whenever a `.git` was
+    // present, and that is what the figures above it measure.
+    //
+    // Git-tree *output* is unchanged, because `boundary_from_file` hands back the identical
+    // path `resolve_c_include` would have computed for itself. Checked by diffing the
+    // pre-#45 and post-#45 binaries at three launch directories on a 1,933-file C++
+    // checkout — repository root, a subdirectory, and a parent above the checkout — all
+    // three identical. The *syscall mix* does change, and in tilth's favour: one upward
+    // `.exists()` walk per file replaces one per unresolvable include, at the cost of the
+    // `is_within(dir, boundary)` canonicalize pair that the `Some` arm now reaches.
     let mut import_budget = MAX_IMPORT_LINES;
 
     for (rel_path, _) in &files {
@@ -1363,19 +1389,47 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             .count();
         import_budget = import_budget.saturating_sub(import_lines.max(1));
 
-        // Resolve imports to actual file paths using the proven import resolver.
+        // The boundary is derived from the *file*, not from `root` (#45).
         //
-        // Deliberately no boundary, unlike the read hint and callee resolution (#15). The
-        // obvious candidate is `root`, but `fingerprint` is called as `fingerprint(&cwd)`
-        // and every file here is `root.join(rel_path)`, so `root` would contain every
-        // candidate and always outrank the `.git` fallback: launched above a checkout the
-        // scan could count a hot file in a different repository, launched inside a
-        // subdirectory it would stop counting headers above the launch dir. Both change
-        // what the initialize fingerprint claims, and #29/#31 went to some trouble to make
-        // it say true things. So C/C++ include-root resolution stays `.git`-gated here
-        // until someone measures the alternative.
-        let resolved =
-            crate::read::imports::resolve_related_files_with_content(&full, &content, None);
+        // Passing `root` directly is the obvious patch and it is wrong. `fingerprint` is only
+        // ever called as `fingerprint(&cwd)`, and every file here is `root.join(rel_path)`, so
+        // `root` contains every candidate and would always outrank the `.git` fallback:
+        // launched above a checkout the scan could count a hot file in a *different*
+        // repository, launched inside a subdirectory it would stop counting headers above the
+        // launch dir. Both change what the initialize fingerprint claims about a git tree,
+        // which is the common case and the one #29/#31 went to some trouble to make truthful.
+        //
+        // `boundary_from_file` inverts that: the enclosing repository wins, and `root` is only
+        // reached when there is no `.git` at all — the case that was broken, where resolution
+        // gave up before probing and every project-relative include bucketed as external. In a
+        // git tree it returns the identical path `resolve_c_include` computes for itself, so
+        // this launch directory's fingerprint is unchanged from before #45. That was checked by
+        // running both binaries at the repository root, a subdirectory, and a parent above the
+        // checkout of a 1,933-file C++ checkout and diffing: identical at all three, each with a
+        // substantive and *different* hot line. It is not expressible as a test — it compares
+        // two implementations — so the three `hot_files_*` fixtures pin the *rule* instead, one
+        // per way of getting it wrong.
+        //
+        // Refusing to cross into another project is a claim about **git** trees only. Where
+        // there is no `.git` the tree root is the only boundary that exists, so a sibling
+        // directory under the same root can be reached — `hot_files_in_a_non_git_tree_can_reach
+        // _a_sibling_project` states that outcome rather than leaving it implied. It is the same
+        // reach a declared scope has always had, and the alternative is the pre-#45 behaviour of
+        // resolving nothing at all.
+        //
+        // Computed only for C/C++, because only `resolve_c_include` reads a boundary —
+        // `resolve_import_to_file` dispatches on the file's own language, so for a Rust or
+        // Python file this is an upward `.exists()` walk whose result is discarded, and in a
+        // tree with no `.git` that walk runs to the filesystem root every time. At up to 100
+        // files per fingerprint that is a few hundred pointless `stat`s on the majority
+        // language case, which the C++ measurement above would never have shown.
+        let boundary = matches!(detect_file_type(&full), FileType::Code(Lang::C | Lang::Cpp))
+            .then(|| crate::read::imports::boundary_from_file(full.parent().unwrap_or(root), root));
+        let resolved = crate::read::imports::resolve_related_files_with_content(
+            &full,
+            &content,
+            boundary.as_deref(),
+        );
         for target_path in resolved {
             *path_counts.entry(target_path).or_insert(0) += 1;
         }
@@ -3041,6 +3095,198 @@ mod tests {
         assert!(
             output.is_empty() || output.contains("0 source files"),
             "empty dir should produce empty or minimal output, got: {output}"
+        );
+    }
+
+    /// A C++ tree whose headers are reached through an include root: `include/proj/util.h`
+    /// included as `"proj/util.h"` from sources in `src/`. `importers` sources include it, so
+    /// it clears `hot_files`' "at least two importers" bar.
+    ///
+    /// Returns nothing — the caller decides where `.git` goes, which is the whole variable.
+    fn write_include_root_cpp_tree(root: &Path, importers: usize) {
+        let inc = root.join("include/proj");
+        let src = root.join("src");
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(inc.join("util.h"), "#pragma once\nvoid util();\n").unwrap();
+        for i in 0..importers {
+            std::fs::write(
+                src.join(format!("m{i}.cc")),
+                "#include \"proj/util.h\"\n\nvoid m() { util(); }\n",
+            )
+            .unwrap();
+        }
+    }
+
+    fn hot_line(out: &str) -> Option<&str> {
+        out.lines().find(|l| l.trim_start().starts_with("hot ("))
+    }
+
+    /// A tree that is not a git checkout must still resolve include-root headers (#45).
+    ///
+    /// This is the reported bug. `hot_files` passed no boundary at all, so `resolve_c_include`
+    /// fell to `enclosing_repo_root(dir)?` — which returns `None` outside a checkout and
+    /// short-circuits before probing anything. Every project-relative include bucketed as
+    /// external and the hot-file counts silently under-reported, the same blindness #15
+    /// removed from the post-read hint, callee resolution, `deps`, `grok` and expanded search
+    /// and that #44 deliberately left here pending measurement.
+    ///
+    /// Deliberately no `.git` anywhere above the fixture either: `tempfile::tempdir` lands in
+    /// the system temp directory, so there is no repository to accidentally rescue it. That is
+    /// asserted rather than assumed, because if a `.git` ever did sit above the temp root this
+    /// test would pass without the fix and prove nothing.
+    #[test]
+    fn hot_files_in_a_non_git_tree_resolves_include_root_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        write_include_root_cpp_tree(dir.path(), 3);
+
+        let mut probe = Some(dir.path());
+        while let Some(d) = probe {
+            assert!(
+                !d.join(".git").exists(),
+                "a .git at {} makes this fixture a git tree, so it cannot test the non-git path",
+                d.display()
+            );
+            probe = d.parent();
+        }
+
+        let out = fingerprint(dir.path());
+        let hot = hot_line(&out).unwrap_or_else(|| {
+            panic!("no hot line in a fingerprint of a 3-importer include-root tree:\n{out}")
+        });
+        assert!(
+            hot.contains("util"),
+            "the include-root header was not counted in a non-git tree — resolution gave up \
+             before probing (#45):\n{hot}"
+        );
+    }
+
+    /// Where there is no `.git`, a sibling project under the same root *can* be reached — and
+    /// that is stated rather than left implied.
+    ///
+    /// This is the honest limit of the fix, and the counterpart to
+    /// `hot_files_launched_above_two_checkouts_does_not_cross_repositories`: refusing to cross
+    /// into another project is a claim about **git** trees, where the repository supplies a
+    /// boundary. Outside one the tree root is the only boundary that exists, so `proj_a` can
+    /// resolve an include that lands in `proj_b`. Review flagged this as an unscoped claim, so
+    /// it gets a fixture: the behaviour is deliberate, it is the same reach a declared scope has
+    /// always had, and the alternative is #45's reported bug of resolving nothing at all.
+    ///
+    /// If this ever becomes unacceptable, the fix is a real project boundary — a manifest, a
+    /// build file — not a narrower default, because narrowing it is what #45 undid.
+    #[test]
+    fn hot_files_in_a_non_git_tree_can_reach_a_sibling_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let proj_a = parent.path().join("proj_a/src");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(parent.path().join("proj_b/shared")).unwrap();
+        std::fs::write(
+            parent.path().join("proj_b/shared/util.h"),
+            "#pragma once\nvoid other();\n",
+        )
+        .unwrap();
+        for i in 0..3 {
+            std::fs::write(
+                proj_a.join(format!("m{i}.cc")),
+                "#include \"proj_b/shared/util.h\"\n\nvoid m() {}\n",
+            )
+            .unwrap();
+        }
+
+        let out = fingerprint(parent.path());
+        let hot = hot_line(&out)
+            .unwrap_or_else(|| panic!("no hot line in a non-git two-project tree:\n{out}"));
+        assert!(
+            hot.contains("proj_b"),
+            "documented behaviour changed: with no `.git` the tree root is the only boundary, \
+             so a sibling project is reachable. If this is now refused, say so here and in the \
+             note at the `boundary_from_file` call site:\n{hot}"
+        );
+    }
+
+    /// Launched *inside* a subdirectory, headers above the launch directory must still count.
+    ///
+    /// This is the first reason `root` is not simply the fix. `fingerprint` is only ever called
+    /// with the process cwd, so every candidate is `root.join(rel)` and `root` would contain all
+    /// of them — the declared-scope arm of `resolve_c_include`'s composition rule would always
+    /// win and `.git` would never apply. Launched at `<repo>/src`, `<repo>/include/proj/util.h`
+    /// sits *above* the boundary and every resolution would be refused: a silent change to
+    /// fingerprint output in git trees, which are the common case.
+    ///
+    /// `boundary_from_file` gives the repository instead, so the answer does not depend on where
+    /// the server happened to be started.
+    #[test]
+    fn hot_files_launched_in_a_subdirectory_still_reaches_headers_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        write_include_root_cpp_tree(dir.path(), 3);
+
+        let out = fingerprint(&dir.path().join("src"));
+        let hot = hot_line(&out)
+            .unwrap_or_else(|| panic!("no hot line when launched inside src/:\n{out}"));
+        // Matched loosely on purpose: a target *above* the launch directory fails
+        // `strip_prefix(root)` in the renderer and falls through to the absolute path, so this
+        // line names a host path rather than a relative one. Pre-existing and unrelated to the
+        // boundary — before #45 the same launch resolved to the same place via `.git` — but this
+        // is the first test to reach it, so it is recorded rather than silently ratified.
+        assert!(
+            hot.contains("util"),
+            "a header above the launch directory stopped being counted, so the boundary came \
+             from the launch dir rather than from the file (#45):\n{hot}"
+        );
+    }
+
+    /// Launched *above* two **checkouts**, resolution must not cross from one into the other.
+    ///
+    /// Scoped to git trees on purpose — `hot_files_in_a_non_git_tree_can_reach_a_sibling_project`
+    /// is the same shape without the `.git` directories, and states the opposite outcome.
+    ///
+    /// The second reason `root` is not the fix, and the one worth caring about: a parent
+    /// directory holding several repositories is ordinary with worktrees. `repo_a/src/*.cc`
+    /// includes `"repo_b/shared/util.h"`, which exists — so with the launch directory as the
+    /// boundary the ancestor walk reaches it at hop `parent` and the fingerprint counts a hot
+    /// file in a *different project*. Given #29/#31 went to some trouble to make the initialize
+    /// fingerprint say true things, that is the failure mode to refuse.
+    ///
+    /// The `repo_a`-local arm is the control: the same launch must still count `repo_a`'s own
+    /// include-root header, or this test would also pass against an implementation that simply
+    /// resolved nothing.
+    #[test]
+    fn hot_files_launched_above_two_checkouts_does_not_cross_repositories() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo_a = parent.path().join("repo_a");
+        let repo_b = parent.path().join("repo_b");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        write_include_root_cpp_tree(&repo_a, 0);
+        std::fs::create_dir_all(repo_b.join("shared")).unwrap();
+        std::fs::write(
+            repo_b.join("shared/util.h"),
+            "#pragma once\nvoid other();\n",
+        )
+        .unwrap();
+
+        // Each source includes repo_a's own header (must count) and repo_b's (must not).
+        for i in 0..3 {
+            std::fs::write(
+                repo_a.join("src").join(format!("m{i}.cc")),
+                "#include \"proj/util.h\"\n#include \"repo_b/shared/util.h\"\n\nvoid m() {}\n",
+            )
+            .unwrap();
+        }
+
+        let out = fingerprint(parent.path());
+        let hot = hot_line(&out)
+            .unwrap_or_else(|| panic!("no hot line when launched above two checkouts:\n{out}"));
+        assert!(
+            hot.contains("include") && hot.contains("proj"),
+            "control failed: repo_a's own include-root header was not counted, so the \
+             cross-repository assertion below proves nothing:\n{hot}"
+        );
+        assert!(
+            !hot.contains("repo_b"),
+            "resolution crossed a repository boundary — the fingerprint is claiming a hot file \
+             in a different project (#45):\n{hot}"
         );
     }
 
