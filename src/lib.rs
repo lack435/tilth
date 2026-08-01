@@ -229,7 +229,7 @@ pub fn run_deps(
     let bloom = index::bloom::BloomFilterCache::new();
     let result = search::deps::analyze_deps(path, scope, &bloom)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
-    Ok(search::deps::format_deps(&result, scope, budget_usize))
+    Ok(search::deps::format_deps(&result, budget_usize))
 }
 
 /// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.

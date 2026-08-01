@@ -28,7 +28,30 @@ const MAX_DEPENDENTS: usize = 15;
 const MAX_EXTERNAL_DEPS: usize = 20;
 
 /// Result of a full dependency analysis for a single file.
+///
+/// **What spelling each path field carries**, which #97 is about and which nothing stated before.
+/// Field by field, because they genuinely differ — an earlier version of this comment said "all
+/// canonical absolute paths under a canonical scope" and review measured three ways that is false:
+///
+///   * `scope` — canonical, when `canonicalize` succeeded. It falls back to the caller's spelling
+///     for a scope that does not exist, where there is nothing to walk and so nothing to disagree
+///     with; see the note at the call.
+///   * `target` — canonical absolute, and **not necessarily under `scope`**. A caller may name a
+///     file outside the scope it searches, which is the case #96 decided renders absolutely.
+///   * `uses_local` — derived from the *target's* directory, so likewise not necessarily under
+///     `scope`, and **lexically normalized rather than canonicalized**: `resolve_import_to_file`
+///     ends in `normalize_path`, a `.`/`..` collapse that does not resolve symlinks.
+///   * `used_by` — walk output under the canonical `scope`, so canonical-prefixed *unless* a
+///     symlink sits below the walk root: the walker follows links without rewriting the spelling.
+///
+/// What #97 fixed is narrower than "one domain", and worth stating as what it is: `target` and
+/// `used_by` now agree well enough to be compared, and `scope` is spelled the way `used_by` is
+/// prefixed, so an in-scope path strips. The residual is the symlink case in the last bullet, #98.
 pub struct DepsResult {
+    /// The scope every other path here is rendered against, recorded rather than re-derived so
+    /// `format_deps` cannot render against a different spelling than the analysis compared
+    /// against — that divergence was #97.
+    pub scope: PathBuf,
     pub target: PathBuf,
     pub uses_local: Vec<LocalDep>,
     pub uses_external: Vec<String>,
@@ -70,6 +93,28 @@ pub fn analyze_deps(
         source: e,
     })?;
 
+    // Canonicalize the scope into the *same* domain, because the target is about to be compared
+    // and stripped against paths derived from it (#97).
+    //
+    // Canonicalizing only the target was the defect. `find_callers_batch` walks `scope` and yields
+    // paths spelled the way the caller spelled it, and two spellings of one directory are neither
+    // `==` nor `strip_prefix`-able. That broke two things at once, and the quiet one was worse:
+    //
+    //   * the self-reference filter below (`caller_match.path == *path`) never fired, so the target
+    //     was reported as one of its own dependents and `total_dependents` was over by one;
+    //   * `format_deps` fell through to absolute paths for files that are *inside* the scope.
+    //
+    // Both are downstream of the same mistake, so both are fixed here rather than at the two
+    // symptom sites. The MCP layer made this platform-divergent and hid it: `resolve_scope` returns
+    // a literal "." when the scope resolves to the process cwd, which happens on Linux and cannot
+    // happen on Windows, where `canonicalize` prepends `\\?\` and the equality never holds. So the
+    // default `tilth_deps` call was correct on Windows and wrong on Linux, and CI is Linux.
+    //
+    // `unwrap_or_else` rather than `?`: a scope that does not exist is not fatal here — the walk
+    // will simply find nothing — and the pre-#97 behaviour for that case was to use it as given.
+    // Erroring would turn a degraded answer into a refusal for callers that pass a stale scope.
+    let scope = &scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
+
     let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
         path: path.clone(),
         source: e,
@@ -78,6 +123,7 @@ pub fn analyze_deps(
     let FileType::Code(lang) = detect_file_type(path) else {
         // Non-code file: return empty deps gracefully.
         return Ok(DepsResult {
+            scope: scope.clone(),
             target: path.clone(),
             uses_local: Vec::new(),
             uses_external: Vec::new(),
@@ -232,7 +278,17 @@ pub fn analyze_deps(
         // Group by file path
         let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
         for (matched_symbol, caller_match) in raw_matches {
-            // Exclude calls from within the target file itself (self-references)
+            // Exclude calls from within the target file itself (self-references).
+            //
+            // Both sides agree since #97 — `path` from the canonicalize above, and
+            // `caller_match.path` from a walk of the canonicalized `scope`. When they did not,
+            // this never matched and the target appeared in its own `Used by` list.
+            //
+            // "Agree", not "are canonical": the walker follows links without rewriting the
+            // spelling, so a symlink *below* the walk root still reaches the target by an
+            // uncanonical path and still lands here as its own dependent. Measured with a
+            // directory junction while reviewing #97, and filed as #98 — #97's fix closes
+            // the scope-spelling half, which is the one the default flow hits, not the class.
             if caller_match.path == *path {
                 continue;
             }
@@ -250,7 +306,23 @@ pub fn analyze_deps(
             .map(|(dep_path, mut pairs)| {
                 pairs.sort();
                 pairs.dedup();
-                let is_test = is_test_file(&dep_path);
+                // Classify on the path *relative to the scope*. `is_test_file` substring-matches
+                // the whole path, so classifying the absolute one lets the directories above the
+                // project decide: a checkout under `__tests__/` marks every dependent a test and
+                // sinks them all in the sort below. That was already true wherever the scope was
+                // absolute, and #97 would have made it true everywhere by canonicalizing the walk
+                // root — so the exposure is closed here rather than widened.
+                //
+                // The `__tests__/` half of that is Unix-only, because `is_test_file` matches the
+                // literal with a forward slash and a Windows path has none. `.test.`/`.spec.` are
+                // separator-free and bite on both. Said exactly, because "a checkout under
+                // `__tests__/`" reads as a cross-platform hazard and is not one.
+                //
+                // Only this call site changed. The others (`grok`, `rank`, `blast`, `read::
+                // outline`) still classify whole paths, so the crate now carries two conventions —
+                // deliberate, since #97 is not a licence to sweep, and filed rather than left
+                // silent.
+                let is_test = is_test_file(dep_path.strip_prefix(scope).unwrap_or(&dep_path));
                 Dependent {
                     path: dep_path,
                     symbols: pairs,
@@ -278,6 +350,7 @@ pub fn analyze_deps(
     used_by.truncate(MAX_DEPENDENTS);
 
     Ok(DepsResult {
+        scope: scope.clone(),
         target: path.clone(),
         uses_local,
         uses_external,
@@ -296,33 +369,26 @@ pub fn analyze_deps(
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
 ///
-/// The three `strip_prefix(scope).unwrap_or(...)` sites below keep their absolute-path fallback,
-/// which #94 asked for a decision on rather than a fix.
+/// Renders against `result.scope`, not against a scope the caller passes in again. #94 asked for a
+/// decision about the `strip_prefix(scope).unwrap_or(...)` fallbacks below; #97 is what that
+/// decision missed, and taking the scope as a second argument is what made it possible.
 ///
-/// Two of the three reach it, by a plainer route than #94's survey suggests — and *not* the route
-/// that issue proposes. `canonical_boundary(scope)` governs C/C++ include resolution and has no
-/// bearing on `strip_prefix` here; the reachable shape is simply `tilth_deps` with an absolute
-/// `path` and no `scope`, which resolves the scope to the server's cwd. A target outside that cwd
-/// fails `strip_prefix` in the header and in `format_uses_local`, whose paths derive from it. That
-/// is language-independent, which makes it a wider claim than the include-resolution one, not a
-/// narrower one.
+/// The fallback stays, and is now what #94 said it was — the arm for a target genuinely *outside*
+/// the scope, where an absolute path is a usable answer the agent can hand straight back to a read,
+/// the reason `search/grok.rs`'s `display_rel` already gives. What it is no longer is the arm for a
+/// target inside the scope whose spelling merely disagreed: `analyze_deps` canonicalizes target and
+/// scope together, so an in-scope path always strips.
 ///
-/// The third, `format_used_by`, cannot reach it: its dependents come from
-/// `find_callers_batch(.., scope, ..)`, a walk *under* `scope`, so every path it renders strips. In
-/// the case above it renders nothing at all — nothing under the server's cwd references a file
-/// outside it.
-///
-/// Keeping the fallback is right for the reason `search/grok.rs`'s `display_rel` already gives:
-/// this is a search result, and an absolute path is a usable answer the agent can hand straight
-/// back to a read. It is *not* the caller's own spelling, which an earlier version of this comment
-/// claimed — `analyze_deps` canonicalizes the target before resolving, so on Windows these lines
-/// carry a `\\?\` verbatim prefix the caller never wrote. Ugly, and it still reads.
+/// The paths it prints are canonical, not the caller's own spelling — on Windows they carry a
+/// `\\?\` verbatim prefix nobody wrote. That is the honest cost of the fallback, and it reads:
+/// verbatim paths round-trip back through `tilth_read`, `tilth_search` and `tilth_deps`.
 ///
 /// `overview`'s hot line is different in both respects, which is why only it changed: nobody
 /// asked for that path, it is injected at every `initialize` under a fixed size budget, and the
 /// rest of the payload is relative to the launch directory — so an absolute path there is both
 /// noise and machine-specific output in an otherwise portable blurb.
-pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
+pub fn format_deps(result: &DepsResult, budget: Option<usize>) -> String {
+    let scope: &Path = &result.scope;
     let dep_count = result.total_dependents;
     let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
 
@@ -716,6 +782,196 @@ fn assemble(parts: &[&str]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// #97: the answer must not depend on how the caller spelled the scope.
+///
+/// `analyze_deps` canonicalizes the target, and used to compare and render it against paths spelled
+/// however the caller spelled the scope. Two spellings of one directory are neither `==` nor
+/// `strip_prefix`-able, so the target became its own dependent and in-scope paths rendered
+/// absolutely.
+///
+/// `<root>/src/..` is the spelling used here because it is non-canonical on every platform, needs
+/// no symlink privileges, and — unlike the shape that actually shipped the bug — needs no control
+/// of the process cwd. The real-world trigger on Linux is `resolve_scope` returning a literal `"."`
+/// (`mcp::tools::tests::resolve_scope_no_arg_no_root_defaults_to_cwd` pins that it does, and
+/// passes only there). Reproducing *that* spelling here means moving the process cwd, which is
+/// exactly the hazard #95 is open about, so it is not reproduced.
+///
+/// Nothing therefore covers `analyze_deps` under a literal `"."` scope — that MCP-layer test pins
+/// what `resolve_scope` returns and never calls deps at all. What is covered instead is the
+/// mechanism the `"."` spelling triggers, plus the same mismatch through the MCP layer in
+/// `mcp::tools::deps::tests`, which reaches it through `resolve_scope`'s root fallback and so runs
+/// on the Linux CI runner. Stated because "the MCP-layer test covers it" was the earlier claim
+/// here and overstated what that test does.
+#[cfg(test)]
+mod scope_spelling_tests {
+    use super::{analyze_deps, format_deps};
+    use std::path::Path;
+
+    /// Two callers of `shared`, plus a call to `shared` from inside the target itself — without
+    /// that third call the self-reference filter has nothing to filter and the test cannot fail.
+    fn write_tree(root: &Path) {
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.rs"),
+            "pub fn shared() -> u32 { 1 }\npub fn inner() -> u32 { shared() + 1 }\n",
+        )
+        .unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(
+                src.join(name),
+                "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
+            )
+            .unwrap();
+        }
+    }
+
+    fn run(root: &Path, scope: &Path) -> (super::DepsResult, String) {
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let r = analyze_deps(&root.join("src/target.rs"), scope, &bloom).unwrap();
+        let out = format_deps(&r, None);
+        (r, out)
+    }
+
+    #[test]
+    fn a_non_canonical_scope_spelling_gives_the_same_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path());
+
+        let (canonical, canonical_out) = run(dir.path(), dir.path());
+        let (spelled, spelled_out) = run(dir.path(), &dir.path().join("src/.."));
+
+        // Control: without real dependents this test passes against anything.
+        assert_eq!(
+            canonical.total_dependents, 2,
+            "fixture produced no dependents, so nothing below is meaningful:\n{canonical_out}"
+        );
+
+        assert_eq!(
+            spelled.total_dependents, canonical.total_dependents,
+            "the dependent count changed with the scope spelling — the self-reference filter \
+             compared a canonical target against caller-spelled paths (#97):\n{spelled_out}"
+        );
+        assert_eq!(
+            spelled_out, canonical_out,
+            "two spellings of one scope produced different output (#97)"
+        );
+    }
+
+    #[test]
+    fn the_target_is_never_its_own_dependent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path());
+
+        for scope in [dir.path().to_path_buf(), dir.path().join("src/..")] {
+            let (r, out) = run(dir.path(), &scope);
+            assert!(
+                !r.used_by
+                    .iter()
+                    .any(|d| d.path.file_name() == Some("target.rs".as_ref())),
+                "the target is listed as its own dependent under scope {} — the self-reference \
+                 filter never fired (#97):\n{out}",
+                scope.display()
+            );
+        }
+    }
+
+    /// A target genuinely *outside* the scope still renders absolutely.
+    ///
+    /// #96 decided that deliberately — for a search result an absolute path is a usable answer the
+    /// agent can hand straight back to a read — and #97's acceptance keeps it. It was guarded by a
+    /// comment on `format_deps` and nothing else, which is thin for a behaviour two issues went out
+    /// of their way to preserve, and thinner now that #97 has narrowed when the arm is reached.
+    ///
+    /// Unlike its four neighbours this one passes with #97 reverted, and is meant to: it guards
+    /// #96's decision against a future fix that "cleans up" the last absolute path, not #97's.
+    #[test]
+    fn a_target_outside_the_scope_still_renders_absolutely() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path());
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        // Scope the search at an empty sibling directory; the target is outside it.
+        let (_, out) = run(dir.path(), &elsewhere);
+        let target = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("src")
+            .join("target.rs");
+        assert!(
+            out.contains(&*target.to_string_lossy()),
+            "a target outside the scope must keep the absolute fallback #96 decided on (#97):\n\
+             {out}"
+        );
+    }
+
+    /// `Used by` puts dependents in the target's own directory first.
+    ///
+    /// This ordering was **dead** before #97 and this test would have failed: the sort compares
+    /// `dep.path.parent()` against the canonical target's parent, and in both broken flows the
+    /// dependents were spelled another way, so the key was always `false` and the list came out
+    /// ordered by `(is_test, path)` alone. Canonicalizing the scope revives it, which is a visible
+    /// reordering of every `Used by` list on the default flow. Review caught that it was happening
+    /// and unmeasured; it is the intended sort finally working, so it is pinned rather than undone.
+    #[test]
+    fn used_by_lists_same_directory_dependents_first() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path());
+        // A dependent one directory down, whose path sorts *before* the same-directory ones.
+        let deeper = dir.path().join("src/aaa_deeper");
+        std::fs::create_dir_all(&deeper).unwrap();
+        std::fs::write(
+            deeper.join("far.rs"),
+            "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
+        )
+        .unwrap();
+
+        let (r, out) = run(dir.path(), dir.path());
+        let names: Vec<String> = r
+            .used_by
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            3,
+            "fixture did not produce the three dependents this ordering is about:\n{out}"
+        );
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("far.rs"),
+            "the same-directory dependents must sort ahead of the one in a subdirectory, so \
+             `far.rs` comes last despite sorting first alphabetically (#97 revived this key):\n\
+             {names:?}\n{out}"
+        );
+    }
+
+    /// A file inside the scope must render relatively however the scope was spelled.
+    ///
+    /// Separate from the equality test above: two runs could agree by both rendering absolutely,
+    /// which is the pre-#97 behaviour for the mismatched spelling and would satisfy an
+    /// equality-only assertion if the canonical run ever regressed to match it.
+    #[test]
+    fn in_scope_paths_render_relatively_under_either_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path());
+        // The tempdir's own canonical spelling is what a leaked absolute path would contain.
+        let leaked = dir.path().canonicalize().unwrap();
+        let leaked = leaked.to_string_lossy();
+
+        for scope in [dir.path().to_path_buf(), dir.path().join("src/..")] {
+            let (_, out) = run(dir.path(), &scope);
+            assert!(
+                !out.contains(leaked.as_ref()),
+                "an in-scope path rendered as a host path under scope {} (#97):\n{out}",
+                scope.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
