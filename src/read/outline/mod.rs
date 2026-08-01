@@ -39,8 +39,10 @@ const OUTLINE_CAP: usize = 100; // max outline lines for huge files
 /// carrying the BOM. But it does have to agree with `resolve_heading` and
 /// `suggest_headings`, which parse the same bytes for the section reader: while only this
 /// side stripped, the outline advertised a doubled-BOM heading that the resolver denied.
-/// The search-side markdown parsers (`search::symbol`, `search::mod`) still parse unstripped
-/// and so still disagree about a doubled-BOM file's first heading — tracked in #51.
+///
+/// The search-side markdown parsers agree now too — `search::symbol`'s definition matcher and
+/// `search::mod`'s enclosing-scope lookup both strip, closing the last of that split (#51/#87).
+/// Every markdown parse on both sides therefore sees the same bytes.
 pub fn generate(
     path: &Path,
     file_type: FileType,
