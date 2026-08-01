@@ -299,13 +299,24 @@ pub fn analyze_deps(
 /// The three `strip_prefix(scope).unwrap_or(...)` sites below keep their absolute-path fallback,
 /// which #94 asked for a decision on rather than a fix.
 ///
-/// The fallback is reachable, and more easily than that issue's survey suggests: `analyze_deps`
-/// passes `canonical_boundary(scope)`, so `tilth_deps` with an absolute `path` outside the
-/// server's cwd renders every one of these lines as a host path. It is the right output anyway,
-/// for the reason `search/grok.rs`'s `display_rel` already gives — this is a search result, and
-/// an absolute path is a usable answer the agent can hand straight back to a read. It is also
-/// the path the *caller supplied*, so echoing it relative to an unrelated scope would be the
-/// misleading spelling, not the honest one.
+/// Two of the three reach it, by a plainer route than #94's survey suggests — and *not* the route
+/// that issue proposes. `canonical_boundary(scope)` governs C/C++ include resolution and has no
+/// bearing on `strip_prefix` here; the reachable shape is simply `tilth_deps` with an absolute
+/// `path` and no `scope`, which resolves the scope to the server's cwd. A target outside that cwd
+/// fails `strip_prefix` in the header and in `format_uses_local`, whose paths derive from it. That
+/// is language-independent, which makes it a wider claim than the include-resolution one, not a
+/// narrower one.
+///
+/// The third, `format_used_by`, cannot reach it: its dependents come from
+/// `find_callers_batch(.., scope, ..)`, a walk *under* `scope`, so every path it renders strips. In
+/// the case above it renders nothing at all — nothing under the server's cwd references a file
+/// outside it.
+///
+/// Keeping the fallback is right for the reason `search/grok.rs`'s `display_rel` already gives:
+/// this is a search result, and an absolute path is a usable answer the agent can hand straight
+/// back to a read. It is *not* the caller's own spelling, which an earlier version of this comment
+/// claimed — `analyze_deps` canonicalizes the target before resolving, so on Windows these lines
+/// carry a `\\?\` verbatim prefix the caller never wrote. Ugly, and it still reads.
 ///
 /// `overview`'s hot line is different in both respects, which is why only it changed: nobody
 /// asked for that path, it is injected at every `initialize` under a fixed size budget, and the

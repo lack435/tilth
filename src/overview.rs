@@ -440,11 +440,23 @@ fn rel_display(path: &Path) -> String {
 /// argument.
 ///
 /// The `…/` arm is for paths with no shared component at all. On Unix two absolute paths always
-/// share the root, and `fingerprint` is only ever called with the process cwd, so reaching it
-/// takes a target on a different Windows drive — `#include "D:/vendor/x.h"`, which `resolve_c
-/// _include`'s direct arm will return if the file exists. A relative `root` would do it too, and
-/// no caller has one. It is kept because the alternative in a case with no relative spelling is
-/// the host path this function exists to remove.
+/// share the root, so reaching it takes a Windows target that shares no prefix with `root`: another
+/// drive (`#include "D:/vendor/x.h"`, which `resolve_c_include`'s direct arm returns if the file
+/// exists), a UNC share, or a `\\?\` verbatim spelling against a non-verbatim `root`. It is kept
+/// because the alternative in a case with no relative spelling is the host path this function
+/// exists to remove.
+///
+/// Both callers pass `current_dir().unwrap_or_default()`, whose fallback is the *empty* path — and
+/// an empty `root` takes the first arm, since `strip_prefix("")` succeeds, which would print the
+/// host path this function removes. It is unreachable rather than handled: `read_dir("")` fails, so
+/// the walk yields no files and there is no hot line to render. Said plainly because the earlier
+/// spelling of this note claimed no caller has a relative `root`, which is not true.
+///
+/// One input renders wrongly rather than absolutely: a Windows drive-relative target (`C:foo\x.h`,
+/// from an equally drive-relative `#include`) shares only the disk prefix, so the walk emits a
+/// `../` chain to a location it is not at. Drive-relative paths anchor to a per-drive cwd that is
+/// not recoverable lexically, so no spelling here is right; the old code printed it verbatim. Left
+/// alone deliberately — the shape is absurd, and guarding it would cost a check on every render.
 fn hot_path_display(root: &Path, path: &Path) -> String {
     if let Ok(rel) = path.strip_prefix(root) {
         return rel_display(rel);
@@ -3309,14 +3321,26 @@ mod tests {
     /// Written while covering #94's "at either a git or a non-git tree root" acceptance, and kept
     /// because the obvious version of that test asserts a relative spelling and fails. With a
     /// `.git` above, `boundary_from_file` hands back the repository and the header at
-    /// `<repo>/include/proj/util.h` is inside it. With no `.git` the boundary falls back to the
-    /// tree root — which for a subdirectory launch *is* the launch directory — so the include
-    /// root one hop up fails `is_within` and the include stays external. Nothing reaches the
-    /// renderer, so there is no path to render badly.
+    /// `<repo>/include/proj/util.h` is inside it. With no `.git` it falls back to the tree root,
+    /// which for a subdirectory launch *is* the launch directory — and there the include root one
+    /// hop up is never even a candidate.
+    ///
+    /// The mechanism is `resolve_c_include`'s `if base == root { break; }`, not `is_within`. With
+    /// `root == dir` the hop loop tests `candidates_at(<tmp>/src, ..)` — `<tmp>/src/proj/util.h`
+    /// and the two conventional roots beneath it — and then breaks before hop 1, so
+    /// `<tmp>/include/proj/util.h` is never generated, never statted, and never reaches the
+    /// containment check at all. Review corrected an earlier version of this comment that blamed
+    /// `is_within`: the one `is_within` call on this path, `boundary.filter(|b| is_within(dir, b))`
+    /// at the adopt site, *succeeds* — it is what makes the launch directory the root in the first
+    /// place. Confirmed by moving the header to hop 0 in the same fixture, where it resolves.
     ///
     /// #94's non-git arm is therefore carried by `hot_files_renders_relatively_for_a_non_c
     /// _language_too`, whose fixture has no `.git` either and whose resolution consults no
     /// boundary at all.
+    ///
+    /// This test carries no #94 weight and is not meant to: it stays green with the renderer
+    /// reverted, because it asserts a #45 boundary fact about what reaches the renderer rather
+    /// than anything about how the renderer spells it.
     ///
     /// The root-launch control is load-bearing: without it this test passes against a fixture
     /// that resolves nothing for some entirely different reason.
