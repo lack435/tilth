@@ -362,13 +362,6 @@ const SURFACES: &[Surface] = &[
         view: None,
         expect: Bom::NoFileText("a token ratio over counters; no file text reaches it"),
     },
-    Surface {
-        label: "session",
-        tool: "tilth_session",
-        edit_mode: false,
-        view: None,
-        expect: Bom::NoFileText("summary/reset of dedup and savings counters; no file text"),
-    },
 ];
 
 /// Schema properties that do **not** open an output shape of their own, each with its reason.
@@ -628,7 +621,6 @@ fn args_for(label: &str, root: &Path) -> Value {
             ]}]
         }),
         "savings" => json!({}),
-        "session" => json!({"action": "summary"}),
         other => panic!("no arguments defined for surface `{other}`"),
     }
 }
@@ -947,8 +939,8 @@ fn every_surface_strips_the_bom_or_is_declared_to_keep_it() {
 /// ANCHOR 1 + 2: every dispatchable tool is named, and every advertised tool is dispatchable.
 ///
 /// The dispatch direction is the one that matters and the one the first version lacked: a tool added
-/// to `dispatch_tool` and never advertised was invisible, which is exactly the state `tilth_session`
-/// is in. `dispatch_tool` now gates on `DISPATCHABLE_TOOLS`, so that const is authoritative.
+/// to `dispatch_tool` and never advertised is invisible, which is exactly the state `tilth_session`
+/// was in. `dispatch_tool` now gates on `DISPATCHABLE_TOOLS`, so that const is authoritative.
 #[test]
 fn every_dispatchable_and_advertised_tool_is_named() {
     for tool in DISPATCHABLE_TOOLS {
@@ -965,15 +957,61 @@ fn every_dispatchable_and_advertised_tool_is_named() {
             "`{name}` is advertised but not in DISPATCHABLE_TOOLS, so calling it fails"
         );
     }
-    // `tilth_session` is dispatchable and unadvertised. Pinned rather than tolerated silently: if the
-    // asymmetry is ever closed, this fails and the note comes out.
+}
+
+/// ANCHOR 2, the other direction: nothing the server answers is undiscoverable.
+///
+/// This replaces a negative pin. The guard used to assert that `tilth_session` specifically was
+/// *not* advertised, because it was the one tool `dispatch_tool` answered with no schema to announce
+/// it — dispatchable since the module split, unadvertised since 6ea62e8 deleted its definition. #86
+/// removed the tool, so the exception is gone and the rule can be stated generally, which is the
+/// version that catches the *next* one.
+///
+/// `tool_definitions(true)` on purpose: `tilth_write` is dispatchable but advertised only in edit
+/// mode, so the read-only schema is a strict subset and comparing against it would fail for a tool
+/// that is correctly gated. That exemption is only sound if the gate runs the other way too — a
+/// read-only server must *refuse* the tool it does not advertise — so the second half asserts it
+/// rather than trusting `dispatch_tool`'s `if edit_mode` arm by reading.
+#[test]
+fn every_dispatchable_tool_is_advertised() {
     let advertised: Vec<String> = tool_definitions(true)
         .iter()
-        .map(|d| d["name"].as_str().unwrap_or_default().to_string())
+        .map(|d| {
+            d["name"]
+                .as_str()
+                .expect("every definition has a name")
+                .to_string()
+        })
+        .collect();
+    let undiscoverable: Vec<&&str> = DISPATCHABLE_TOOLS
+        .iter()
+        .filter(|t| !advertised.iter().any(|a| a == *t))
         .collect();
     assert!(
-        !advertised.iter().any(|a| a == "tilth_session"),
-        "`tilth_session` is now advertised — good, but remove this assertion and the note beside it"
+        undiscoverable.is_empty(),
+        "{undiscoverable:?} are dispatchable but absent from `tool_definitions`, so the server \
+         answers tools no client can discover and a schema-validating client will refuse. Either \
+         add a definition or remove the dispatch arm — see #86."
+    );
+
+    // The one tool exempted above, checked in the direction the exemption depends on.
+    assert!(
+        !tool_definitions(false)
+            .iter()
+            .any(|d| d["name"] == "tilth_write"),
+        "`tilth_write` is advertised without --edit, so the edit-mode exemption above is unearned"
+    );
+    // The *message*, not merely `is_err()`. Every argument shape `tool_write` would reject on its
+    // own — an empty `files`, a missing one, a bad mode — errors identically whether the gate is
+    // there or not, so an `is_err()` assertion here passes with `if edit_mode` deleted. Verified:
+    // it did. Only the `unknown tool` spelling comes from the gate, and it is the one a client sees.
+    let read_only = Services::new(false);
+    let refusal = dispatch_tool("tilth_write", &json!({"files": []}), &read_only);
+    assert_eq!(
+        refusal.as_deref().map_err(String::as_str),
+        Err("unknown tool: tilth_write"),
+        "a read-only server did not refuse `tilth_write` as unknown — it never advertised the tool, \
+         so reaching its argument validation at all means the edit-mode gate is gone"
     );
 }
 

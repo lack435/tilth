@@ -15,7 +15,7 @@ pub(crate) mod write;
 
 use tools::{
     tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_savings,
-    tool_search, tool_session, tool_write,
+    tool_search, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -299,9 +299,14 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 ///
 /// `dispatch_tool` gates on this list before matching, so a tool added to the `match` below without
 /// being added here is **unreachable** — a failure at the first call rather than a silent gap. That
-/// matters because this list, not `tool_definitions`, is the real request entry point: the two are
-/// not equal, and `tilth_session` is the standing proof (dispatchable, never advertised). The BOM
-/// surface table in `bom_surfaces` enumerates from here for exactly that reason.
+/// matters because this list, not `tool_definitions`, is the real request entry point, and the BOM
+/// surface table in `bom_surfaces` enumerates from here rather than from the schema for that reason.
+///
+/// The two are now required to agree, which they did not used to: `tilth_session` sat here with no
+/// definition from 6ea62e8 (which deleted its schema and dropped it from the instructions) until
+/// #86, so the server answered a tool no client could discover. `every_dispatchable_tool_is_advertised`
+/// pins the equality in both directions — `tool_definitions(true)`, because `tilth_write` is
+/// dispatchable but advertised only in edit mode.
 pub(in crate::mcp) const DISPATCHABLE_TOOLS: &[&str] = &[
     "tilth_read",
     "tilth_search",
@@ -309,7 +314,6 @@ pub(in crate::mcp) const DISPATCHABLE_TOOLS: &[&str] = &[
     "tilth_deps",
     "tilth_grok",
     "tilth_diff",
-    "tilth_session",
     "tilth_savings",
     "tilth_write",
 ];
@@ -326,9 +330,8 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
-        "tilth_session" => tool_session(args, services.session()),
         "tilth_savings" => tool_savings(args, services.session()),
-        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
+        "tilth_write" if edit_mode => tool_write(args, services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
