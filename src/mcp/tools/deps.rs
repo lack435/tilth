@@ -75,6 +75,57 @@ mod tests {
         );
     }
 
+    /// #97 through the layer that shipped it, and on the platform that shipped it.
+    ///
+    /// `resolve_scope` canonicalizes every scope it resolves, so the one spelling that reaches
+    /// `analyze_deps` uncanonicalized is its missing-directory fallback: a `scope` that is not a
+    /// directory plus an absolute `root` returns that **`root` as the caller spelled it**
+    /// (`resolve_scope`'s `Some(r) if r.is_absolute()` arm). #97 called this the cheapest
+    /// reproduction, and it was measured by hand and guarded by nothing.
+    ///
+    /// The `root` here is deliberately spelled `<tmp>/src/..`, which is non-canonical on every
+    /// platform. That matters: a plain tempdir path is already canonical on the Linux runner, so
+    /// the same test written the obvious way would exercise nothing there — which is the platform
+    /// the defect actually shipped on, since `resolve_scope`'s other uncanonical spelling (a
+    /// literal `"."`) can only arise on Linux.
+    ///
+    /// Asserts the *quiet* half. The rendering was the visible symptom; a file reported as its own
+    /// dependent is the wrong answer, and the one worth a layer test.
+    #[test]
+    fn a_non_canonical_root_fallback_does_not_make_a_file_its_own_dependent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.rs"),
+            "pub fn shared() -> u32 { 1 }\npub fn inner() -> u32 { shared() + 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("a.rs"),
+            "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
+        )
+        .unwrap();
+
+        let args = serde_json::json!({
+            "path": src.join("target.rs").to_str().unwrap(),
+            "scope": "no_such_dir",
+            "root": tmp.path().join("src/..").to_str().unwrap(),
+        });
+        let out = tool_deps(&args, &bloom()).expect("missing scope + absolute root must not error");
+
+        assert!(
+            out.contains("1 dependent"),
+            "control failed: the fixture must produce exactly the one real dependent, or the \
+             assertion below proves nothing:\n{out}"
+        );
+        assert!(
+            !out.contains("target.rs:"),
+            "the target is listed among its own dependents — the self-reference filter compared \
+             a canonical target against paths spelled like the raw root (#97):\n{out}"
+        );
+    }
+
     #[test]
     fn absolute_path_explicit_relative_scope_no_root_errors() {
         // An EXPLICITLY passed relative `scope` with no absolute root is
