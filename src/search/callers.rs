@@ -215,6 +215,13 @@ pub(crate) fn find_callers_batch(
 
     let walker = super::walker(scope, glob)?;
 
+    // The one place a whole scope is enumerated against the bloom cache, and therefore the one
+    // place that can tell the cache "everything you hold has now had its chance to be probed".
+    // That is what lets a bounded cache evict without an access order `DashMap` does not keep;
+    // see `BloomFilterCache::begin_pass`. Taken after `walker(..)?` only because there is nothing
+    // to sweep for a walk that never started — the guard would be correct either side of it.
+    let pass = bloom.begin_pass();
+
     super::run_walk(walker, || {
         let matches = &matches;
 
@@ -271,6 +278,20 @@ pub(crate) fn find_callers_batch(
             ignore::WalkState::Continue
         })
     });
+
+    // A cancelled walk stopped partway through its scope, so the files it never reached read as
+    // unprobed for a reason that has nothing to do with the working set. Close the pass without
+    // ageing anything; the next complete walk sweeps.
+    //
+    // `worker_request_cancelled`, not `current().is_cancelled()`. The bloom cache is state that
+    // outlives a request — the same category as the session writes that accessor was added for —
+    // and `cancel`'s own docs say why `CURRENT` cannot answer this: by the time an abandoned worker
+    // gets here the serial loop has published the *next* request's token, so it would be told it
+    // is not cancelled and would age a truncated pass. Both fail in the never-wrongly-cancelled
+    // direction; only this one is right in both regimes.
+    if crate::cancel::worker_request_cancelled() {
+        pass.abandon();
+    }
 
     let mut all = matches
         .into_inner()
@@ -1164,6 +1185,86 @@ pub(crate) mod symlink_identity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancelled walk must not age the bloom cache.
+    ///
+    /// The pass bracket above tells the cache "everything you hold has had its chance to be
+    /// probed", and a walk that quit partway through has not made that true. Two consecutive
+    /// timeouts would otherwise evict a working set that was never actually idle.
+    ///
+    /// The uncancelled arm is what makes this a test rather than an assertion of zero: same
+    /// fixture, same 0-byte ceiling, one sweep.
+    ///
+    /// The cancel has to land **mid-walk**, and a first version that set it before the call proved
+    /// nothing at all: `run_walk` checks the token ahead of every entry, so a pre-cancelled walk
+    /// probes no file, refuses no admission, and is owed no sweep whether or not the pass was
+    /// abandoned. It passed with the fix reverted. The watcher thread below fires on the cache's
+    /// own build counter rather than on a timer, so the cancel lands after the first probe and
+    /// before a 400-file walk can finish — and `built` is asserted to be short of the fixture, so a
+    /// run where it did not is a failure rather than a silent pass.
+    #[test]
+    fn a_cancelled_walk_does_not_age_the_bloom_cache() {
+        const FILES: usize = 400;
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..FILES {
+            std::fs::write(
+                tmp.path().join(format!("f{i:04}.rs")),
+                "pub fn go() -> u32 { shared() }\n",
+            )
+            .unwrap();
+        }
+        let targets: HashSet<String> = ["shared".to_string()].into_iter().collect();
+
+        // A ceiling of 0 refuses every admission, so a sweep is due on every complete pass and the
+        // count below is about cancellation and nothing else.
+        let uncancelled = crate::index::bloom::BloomFilterCache::with_ceiling(0);
+        let _ = find_callers_batch(&targets, tmp.path(), &uncancelled, None).unwrap();
+        assert_eq!(
+            uncancelled.sweeps_run(),
+            1,
+            "a complete pass did not sweep, so the cancelled arm below would prove nothing"
+        );
+
+        // Both halves of what `spawn_with_timeout` sets up, because the two are consulted by
+        // different things: the walk quits on the *published* token (`run_walk` -> `current()`),
+        // and the abandon decision reads the token bound to *this* thread. Binding only one would
+        // test half the path.
+        let _publish = crate::cancel::PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _visible = crate::cancel::make_visible_on_this_thread();
+        let request = crate::cancel::begin_request();
+        let _bound = crate::cancel::bind_worker(request.token());
+
+        let cancelled = crate::index::bloom::BloomFilterCache::with_ceiling(0);
+        let walk_over = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Spin on the cache's own counter rather than sleeping, so the cancel lands as
+                // soon as there is a probe to interrupt. `walk_over` is the escape hatch: without
+                // it a fixture that somehow probed nothing would hang the scope's join rather than
+                // fail the assertion below.
+                while cancelled.filters_built() == 0 && !walk_over.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                request.cancel();
+            });
+            let _ = find_callers_batch(&targets, tmp.path(), &cancelled, None);
+            walk_over.store(true, Ordering::Relaxed);
+        });
+
+        let built = cancelled.filters_built();
+        assert!(
+            built > 0 && built < FILES,
+            "the walk was not truncated ({built} of {FILES} files probed), so nothing here is \
+             about a partial pass"
+        );
+        assert_eq!(
+            cancelled.sweeps_run(),
+            0,
+            "a cancelled walk swept, ageing entries it never reached"
+        );
+    }
 
     /// A callers query over a BOM'd file must render and rank exactly as without one.
     ///
