@@ -512,10 +512,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize tests that change process cwd.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    // Serializing the cwd against *these* tests was never enough — `crate::testlock::cwd` is now
+    // the one lock, and `mcp::bom_surfaces` takes it too. See #95 and the note on `run_diff_in`.
+    //
+    // `//` and not `///`: rustdoc concatenates doc attributes across a blank line, so the `///`
+    // this replaced had silently become the first paragraph of `setup_test_repo`'s documentation.
 
     /// Create a test git repo with an initial commit containing a Rust file.
     fn setup_test_repo() -> tempfile::TempDir {
@@ -556,7 +557,34 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Run diff() from within the test repo directory, serialized via CWD_LOCK.
+    /// Restores the process cwd on the way out, panic or not.
+    ///
+    /// Without this, a panic inside `diff()` unwinds past the restore and releases the lock with
+    /// the cwd still inside a fixture that is about to be deleted — and the next holder is
+    /// `bom_surfaces`, holding it across its whole table, which then fails *deterministically* with
+    /// the #95 error. Test profiles unwind (`panic = "abort"` is set for `[profile.release]` only),
+    /// so that path is live. It is also what makes `testlock::cwd`'s poison-ignoring honest: with
+    /// the restore guaranteed, there really is nothing a panic can leave inconsistent here.
+    struct RestoreCwd(std::path::PathBuf);
+
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    /// Run diff() from within the test repo directory, serialized via the shared cwd lock.
+    ///
+    /// The lock has to be *shared* with every test that reads the cwd, not just with the ones that
+    /// move it. Measured for #95: `mcp::bom_surfaces` would spawn `git` with the inherited cwd
+    /// pointing at `dir`, and git's repository discovery would then race that fixture's deletion —
+    /// `.git` present, `.git/HEAD` already gone. Hence the two symptoms, "not a git repository" and
+    /// "your current branch appears to be broken", neither of which looks like a cwd race.
+    ///
+    /// What the lock buys is precisely that **no such child is ever spawned while the cwd is a
+    /// fixture**. The `TempDir` drop happens in the test body after this returns, necessarily
+    /// outside the lock, and deliberately so — it does not need to be inside it, and moving it
+    /// there would not make anything safer.
     fn run_diff_in(
         dir: &Path,
         source: &DiffSource,
@@ -565,12 +593,10 @@ mod tests {
         blast: bool,
         budget: Option<u64>,
     ) -> Result<String, String> {
-        let _lock = CWD_LOCK.lock().unwrap();
-        let prev = std::env::current_dir().unwrap();
+        let _lock = crate::testlock::cwd();
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
         std::env::set_current_dir(dir).unwrap();
-        let result = diff(source, scope, search, blast, 0, budget);
-        std::env::set_current_dir(&prev).unwrap();
-        result
+        diff(source, scope, search, blast, 0, budget)
     }
 
     // 1. test_empty_diff

@@ -34,7 +34,43 @@ pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
+
 pub mod util;
+
+/// Locks over process-global state that tests share.
+///
+/// The process working directory is one value for the whole test binary, and `cargo test` runs
+/// tests on many threads. A lock that lives inside one module only serializes that module's tests
+/// against each other, which is what #95 was: `diff`'s tests moved the cwd under their own private
+/// mutex while `mcp::bom_surfaces` read it without one.
+#[cfg(test)]
+pub(crate) mod testlock {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Must be held by anything that **moves** the process cwd, and by any reader that can *fail*
+    /// on a moved one — the second half is easy to forget and is the whole of #95.
+    ///
+    /// Not every reader qualifies, and the crate has several that do not take it: tests that merely
+    /// observe `current_dir()` and assert on its shape cannot be made wrong by a cwd that moved and
+    /// moved back. What qualifies is spawning a child process, which inherits the cwd and can
+    /// outlive the window.
+    static CWD: Mutex<()> = Mutex::new(());
+
+    /// Take the cwd lock, ignoring poisoning.
+    ///
+    /// A test that panics while holding this lock would otherwise poison it and turn one failure
+    /// into a cascade across two modules — exactly the "a red run means something" property #95 is
+    /// about, and the panic that actually happens is `bom_surfaces`' own assertion, which does not
+    /// touch the cwd.
+    ///
+    /// This is only sound because every writer restores the cwd from a `Drop` guard, so an unwind
+    /// cannot release the lock with the cwd moved. Review caught the earlier version of this note
+    /// asserting "nothing a panic could leave inconsistent" while `run_diff_in` restored inline —
+    /// where a panic in `diff()` skipped the restore and handed the next holder a fixture cwd.
+    pub(crate) fn cwd() -> MutexGuard<'static, ()> {
+        CWD.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Re-exports for the fuzz harness. Not stable; do not depend on this.
 /// Items here are only `pub` so `fuzz/fuzz_targets/*.rs` can reach them
