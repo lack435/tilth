@@ -29,11 +29,7 @@ pub(in crate::mcp) fn tool_deps(
     let deps_result =
         crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&crate::search::deps::format_deps(
-        &deps_result,
-        &scope,
-        budget,
-    ));
+    output.push_str(&crate::search::deps::format_deps(&deps_result, budget));
     Ok(output)
 }
 
