@@ -78,6 +78,11 @@ pub struct CallerMatch {
     /// **An identity, not a spelling.** `path` canonicalized, falling back to `path` itself when
     /// that fails. Compare and deduplicate on this.
     ///
+    /// On that fallback the pre-#98 behaviour returns for the affected match: the self-reference
+    /// filters miss it and the dedup stops collapsing it. The exposure is small — the file was read
+    /// successfully moments earlier, and a broken symlink never arrives here because the walker
+    /// yields an `Err` the closure drops — but it is a silent degradation, so it is written down.
+    ///
     /// The walker follows links (`follow_links(true)`) and `ignore` builds child paths by joining
     /// onto the walk root, so one file reached through a symlinked directory arrives under two
     /// spellings. Every consumer that asked "is this match the target?" — `deps`' self-reference
@@ -86,6 +91,14 @@ pub struct CallerMatch {
     /// questions be asked separately, rather than making one path serve two purposes badly.
     pub identity: PathBuf,
     pub line: u32,
+    /// Column of the call site, 0-based. Carried so that `(identity, line, column)` identifies a
+    /// call site exactly — it is not rendered.
+    ///
+    /// Without it the dedup key cannot tell two calls on one line apart from one call seen twice
+    /// through a symlink, and deletes the former. Neither `symbol` nor `calling_function` nor
+    /// `call_text` closes that gap: `t(t(2))` is two call sites agreeing on all three, since
+    /// `call_text` is the whole line when the call fits on one.
+    pub column: u32,
     pub calling_function: String,
     pub call_text: String,
     /// Line range of the calling function (for expand).
@@ -266,7 +279,7 @@ pub(crate) fn find_callers_batch(
     Ok(all)
 }
 
-/// Collapse matches that are the same call site reached by two names (#98).
+/// Collapse entries that are one call site reached by two spellings of its file (#98).
 ///
 /// `follow_links(true)` means a symlinked directory is walked *and* so is its target, so every file
 /// under it is visited twice and every real caller was reported twice — a two-file fixture reported
@@ -276,18 +289,48 @@ pub(crate) fn find_callers_batch(
 /// Keyed on `identity` — the point of the field. Keyed on `path` this is a no-op, since the two
 /// spellings differ.
 ///
+/// The key must identify a **call site**, not a line. `(identity, line, symbol)` does not: review
+/// measured this deleting one of the two `canonicalize()` calls on `read/imports.rs:420`, and a
+/// caller sharing a line with another vanished outright — on trees with no symlink in them, which
+/// is every tree. `column` is what makes the key exact, and
+/// `two_call_sites_on_one_line_are_both_reported` is the guard.
+///
 /// **The surviving spelling is the lexicographically smallest, not the first seen.** The walk is
 /// parallel, so "first" is thread-scheduling order and picking it would make the rendered path vary
 /// between runs of the same query — the class of nondeterminism #28 removed from the fingerprint
 /// and `hot_files_line_is_stable_with_tied_file_sizes` guards there. A total order over the
 /// candidates is what makes the choice reproducible.
+///
+/// The consequence, which is not obviously desirable: the survivor may be a spelling the caller
+/// never mentioned. Asking about `real/target.rs` in a tree that also has an `aaa_link` to it
+/// renders the dependents as `aaa_link/…`. Preferring the candidate equal to `identity`, or the one
+/// sharing the longest prefix with the query, would be just as deterministic and friendlier.
+/// Deliberately not done here: the deps-level test depends on the non-canonical spelling surviving,
+/// which is what makes it able to fail, and swapping the rule without replacing that fixture would
+/// quietly turn it back into a test that passes with the fix reverted.
+///
+/// This deduplicates *output*, not work. Both spellings are still read, prefiltered, parsed and
+/// canonicalized; only the duplicate results are collapsed. Skipping the second visit outright
+/// would need the walk to know a file's identity before deciding to read it, which is a syscall per
+/// walked file rather than per surviving file — the trade #98 priced and declined.
 fn dedup_by_identity(all: &mut Vec<(String, CallerMatch)>) {
     // Sort so that each (identity, line, symbol) group is contiguous and its smallest `path` comes
     // first; then keep the head of each group.
     all.sort_by(|a, b| {
-        (&a.1.identity, a.1.line, &a.0, &a.1.path).cmp(&(&b.1.identity, b.1.line, &b.0, &b.1.path))
+        (&a.1.identity, a.1.line, a.1.column, &a.0, &a.1.path).cmp(&(
+            &b.1.identity,
+            b.1.line,
+            b.1.column,
+            &b.0,
+            &b.1.path,
+        ))
     });
-    all.dedup_by(|a, b| a.1.identity == b.1.identity && a.1.line == b.1.line && a.0 == b.0);
+    all.dedup_by(|a, b| {
+        a.1.identity == b.1.identity
+            && a.1.line == b.1.line
+            && a.1.column == b.1.column
+            && a.0 == b.0
+    });
 }
 
 /// Tree-sitter call site detection for a set of target symbols.
@@ -317,17 +360,25 @@ fn find_callers_treesitter_batch(
     // beside. That is why this is here rather than at the identity comparisons, which is the same
     // fix priced per *match*: #98 listed both and this is the cheaper one.
     //
-    // Measured, `tilth --deps`, minimum of N runs (minimum rather than mean — the spread across
-    // runs is far larger than the effect, and a mean of a noisy sample would have reported a
-    // difference that is not there):
+    // Measured, `tilth --deps`, minimum of N runs — minimum rather than mean because timing noise
+    // is one-sided, so the fastest run is the least contaminated estimate:
     //
-    //   this repository, 59 Rust files, n=9      152ms -> 155ms
-    //   `callers:` query on the same, n=9         54ms ->  56ms
-    //   a ~175k-file C++ tree, n=5             20298ms -> 20241ms
+    //   this repository, 71 Rust files, n=9     152ms -> 155ms
+    //   `callers` query on the same, n=9         54ms ->  56ms
+    //   a ~175k-file C++ tree, n=5            20298ms -> 20241ms
     //
-    // The large tree is the one that matters and shows nothing: the added syscalls do not scale
-    // with tree size, only with the number of files that survive every prefilter. The small-tree
-    // deltas are 2-4% on a 150ms operation and are at the edge of what this harness resolves.
+    // **Read those as "unmeasurable", not as a cost.** Review re-ran the same method on binaries
+    // differing only in this line and got the sign flipping between repetitions, with the
+    // minimum-of-9 statistic moving 34ms for the *same* binary — an order of magnitude more than
+    // the 2-3ms above. An earlier version of this comment reported the small-tree numbers as a
+    // directional cost, which the method does not support. The large-tree figures show the
+    // canonicalize build measuring *faster*, which says the same thing.
+    //
+    // What the placement buys is real even though the timing cannot see it: the call sits after the
+    // size gate, the bloom prefilter, the memchr pass and `parse_budgeted`, so it is paid per file
+    // that survives all of them rather than per file walked. That population still grows with the
+    // tree — the honest claim is that the cost is invisible next to the parse it sits beside, not
+    // that it is independent of tree size.
     let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
@@ -383,6 +434,7 @@ fn find_callers_treesitter_batch(
                         path: path.to_path_buf(),
                         identity: identity.clone(),
                         line,
+                        column: cap.node.start_position().column as u32,
                         calling_function,
                         call_text,
                         caller_range,
@@ -618,7 +670,9 @@ fn write_second_hop_impact(
     }
 
     // Total order before the dedup-and-cap loop below. `find_callers_batch` returns
-    // matches in walk order, which is thread-scheduling order — so without this the
+    // matches ordered by (identity, line, column, symbol, path) since #98 — an order over the
+    // *canonical* path, not the rendered one, and not the order this section renders in — so
+    // without this the
     // `IMPACT_MAX_RESULTS` cap kept a different 15 of them on each run, and the dedup
     // kept a different representative per (function, file). Removing the walk's early
     // quit made the *total* stable; it did nothing for this rendering, and an unranked
@@ -1000,18 +1054,81 @@ pub(crate) mod symlink_identity_tests {
         assert_eq!(identities.len(), 2, "two entries collapsed to one identity");
     }
 
+    /// Deduplication must not collapse two *distinct* call sites that share a line.
+    ///
+    /// The dedup key decides this, and the first version — `(identity, line, symbol)` — was wrong
+    /// on ordinary trees with no symlink anywhere: `match (a.canonicalize(), b.canonicalize())` is
+    /// two real call sites at one line and one symbol, and one of them was silently deleted.
+    /// Review caught it; this repository had 39 `canonicalize` call sites reported as 38, and a
+    /// synthetic `pub fn a() { t(1) } pub fn b() { t(2) }` on one line lost the caller `b`
+    /// entirely. The key carries the column for exactly this reason.
+    ///
+    /// Two shapes, because they fail differently: two callers on one line loses a *caller name*,
+    /// and a nested `t(t(2))` loses a call site whose every other field is identical — the second
+    /// is why `calling_function` in the key is not sufficient either.
+    #[test]
+    fn two_call_sites_on_one_line_are_both_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("two_callers.rs"),
+            "pub fn t(x: u32) -> u32 { x }\npub fn a() -> u32 { t(1) } pub fn b() -> u32 { t(2) }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("nested.rs"),
+            "pub fn t(x: u32) -> u32 { x }\npub fn n() -> u32 { t(t(2)) }\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = ["t".to_string()].into_iter().collect();
+        let found = find_callers_batch(&targets, tmp.path(), &bloom, None).unwrap();
+
+        let in_file = |name: &str| {
+            found
+                .iter()
+                .filter(|(_, m)| m.path.file_name() == Some(name.as_ref()))
+                .count()
+        };
+        assert_eq!(
+            in_file("two_callers.rs"),
+            2,
+            "two callers sharing a line must both be reported: {:?}",
+            found
+                .iter()
+                .map(|(s, m)| (s.as_str(), m.calling_function.as_str(), m.line))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            in_file("nested.rs"),
+            2,
+            "a nested call is two call sites, identical in every field but position: {:?}",
+            found
+                .iter()
+                .map(|(s, m)| (s.as_str(), m.calling_function.as_str(), m.line))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// The deduplicated spelling must not depend on which thread got there first.
     ///
     /// The walk is parallel, so keeping the first-seen path would make the rendered path vary
     /// between runs of the same query. `dedup_by_identity` keeps the lexicographically smallest
     /// instead; this pins that it is stable rather than merely arbitrary.
+    ///
+    /// **A guard, not a tripwire**: with the dedup removed entirely both spellings survive, the
+    /// test sorts its own output, and it passes. What it targets is a *first-seen* dedup, and
+    /// review measured the original 12-file, 5-repetition version catching that mutant only 3 runs
+    /// in 5 — the first two passed. Widened to 40 files and 12 repetitions, since detection depends
+    /// on the parallel walk actually racing: more files per run and more runs is the only lever
+    /// this test has over that.
     #[test]
     fn the_surviving_spelling_is_stable_across_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real");
         std::fs::create_dir(&real).unwrap();
         std::fs::write(real.join("target.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
-        for i in 0..12 {
+        for i in 0..40 {
             std::fs::write(
                 real.join(format!("c{i}.rs")),
                 "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
@@ -1034,7 +1151,7 @@ pub(crate) mod symlink_identity_tests {
 
         let first = render();
         assert!(!first.is_empty(), "fixture produced nothing to compare");
-        for _ in 0..5 {
+        for _ in 0..12 {
             assert_eq!(
                 first,
                 render(),
@@ -1141,6 +1258,7 @@ mod tests {
                     // failed `canonicalize`: identity falls back to the spelling.
                     identity: PathBuf::from(p),
                     line: *line,
+                    column: 0,
                     calling_function: format!("caller_{i}"),
                     call_text: "target()".to_string(),
                     caller_range: None,
@@ -1358,7 +1476,7 @@ mod tests {
     /// The *rendered* second-hop block must be stable too, not just the walk's total.
     ///
     /// `write_second_hop_impact` dedups and caps at `IMPACT_MAX_RESULTS`, and it used to do
-    /// that over `find_callers_batch`'s raw vector — which is in walk order, i.e. thread
+    /// that over `find_callers_batch`'s raw vector — which since #98 is ordered by identity, not
     /// order. With more than 15 unique hop-2 callers, identical runs rendered a different
     /// 15 of them (measured: 5 distinct renderings in 6 runs). Fixing the walk's total did
     /// not fix this; an unranked truncation of an unordered vector is the same bug.
