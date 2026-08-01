@@ -111,12 +111,85 @@ const PER_ENTRY_OVERHEAD: usize =
 /// What this constant buys is tolerance of a workload that alternates between scopes rather than
 /// staying in one. 2 is the smallest value with that property, and the property is structural
 /// rather than tuned: a scope walked every other pass reads probed on its own pass, so its idle
-/// count returns to 0 before it can reach 2. At 1 the two scopes take turns evicting each other,
-/// each clearing the other's filters immediately before they are needed — the corrected test shows
-/// the resident scope fully evicted in the first round at 1, against zero evictions across four
-/// rounds at 2. Any k tolerates a cycle of period <= k; 2 covers the alternation and costs one
-/// extra sweep of latency before a genuinely dead resident set is released.
+/// count returns to 0 before it can reach 2. At 1 it is cleared by its neighbour's sweep in the
+/// round before its own turn — measured on the corrected test as the whole resident scope evicted
+/// in round 0, against zero evictions across four rounds at 2. (In that fixture only one of the two
+/// scopes is ever resident, so "they take turns evicting each other" would overstate what was
+/// seen: one scope is evicted, and the other never gets in either way.)
+///
+/// Two is not a general bound on rotation length, and the arithmetic that suggests it — "k
+/// tolerates a cycle of period <= k" — does not survive contact with the fixtures. Whether a
+/// rotation of period 3 survives at 2 depends on the ceiling, because a scope that fits entirely
+/// refuses nothing on its own pass, skips a sweep, and hands its neighbours a round of grace:
+/// measured, 3 scopes at a 12-entry ceiling are stable and the same 3 at 8 are not. Rotations
+/// longer than the alternation are held by `EVICT_FREE_FRACTION` instead, which bounds the damage
+/// rather than the period. See there.
 const IDLE_SWEEPS_BEFORE_EVICTION: u8 = 2;
+
+/// Largest share of the ceiling one sweep may free.
+///
+/// Without this the sweep is a synchronised clear of everything that aged out at once, and that
+/// has a regime where it scores **zero**. Review found it and it reproduces to the digit: rotate
+/// over k >= 3 disjoint scopes under memory pressure and every scope's entries age together, so
+/// each one is dropped a pass or two before its turn comes round and no probe ever hits. Six
+/// rounds, scopes of 10 files, arms paired inside one run:
+///
+/// ```text
+/// scopes  ceiling     refusing   uncapped   capped
+///      2   8 entries     33.3%      33.3%    33.3%
+///      3   8 entries     22.2%       0.0%    19.4%
+///      3  12 entries     33.3%      33.3%    33.3%
+///      4  12 entries     25.0%       0.0%    20.8%
+///      4  15 entries     31.2%       0.0%    27.1%
+///      5  25 entries     41.7%       0.0%    36.7%
+///     10  70 entries     58.3%       0.0%    52.5%
+/// ```
+///
+/// Zero is worse than having no cache at all — it holds the memory and pays the eviction churn for
+/// nothing — and it is the same failure the four rejected triggers were rejected for: throwing away
+/// a cache that was earning. A larger `IDLE_SWEEPS_BEFORE_EVICTION` does not repair it: any
+/// constant tolerates rotations shorter than itself and collapses on the next one up.
+///
+/// Two rows survive uncapped, for two different reasons, and neither generalises. The 2-scope row
+/// is the alternation `IDLE_SWEEPS_BEFORE_EVICTION` is set to cover. The 3-scope, 12-entry row
+/// survives because one 10-file scope fits that ceiling entirely, so its own pass refuses nothing,
+/// skips a sweep, and hands its neighbours a round of grace — a property of that fixture's
+/// arithmetic, not of the policy, and the same 3 scopes at 8 entries collapse.
+///
+/// Capping the *bytes* one sweep may release changes the shape of the failure rather than moving
+/// its threshold: a synchronised clear becomes partial retention, and whatever survives a sweep is
+/// re-probed on its own pass, resets to idle 0, and stays. The cache settles on a stable subset
+/// instead of taking turns destroying itself. **This is a reduction, not an elimination** — the
+/// capped column is still 0 to 4.5 points under refusal, because a sweep always releases at least
+/// one entry and a rotation always has one aged. What it removes is the cliff.
+///
+/// It costs nothing on the case this exists to fix, because there the dead set is large and the
+/// new one is small: 32 MB of unreachable filters against a subtree that caches in 1.9 MB, so one
+/// sweep's 3.2 MB already covers the whole incoming scope. Measured over the same synthetic
+/// fixture, first all-hit pass after a broad query that filled a 200-entry ceiling, incoming scope
+/// 10% of it:
+///
+/// ```text
+/// fraction   first all-hit pass   worst rotation row
+/// uncapped                   3          0.0% (-25.0)
+/// 1/4                        3         18.8%  (-6.2)
+/// 1/10                       3         20.8%  (-4.2)
+/// 1/25                       5         22.9%  (-2.1)
+/// 1/50                       7         22.9%  (-2.1)
+/// ```
+///
+/// A tenth is the last row that costs nothing on the target case. Below it the rotation keeps
+/// improving, but only by ~2 points, and adaptation — the whole point of #40 — starts doubling.
+/// The real ratio is more favourable than the row measured here (1.9 MB into 32 MB is 6%, not
+/// 10%), so a tenth clears the incoming scope in one sweep with room to spare.
+///
+/// Matching `cache::EVICT_FREE_FRACTION`, which bounds the sibling `OutlineCache` for an unrelated
+/// reason — eviction there scans linearly for the coldest entry, so the fraction amortises scan
+/// cost rather than protecting a retention set — and arrived at the same value. Expressed as a
+/// divisor for the reason recorded there, that the percentage form truncates to zero on small
+/// budgets, and the cap is checked *before* each eviction rather than after, so a sweep always
+/// releases at least one entry however small a ceiling a test picks.
+const EVICT_FREE_FRACTION: usize = 10;
 
 /// Real byte cost of caching `filter`.
 ///
@@ -155,13 +228,12 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// ```text
 ///                        hit rate   resident after
 /// refusing (before)          0.0%          32.0 MB
-/// sweeping (now)            40.0%           1.9 MB
+/// sweeping (now)            40.0%          30.7 MB
 /// fresh cache (control)     80.0%           1.9 MB
 /// ```
 ///
 /// The subtree caches completely in 1.9 MB, so the old cache was refusing the 1.9 MB that would
-/// make it perfect in order to hold 32 MB it could never use. Both halves of that are now fixed —
-/// the hit rate and the 30 MB of dead residency.
+/// make it perfect in order to hold 32 MB it could never use.
 ///
 /// **The 40% is adaptation latency, not the steady state.** Per call, sweeping arm: calls 0 and 1
 /// age the dead set out, call 2 admits the subtree, calls 3 and 4 run at 100.0%. The fresh
@@ -169,11 +241,24 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// session converges above it, not below. Five calls is the window #40 specified; it is short
 /// enough that two sweeps of latency cost 40 points of it.
 ///
-/// It is not an artefact of one subtree size or one tree. A 182-probe scope on the same tree:
-/// 0.0% / 40.0% / 80.0%, resident 32.0 MB -> 0.3 MB. A ~23.5k-file mixed-language tree with a
-/// 2129-probe subtree: 0.0% / 40.0% / 80.0%, resident 32.0 MB -> 1.2 MB. The per-call trace is the
-/// same in all three, which is what should happen — the latency is two sweeps regardless of how big
-/// the new scope is or what it is written in.
+/// **Only one of #40's two complaints is fully answered, and the residency column is why.** One
+/// sweep releases `EVICT_FREE_FRACTION` of the ceiling — 3.2 MB — the subtree takes 1.9 MB of it,
+/// and from there every call hits, refuses nothing, and therefore triggers no further sweep. So
+/// ~28.8 MB of filters that will never be probed again stay resident. That is deliberate, and it
+/// is the price of not having the cliff `EVICT_FREE_FRACTION` exists to prevent: an uncapped sweep
+/// did release the whole 32 MB, and also scored 0% on a three-scope rotation. What was wrong in
+/// #40 was a bounded cache that returned *nothing* for its budget; this one returns everything the
+/// workload asks for while still never exceeding the bound it was always allowed. Releasing the
+/// remainder would mean sweeping a cache under no pressure, which
+/// `a_cache_with_room_to_spare_never_sweeps` forbids for a reason.
+///
+/// It is not an artefact of one subtree size or one tree. A 182-probe scope on the same tree, and a
+/// 2129-probe subtree of a ~23.5k-file mixed-language tree, both read 0.0% / 40.0% / 80.0% with the
+/// same per-call trace and the same residency shape (32.0 MB -> 29.1 MB and 32.0 MB -> 30.0 MB).
+/// All three incoming scopes are well under `EVICT_FREE_FRACTION` of the ceiling, which is the
+/// condition for the trace to be that one — a scope larger than a tenth of the budget needs more
+/// than one sweep to make room, and adaptation stretches accordingly. That is the ratio the
+/// constant is chosen against, not a claim that scope size does not matter.
 ///
 /// # Why the obvious fixes do not work
 ///
@@ -244,15 +329,21 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// signal, because both are full.
 ///
 /// What separates them is a **set**, not a count: which resident entries the workload is still
-/// probing. An overloaded cache probes every resident entry on every walk — that is precisely why
-/// refusal degrades gracefully there — while the #40 cache probes none of them. So the decision is
-/// per-entry and needs no threshold at all: an entry that survived a whole walk unprobed is not
-/// part of the current working set. `begin_pass` is where that is implemented and argued;
-/// `IDLE_SWEEPS_BEFORE_EVICTION` is the one number, and it exists to tolerate a workload that
-/// alternates between scopes rather than to tune a rate.
+/// probing. A workload that keeps walking one oversized scope probes every resident entry every
+/// time — that is precisely why refusal degrades gracefully there — while the #40 cache probes none
+/// of them. So the decision is per-entry and needs no rate threshold: an entry that survived a
+/// whole walk unprobed is not part of the current working set. `begin_pass` is where that is
+/// implemented and argued.
 ///
-/// The overloaded case therefore comes out **identical**, not merely close. Repeated walks over one
-/// scope, ceiling as a fraction of that scope's working set, paired within a single run so both
+/// Two constants qualify it, and both were put there by a regime that broke without them rather
+/// than by tuning. `IDLE_SWEEPS_BEFORE_EVICTION` makes a workload alternating between two scopes
+/// stable. `EVICT_FREE_FRACTION` bounds what one sweep may release, because a workload rotating
+/// over three or more disjoint scopes is equally overloaded and does *not* re-probe everything each
+/// pass — left uncapped that scores 0%, worse than refusal by up to 58 points. Each of those is
+/// measured where it is defined.
+///
+/// The single-scope overloaded case comes out **identical**, not merely close. Repeated walks over
+/// one scope, ceiling as a fraction of that scope's working set, paired within a single run so both
 /// arms see the same tree in the same state (`TILTH_THREADS=1`):
 ///
 /// ```text
@@ -269,9 +360,9 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// rows carry up to 15.9 points of run-to-run spread, so "within noise" would have been weak
 /// evidence for the one property this policy must not break. Identical is not.
 ///
-/// The shape that *can* defeat "unprobed for a whole pass" is alternation between two scopes, which
-/// none of the earlier attempts had a fixture for. Four rounds of A, B against two disjoint
-/// subtrees, ceiling as a fraction of the pair's combined working set:
+/// The shapes that *can* defeat "unprobed for a whole pass" are rotations, and none of the earlier
+/// attempts had a fixture for any of them. Two-scope alternation is the benign end. Four rounds of
+/// A, B against two disjoint subtrees, ceiling as a fraction of the pair's combined working set:
 ///
 /// ```text
 /// ceiling / working set   C++ pair                   C# pair
@@ -284,12 +375,22 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// Also identical, and for a reason rather than by luck — see `IDLE_SWEEPS_BEFORE_EVICTION`, and
 /// `scopes_visited_in_alternation_do_not_evict_each_other`, which fails at a bound of 1.
 ///
-/// Peak memory is bounded exactly as before. The sweep only ever frees, and frees in place —
-/// `retain` erases each bucket under its shard's write lock, so no transient holds two generations
-/// and the ceiling bounds resident bytes during a sweep as it does outside one. The trace above
-/// shows the accounting going 32.0 MB -> 0.0 -> 1.9 MB with nothing in between above the ceiling.
-/// What this does *not* claim is that process RSS falls by the same 30 MB: the allocator is under
-/// no obligation to return freed pages to the OS. The bound is what is asserted, not the return.
+/// **Three or more scopes is the hostile end, and this is the one row where the policy is worse
+/// than refusal.** No real tree is needed to show it and no constant removes it; see
+/// `EVICT_FREE_FRACTION` for the measurement and the mechanism. Capped, the rotation lands 0 to 4.5
+/// points under refusal across three to ten scopes; uncapped it lands at zero. The honest summary
+/// of this change is therefore: a large gain on the shape #40 is about, no change at all on the
+/// overloaded single scope or the two-scope alternation, and a small measured loss on a rotation
+/// over three or more.
+///
+/// Peak memory is bounded exactly as before, and the argument is mechanical rather than measured.
+/// The sweep only ever frees, and frees in place — `retain` erases each bucket under its shard's
+/// write lock, so no transient holds two generations, and a policy that only removes cannot raise
+/// a peak. `mod adaptivity` cannot confirm the *intra-call* half of that on its own: `Snap` samples
+/// `cached_bytes()` at call boundaries only, so what it shows is the endpoints (32.0 MB, then
+/// 28.8 MB after one sweep, then 30.7 MB once the subtree is admitted), never a state in between.
+/// What is not claimed at all is that process RSS falls with the counter: the allocator is under no
+/// obligation to return freed pages to the OS.
 ///
 /// Output is unaffected, as it must be and as it has been across #32 and #37: a filter is only ever
 /// a pre-filter ahead of a real `memmem` check and a parse, so an evicted entry costs a rebuild and
@@ -354,23 +455,39 @@ pub struct BloomFilterCache {
     peak_miss_run: std::sync::atomic::AtomicUsize,
     /// Passes currently in flight. See `begin_pass`.
     ///
-    /// A count rather than a flag because passes nest and overlap: `analyze_deps` and `grok` each
-    /// drive one, `edit::apply_batch` fans out with `into_par_iter` and every task can reach
-    /// `find_callers_batch` at once. Only the pass that takes this back to zero may sweep — an
-    /// eviction decided while another walk is still probing would read "unprobed" for files that
-    /// walk simply has not reached yet.
+    /// A count rather than a flag because passes **overlap**: `edit::apply_batch` fans out with
+    /// `into_par_iter` and every task can reach `find_callers_batch` at once, on different threads.
+    /// (Not nesting — every other driver, `analyze_deps`, `grok`, `blast_radius`, `diff`, calls
+    /// `find_callers_batch` sequentially. A count handles both, and only overlap is reachable.)
+    /// Only the pass that takes this back to zero may sweep: an eviction decided while another walk
+    /// is still probing would read "unprobed" for files that walk simply has not reached yet. So a
+    /// write batch of N tasks adapts once rather than N times, which is the right trade — the cost
+    /// of a missed sweep is a delayed adaptation, the cost of a wrong one is a live entry dropped.
+    ///
+    /// It closes the window rather than eliminating it: `end_pass` decrements to zero and *then*
+    /// sweeps, so a new pass can start probing while that sweep is still running and be charged one
+    /// spurious idle increment. Bounded — the sweep is one `retain` — and safe in the direction
+    /// that only costs a rebuild.
     active_passes: std::sync::atomic::AtomicUsize,
-    /// Refusals since the current sweep window opened; zeroed by `end_pass`.
+    /// Refusals recorded while a pass was open, since the last pass closed.
     ///
-    /// The gate on sweeping at all. No refusals means the ceiling was never in the way during
-    /// this pass, so there is no demand the resident set is crowding out and nothing to gain by
-    /// dropping any of it. Distinct from `refusals`, which is cumulative and report-only.
+    /// The gate on sweeping at all. No refusals means the ceiling was never in the way during this
+    /// pass, so there is no demand the resident set is crowding out and nothing to gain by dropping
+    /// any of it. Cleared by every last-in-flight `end_pass`, abandoned or not, and only written
+    /// while `active_passes > 0` — both of those are corrections; see `end_pass` and `note_refusal`
+    /// for what went wrong without them. Distinct from `refusals`, which is cumulative,
+    /// unconditional and report-only.
     pass_refusals: std::sync::atomic::AtomicUsize,
-    /// Set while a sweep is running, so two passes ending together sweep once.
+    /// Set while a sweep is running, so a pass that opens and closes inside another sweep's window
+    /// does not start a second one.
     ///
-    /// A second concurrent sweep would be *correct* — `retain` takes each shard's write lock and
-    /// the accounting rides inside it — but it would double-count the idle increment, ageing every
-    /// entry two passes for one pass of elapsed work.
+    /// Not "two passes ending together": only one thread can observe the `1 -> 0` decrement, so
+    /// simultaneous closes cannot both reach `sweep`. The reachable overlap is the one above, and
+    /// it is a sweep long. A second concurrent sweep would be *correct* — `retain` takes each
+    /// shard's write lock and the accounting rides inside it — but it would double-count the idle
+    /// increment, ageing every entry twice for one pass of elapsed work. Reasoned rather than
+    /// measured: see `a_sweep_cannot_desynchronise_cached_bytes_from_the_map`, which covers
+    /// sweep-against-admission and says plainly that it does not cover this.
     sweeping: std::sync::atomic::AtomicBool,
     /// Sweeps run, and entries they dropped. Report-only, for the harness in `mod adaptivity`.
     sweeps: std::sync::atomic::AtomicUsize,
@@ -382,7 +499,8 @@ struct CachedFilter {
     mtime: SystemTime,
     /// What this entry contributed to `bytes`, so replacing a stale entry can subtract it.
     bytes: usize,
-    /// Probed since the last sweep. Set by every hit, cleared by the sweep that reads it.
+    /// Probed since the last sweep. Set by every hit **and at admission** (`fresh_entry`, where the
+    /// second half is load-bearing rather than symmetric), cleared by the sweep that reads it.
     ///
     /// Atomic because the hit path holds only the `DashMap` shard *read* guard — `contains_any`
     /// deliberately does not take the write lock to record a hit, since that would serialise
@@ -484,10 +602,12 @@ impl BloomFilterCache {
         self.peak_miss_run.swap(0, Relaxed)
     }
 
-    /// Open a pass, and reclaim the bytes of anything the previous one did not touch.
+    /// Open a pass. Closing the last one is what reclaims the bytes of anything it did not touch.
     ///
     /// A **pass** is one walk over a scope — `find_callers_batch`, the only place a whole tree is
-    /// enumerated against this cache. The guard closes it on drop, including on the `?` paths.
+    /// enumerated against this cache. The guard closes it on drop, so no early return can leak it;
+    /// `find_callers_batch` takes it after its one `?` for a different reason, that there is
+    /// nothing to sweep for a walk that never started.
     ///
     /// The pass is the unit that makes eviction possible here at all. `DashMap` keeps no access
     /// order, so the cache cannot rank entries by recency, and #40 measured what the alternative —
@@ -508,12 +628,21 @@ impl BloomFilterCache {
     /// not a rate threshold in disguise — it is what makes a workload alternating between two
     /// scopes stable. See there.)
     ///
-    /// That gives the overloaded case a guarantee rather than a measurement. Every resident entry
-    /// is probed each pass, so every `probed` bit is set, so the sweep evicts nothing and the cache
-    /// behaves exactly as refusal did. The thrash rows in `mod adaptivity` are noisy enough that a
-    /// measured no-regression would have been weak evidence; this one is structural.
+    /// For a workload that keeps walking **one** scope larger than the ceiling, that gives a
+    /// guarantee rather than a measurement: every resident entry is probed on every pass, so every
+    /// `probed` bit is set, so the sweep evicts nothing and the cache behaves exactly as refusal
+    /// did. The thrash rows in `mod adaptivity` are noisy enough that a measured no-regression
+    /// would have been weak evidence; that one is structural.
     ///
-    /// Nesting and concurrency are why this is a counter and not a flag — see `active_passes`.
+    /// **The guarantee is that narrow, and the boundary is worth stating precisely, because a first
+    /// version of this comment claimed it for "the overloaded case" in general and was wrong.** A
+    /// workload that *rotates* over three or more disjoint scopes is equally overloaded and does
+    /// not probe every resident entry on every pass — each scope's entries go unprobed while its
+    /// neighbours are walked. Left alone that collapses to a 0% hit rate, worse than refusal by up
+    /// to 58 points; `EVICT_FREE_FRACTION` is what contains it, and contains rather than removes
+    /// it. See there, and `a_rotation_over_three_or_more_scopes_does_not_collapse`.
+    ///
+    /// Overlap is why this is a counter and not a flag — see `active_passes`.
     pub(crate) fn begin_pass(&self) -> PassGuard<'_> {
         self.active_passes
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -524,6 +653,12 @@ impl BloomFilterCache {
     }
 
     /// Close a pass and sweep if this was the last one in flight.
+    ///
+    /// The refusal count is cleared whenever this close is the last one, **before** the `sweep`
+    /// flag is consulted. An earlier version returned first on the abandon path and left the count
+    /// standing, so a walk that was cancelled mid-way handed its refusals to the next pass and
+    /// armed a sweep that pass had not earned. Review found it; the window it opens is the whole
+    /// gap between two requests.
     fn end_pass(&self, sweep: bool) {
         if self
             .active_passes
@@ -531,13 +666,14 @@ impl BloomFilterCache {
             != 1
         {
             // Another walk is still probing. Its files would read as unprobed only because it has
-            // not reached them.
+            // not reached them. Leave the refusal count for whichever pass closes last.
             return;
         }
+        let refused = self.pass_refusals.swap(0, Relaxed);
         if !sweep {
             return;
         }
-        if self.pass_refusals.swap(0, Relaxed) == 0 {
+        if refused == 0 {
             // Nothing was refused, so the ceiling never got in the way and no admission is waiting
             // on these bytes. Ageing entries here would evict a cache with room to spare.
             return;
@@ -545,7 +681,8 @@ impl BloomFilterCache {
         self.sweep();
     }
 
-    /// Drop entries unprobed for `IDLE_SWEEPS_BEFORE_EVICTION` consecutive sweeps.
+    /// Age every entry, and drop those unprobed for `IDLE_SWEEPS_BEFORE_EVICTION` consecutive
+    /// sweeps — up to `EVICT_FREE_FRACTION` of the ceiling in one go.
     ///
     /// `retain` takes one shard's write lock at a time and calls the closure while holding it, so
     /// the `sub_bytes` below is inside the lock for the key it is un-charging. That is the same
@@ -564,16 +701,27 @@ impl BloomFilterCache {
             return;
         }
         let mut evicted = 0usize;
+        let mut freed = 0usize;
+        let cap = self.ceiling / EVICT_FREE_FRACTION;
         self.filters.retain(|_, entry| {
             if entry.probed.swap(false, Relaxed) {
                 entry.idle = 0;
                 return true;
             }
+            // Age every entry, even past the cap. Only the *release* is capped; stalling the
+            // ageing too would mean a sweep that hit its cap made no progress on the rest of a
+            // dead set, and the next sweep would start it from scratch.
             entry.idle = entry.idle.saturating_add(1);
             if entry.idle < IDLE_SWEEPS_BEFORE_EVICTION {
                 return true;
             }
+            if freed >= cap {
+                // Over budget for this sweep. It stays at or above the idle bound, so the next
+                // sweep reconsiders it first-class rather than restarting its clock.
+                return true;
+            }
             self.sub_bytes(entry.bytes);
+            freed += entry.bytes;
             evicted += 1;
             false
         });
@@ -800,10 +948,25 @@ impl BloomFilterCache {
         }
     }
 
-    /// Record a refused admission, both cumulatively and against the current sweep window.
+    /// Record a refused admission, cumulatively and — if a pass is open — against the sweep window.
+    ///
+    /// The `active_passes` check is not bookkeeping tidiness. `admit` is reachable with no pass
+    /// open at all: `callees::resolve_callees` probes this cache through `read_with_bloom_check`
+    /// for each of a file's imports and never opens one, because a handful of imports is not a walk
+    /// over a scope and must not be allowed to age anything. Without the check those refusals sat
+    /// in the counter until some later callers walk closed, and armed a sweep on a pass whose own
+    /// budget was never under pressure — so `a_cache_with_room_to_spare_never_sweeps` held in its
+    /// fixture and not in production. Review found that; it is the same class of mistake as
+    /// counting a cancelled pass's refusals, and both are fixed here and in `end_pass`.
+    ///
+    /// A refusal racing a pass close can still land on either side of it. That is a one-count
+    /// difference in a gate that only asks "was anything refused", and either answer is defensible
+    /// for a probe that overlapped the boundary.
     fn note_refusal(&self) {
         self.refusals.fetch_add(1, Relaxed);
-        self.pass_refusals.fetch_add(1, Relaxed);
+        if self.active_passes.load(Relaxed) > 0 {
+            self.pass_refusals.fetch_add(1, Relaxed);
+        }
     }
 
     /// Would `cost` more bytes stay inside the ceiling? `saturating_add` so a corrupted counter
@@ -1824,16 +1987,23 @@ mod tests {
     ///
     /// The assertion is on the **last** narrow pass costing no builds at all. Under refusal it
     /// costs one per file, for ever, which is the 0.0% hit rate #40 measured on a real tree.
+    ///
+    /// The narrow scope is a **tenth** of the ceiling, which is the ratio that matters rather than
+    /// an arbitrary small number: `EVICT_FREE_FRACTION` releases a tenth of the budget per sweep,
+    /// so this is the widest incoming scope that still clears in one. It is also generous against
+    /// production, where #40's own fixture wants 1.9 MB of a 32 MB ceiling — 6%. A first version
+    /// used a scope half the ceiling and failed once the cap landed, which is the honest signal
+    /// that a scope that large takes several sweeps rather than one.
     #[test]
     fn a_resident_set_the_workload_stopped_probing_is_released() {
         let content = ident_content(200);
         // Room for the broad set alone. The narrow set cannot fit alongside it, so it can only be
         // admitted if the broad set goes.
-        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 20);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 200);
 
         {
             let _pass = cache.begin_pass();
-            for f in 0..40 {
+            for f in 0..400 {
                 probe(&cache, &format!("/broad/{f}.rs"), &content);
             }
         }
@@ -1841,13 +2011,13 @@ mod tests {
             cache.admissions_refused() > 0,
             "the broad pass never filled the budget, so nothing below is about a full cache"
         );
-        assert_eq!(cache.resident_entries(), 20);
+        assert_eq!(cache.resident_entries(), 200);
 
-        // The agent narrows. Passes 1 and 2 age the broad set out, pass 3 admits the narrow set,
-        // pass 4 is served entirely from cache.
+        // The agent narrows. Passes 0 and 1 age the broad set out, pass 2 admits the narrow set,
+        // pass 3 is served entirely from cache.
         for _ in 0..3 {
             let _pass = cache.begin_pass();
-            for f in 0..10 {
+            for f in 0..20 {
                 probe(&cache, &format!("/narrow/{f}.rs"), &content);
             }
         }
@@ -1855,7 +2025,7 @@ mod tests {
         let before = (cache.filters_built(), cache.cache_hits());
         {
             let _pass = cache.begin_pass();
-            for f in 0..10 {
+            for f in 0..20 {
                 probe(&cache, &format!("/narrow/{f}.rs"), &content);
             }
         }
@@ -1863,15 +2033,22 @@ mod tests {
         let hit = cache.cache_hits() - before.1;
         assert_eq!(
             (built, hit),
-            (0, 10),
+            (0, 20),
             "the narrow set is still not resident: {built} builds and {hit} hits in a pass over \
-             10 files the workload has probed four times"
+             20 files the workload has probed four times"
         );
-        assert_eq!(
-            cache.resident_entries(),
-            10,
-            "the broad set is still holding budget it has not earned since pass 0"
+        assert!(
+            cache.entries_evicted() >= 20,
+            "only {} entries were released, so the narrow set cannot have displaced the broad one",
+            cache.entries_evicted()
         );
+        // What is *not* asserted: that the broad set is gone. It is not — `EVICT_FREE_FRACTION`
+        // releases a tenth per sweep, the narrow set takes that tenth, and from then on the pass
+        // refuses nothing, so no further sweep runs and ~180 dead entries stay resident inside the
+        // ceiling. That is deliberate. The cache is bounded either way; what #40 is about is a
+        // bounded cache that returns *nothing* for its budget, and this one now returns everything
+        // the workload asks for. Releasing the rest would mean sweeping a cache under no pressure,
+        // which `a_cache_with_room_to_spare_never_sweeps` exists to forbid.
         assert_eq!(
             cache.cached_bytes(),
             cache.summed_entry_bytes(),
@@ -1964,6 +2141,67 @@ mod tests {
         );
     }
 
+    /// Hits and builds a rotation over `scopes` disjoint scopes produces, with sweeping on or off.
+    ///
+    /// The suppressed arm holds one extra pass open for the whole run, which is what `end_pass`
+    /// refuses to sweep in — so it is the pre-#40 refuse-forever policy running the shipping code
+    /// path rather than a second implementation of it. Deterministic: one thread, fixed order.
+    fn rotation_hit_rate(scopes: usize, ceiling_entries: usize, sweeping: bool) -> (usize, usize) {
+        let content = ident_content(200);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * ceiling_entries);
+        let suppress = (!sweeping).then(|| cache.begin_pass());
+        for _ in 0..6 {
+            for s in 0..scopes {
+                let _pass = cache.begin_pass();
+                for f in 0..10 {
+                    probe(&cache, &format!("/s{s}/{f}.rs"), &content);
+                }
+            }
+        }
+        drop(suppress);
+        (cache.cache_hits(), cache.filters_built())
+    }
+
+    /// A rotation over three or more disjoint scopes must not collapse.
+    ///
+    /// This is the regression an adversarial review found, and it was a cliff rather than a slope:
+    /// with the sweep releasing everything that aged out at once, every scope's entries age
+    /// together and each is dropped a pass or two before its turn, so **no probe ever hits**. Four
+    /// scopes at a 12-entry ceiling scored 0.0% against refusal's 25.0%, and a ten-scope rotation
+    /// at 0.70x the union — the same ceiling fraction the thrash table calls harmless — scored 0.0%
+    /// against 58.3%.
+    ///
+    /// `EVICT_FREE_FRACTION` is what holds the line, by turning the clear into partial retention.
+    /// The bound asserted here is three quarters of refusal, against a measured 20.8% versus 25.0%
+    /// (0.83) on this fixture — loose enough not to pin an exact ratio, tight enough that the
+    /// uncapped policy's 0.0% cannot pass. Remove the cap in `sweep` and this test fails.
+    ///
+    /// Two scopes are covered separately by `scopes_visited_in_alternation_do_not_evict_each_other`,
+    /// which is the case that needs no cap at all.
+    #[test]
+    fn a_rotation_over_three_or_more_scopes_does_not_collapse() {
+        for (scopes, ceiling) in [(3usize, 8usize), (4, 12), (4, 15), (5, 25), (10, 70)] {
+            let (rh, rb) = rotation_hit_rate(scopes, ceiling, false);
+            let (sh, sb) = rotation_hit_rate(scopes, ceiling, true);
+            assert_eq!(
+                rh + rb,
+                sh + sb,
+                "{scopes} scopes / {ceiling} entries: the two arms did not make the same probes"
+            );
+            assert!(
+                rh > 0,
+                "{scopes} scopes / {ceiling} entries: refusal itself scored 0, so there is no \
+                 baseline to regress against"
+            );
+            assert!(
+                sh * 4 >= rh * 3,
+                "{scopes} scopes / {ceiling} entries: rotation collapsed — {sh} hits sweeping \
+                 against {rh} refusing, of {} probes",
+                rh + rb
+            );
+        }
+    }
+
     /// A cache with room to spare must never sweep, however long the session runs.
     ///
     /// The gate is `pass_refusals`: with no refusal there is no admission waiting on these bytes,
@@ -1987,12 +2225,79 @@ mod tests {
         assert_eq!(cache.resident_entries(), 30);
     }
 
+    /// Refusals from an **abandoned** pass must not arm the next pass's sweep.
+    ///
+    /// Review found this: `end_pass` used to return on the abandon path before clearing the count,
+    /// so a cancelled walk handed its refusals forward and the next pass swept whether or not its
+    /// own budget was ever under pressure. The window is the whole gap between two requests.
+    #[test]
+    fn an_abandoned_pass_does_not_arm_the_next_ones_sweep() {
+        let content = ident_content(200);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 5);
+
+        // A pass that refuses, then abandons — a cancelled walk.
+        let pass = cache.begin_pass();
+        for f in 0..10 {
+            probe(&cache, &format!("/f{f}.rs"), &content);
+        }
+        assert!(cache.admissions_refused() > 0, "the fixture did not refuse");
+        pass.abandon();
+        assert_eq!(cache.sweeps_run(), 0, "an abandoned pass swept");
+
+        // A pass with nothing to admit. It is owed no sweep of its own.
+        {
+            let _pass = cache.begin_pass();
+            for f in 0..5 {
+                probe(&cache, &format!("/f{f}.rs"), &content);
+            }
+        }
+        assert_eq!(
+            cache.sweeps_run(),
+            0,
+            "the abandoned pass's refusals armed a sweep on a pass that refused nothing"
+        );
+    }
+
+    /// Refusals recorded with **no pass open** must not arm a sweep either.
+    ///
+    /// Also from review. `admit` is reachable outside any pass — `callees::resolve_callees` probes
+    /// a file's imports through the same prefilter and opens none — so without the guard in
+    /// `note_refusal` a session that had ever refused a callees probe swept on the next callers
+    /// walk regardless of that walk's own budget. `a_cache_with_room_to_spare_never_sweeps` held in
+    /// its fixture and did not hold in production.
+    #[test]
+    fn refusals_outside_a_pass_do_not_arm_a_sweep() {
+        let content = ident_content(200);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 5);
+
+        // No pass: the shape `resolve_callees` produces.
+        for f in 0..10 {
+            probe(&cache, &format!("/f{f}.rs"), &content);
+        }
+        assert!(cache.admissions_refused() > 0, "the fixture did not refuse");
+
+        {
+            let _pass = cache.begin_pass();
+            for f in 0..5 {
+                probe(&cache, &format!("/f{f}.rs"), &content);
+            }
+        }
+        assert_eq!(
+            cache.sweeps_run(),
+            0,
+            "refusals from outside any pass armed a sweep on a pass that refused nothing"
+        );
+    }
+
     /// A nested pass must not sweep — the outer walk is still probing, so its untouched files are
     /// untouched only because it has not reached them yet.
     ///
-    /// Reachable in production: `analyze_deps` and `grok` each drive a callers walk, and
-    /// `edit::apply_batch` fans out with `into_par_iter` so several run at once against the one
-    /// process-lifetime cache.
+    /// Nesting itself is not reachable in production — every driver (`analyze_deps`, `grok`,
+    /// `blast_radius`, `diff`) calls `find_callers_batch` sequentially. **Overlap** is:
+    /// `edit::apply_batch` fans out with `into_par_iter` and several tasks reach the walk at once
+    /// against the one process-lifetime cache. `active_passes` is one counter serving both, so this
+    /// pins it in the shape a single-threaded test can express deterministically; the concurrent
+    /// shape is covered by `a_sweep_cannot_desynchronise_cached_bytes_from_the_map`.
     #[test]
     fn a_nested_pass_does_not_sweep_before_the_outer_one_closes() {
         // Every admission refused, so a sweep is always due on the refusal gate and the count is

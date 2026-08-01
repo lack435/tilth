@@ -282,7 +282,14 @@ pub(crate) fn find_callers_batch(
     // A cancelled walk stopped partway through its scope, so the files it never reached read as
     // unprobed for a reason that has nothing to do with the working set. Close the pass without
     // ageing anything; the next complete walk sweeps.
-    if crate::cancel::current().is_cancelled() {
+    //
+    // `worker_request_cancelled`, not `current().is_cancelled()`. The bloom cache is state that
+    // outlives a request — the same category as the session writes that accessor was added for —
+    // and `cancel`'s own docs say why `CURRENT` cannot answer this: by the time an abandoned worker
+    // gets here the serial loop has published the *next* request's token, so it would be told it
+    // is not cancelled and would age a truncated pass. Both fail in the never-wrongly-cancelled
+    // direction; only this one is right in both regimes.
+    if crate::cancel::worker_request_cancelled() {
         pass.abandon();
     }
 
@@ -1218,11 +1225,16 @@ mod tests {
             "a complete pass did not sweep, so the cancelled arm below would prove nothing"
         );
 
+        // Both halves of what `spawn_with_timeout` sets up, because the two are consulted by
+        // different things: the walk quits on the *published* token (`run_walk` -> `current()`),
+        // and the abandon decision reads the token bound to *this* thread. Binding only one would
+        // test half the path.
         let _publish = crate::cancel::PUBLISH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _visible = crate::cancel::make_visible_on_this_thread();
         let request = crate::cancel::begin_request();
+        let _bound = crate::cancel::bind_worker(request.token());
 
         let cancelled = crate::index::bloom::BloomFilterCache::with_ceiling(0);
         let walk_over = AtomicBool::new(false);
