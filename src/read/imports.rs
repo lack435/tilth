@@ -448,6 +448,32 @@ fn is_include_root_relative(clean: &str) -> bool {
     real >= 2
 }
 
+/// The containment root for a caller that knows the tree it is scanning but has no scope the
+/// user *declared* — the enclosing repository when there is one, `tree_root` when there is not.
+///
+/// This is the inverse precedence to `resolve_c_include`'s own rule, and the inversion is the
+/// whole point. There, a declared scope outranks the repository because the caller stated it:
+/// the user named that tree. Here nothing was stated. `overview::fingerprint` is only ever
+/// called with the process cwd, so a boundary taken from it would be derived from wherever the
+/// server happened to be launched — which is exactly the distinction #10's review turned on. A
+/// root that is not declared has no business outranking one derived from the file.
+///
+/// So it is a *fallback*, and only the case that is currently broken changes. In a git tree the
+/// returned path is bit-for-bit what `resolve_c_include` would have computed for itself — same
+/// walk, same spelling — so the hop loop's `base == root` break lands in the same place and the
+/// probe count is identical. In a tree with no `.git`, resolution used to give up before probing
+/// anything at all and every project-relative include silently bucketed as external (#45).
+///
+/// Deliberately *not* canonicalized, unlike `canonical_boundary`. The identity above is what
+/// makes this safe to hand to a fingerprint whose output is pinned byte-for-byte, and
+/// canonicalizing would break it two ways: on Windows a `\\?\`-prefixed root never compares
+/// equal to a `base` carrying the caller's spelling, so the hop loop would walk past the root
+/// instead of stopping at it. `is_within` canonicalizes both sides at the point of comparison,
+/// which is where it actually matters.
+pub(crate) fn boundary_from_file(file_dir: &Path, tree_root: &Path) -> PathBuf {
+    enclosing_repo_root(file_dir).unwrap_or_else(|| tree_root.to_path_buf())
+}
+
 /// Nearest ancestor of `dir` (inclusive) containing `.git`, if any.
 ///
 /// `.git` is a directory in a normal clone and a *file* in a linked worktree or
@@ -670,6 +696,54 @@ mod tests {
         assert!(
             resolve_c_include(&root.join("proj/a/b"), "\"x/leak.h\"", None).is_none(),
             "without a .git bound the walk must not run"
+        );
+    }
+
+    /// `boundary_from_file` must return the *repository*, not the tree root it was handed,
+    /// whenever there is one — and that repository path must be the identical spelling
+    /// `resolve_c_include` computes for itself.
+    ///
+    /// Identity, not merely equivalence, is what makes #45 safe to ship against a fingerprint
+    /// whose output is pinned byte-for-byte: the hop loop breaks on `base == root`, a lexical
+    /// comparison, so a root that merely *denotes* the same directory in a different spelling
+    /// would walk past it and change the probe count. Asserted against `enclosing_repo_root`
+    /// directly, because that is the function whose result the `None` arm of
+    /// `resolve_c_include`'s composition rule would have used.
+    ///
+    /// Nested repositories are the interesting case and the reason the walk is nearest-first:
+    /// a submodule or linked worktree inside a checkout must contain resolution to itself.
+    #[test]
+    fn boundary_from_file_prefers_the_repository_over_the_tree_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let inner = outer.join("vendor/inner");
+        fs::create_dir_all(inner.join("src")).unwrap();
+        fs::create_dir_all(outer.join(".git")).unwrap();
+        fs::create_dir_all(outer.join("src")).unwrap();
+        // `.git` as a *file*, the linked-worktree/submodule spelling.
+        fs::write(inner.join(".git"), "gitdir: ../../.git/modules/inner\n").unwrap();
+
+        let outer_src = outer.join("src");
+        assert_eq!(
+            boundary_from_file(&outer_src, tmp.path()),
+            enclosing_repo_root(&outer_src).expect("outer is a repository"),
+            "the tree root outranked the enclosing repository, which is the precedence #45 \
+             specifically rejects"
+        );
+        let inner_src = inner.join("src");
+        assert_eq!(
+            boundary_from_file(&inner_src, tmp.path()),
+            inner,
+            "a nested repository must contain its own resolution, not defer to the outer one"
+        );
+
+        // With no `.git` anywhere, and only then, the tree root is the answer.
+        let bare = tmp.path().join("bare/src");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            boundary_from_file(&bare, tmp.path()),
+            tmp.path(),
+            "outside any repository the tree root must be used, or #45's reported bug is back"
         );
     }
 
