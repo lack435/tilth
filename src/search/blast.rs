@@ -87,7 +87,9 @@ pub(crate) fn blast_radius(
     let canonical = path.canonicalize().ok()?;
     let callers: Vec<(String, CallerMatch)> = callers
         .into_iter()
-        .filter(|(_, m)| m.path != canonical)
+        // `identity`, not `path`: `path` is the spelling the walk used, and a symlinked directory
+        // gives the same file a second one that never equals `canonical` (#98).
+        .filter(|(_, m)| m.identity != canonical)
         .collect();
 
     if callers.is_empty() {

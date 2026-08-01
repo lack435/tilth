@@ -71,7 +71,20 @@ const FULL_MAX_MATCHES: usize = 100;
 /// expanded, so the survivors re-read their own file instead.
 #[derive(Debug)]
 pub struct CallerMatch {
+    /// **A spelling, not an identity.** The path as the walk reached it, which is what to render:
+    /// consumers strip their own `scope` off it, and that only works while the two are spelled the
+    /// same way. Do not compare it against a canonicalized path — that was #98.
     pub path: PathBuf,
+    /// **An identity, not a spelling.** `path` canonicalized, falling back to `path` itself when
+    /// that fails. Compare and deduplicate on this.
+    ///
+    /// The walker follows links (`follow_links(true)`) and `ignore` builds child paths by joining
+    /// onto the walk root, so one file reached through a symlinked directory arrives under two
+    /// spellings. Every consumer that asked "is this match the target?" — `deps`' self-reference
+    /// filter, `blast`'s, `grok`'s — asked it of `path` and got the wrong answer, and the file was
+    /// reported as its own dependent. Keeping both a spelling and an identity is what lets those
+    /// questions be asked separately, rather than making one path serve two purposes badly.
+    pub identity: PathBuf,
     pub line: u32,
     pub calling_function: String,
     pub call_text: String,
@@ -246,9 +259,35 @@ pub(crate) fn find_callers_batch(
         })
     });
 
-    Ok(matches
+    let mut all = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    dedup_by_identity(&mut all);
+    Ok(all)
+}
+
+/// Collapse matches that are the same call site reached by two names (#98).
+///
+/// `follow_links(true)` means a symlinked directory is walked *and* so is its target, so every file
+/// under it is visited twice and every real caller was reported twice — a two-file fixture reported
+/// five dependents. The duplicates are indistinguishable in the output, so an inflated blast radius
+/// reads as a well-connected file rather than as a bug.
+///
+/// Keyed on `identity` — the point of the field. Keyed on `path` this is a no-op, since the two
+/// spellings differ.
+///
+/// **The surviving spelling is the lexicographically smallest, not the first seen.** The walk is
+/// parallel, so "first" is thread-scheduling order and picking it would make the rendered path vary
+/// between runs of the same query — the class of nondeterminism #28 removed from the fingerprint
+/// and `hot_files_line_is_stable_with_tied_file_sizes` guards there. A total order over the
+/// candidates is what makes the choice reproducible.
+fn dedup_by_identity(all: &mut Vec<(String, CallerMatch)>) {
+    // Sort so that each (identity, line, symbol) group is contiguous and its smallest `path` comes
+    // first; then keep the head of each group.
+    all.sort_by(|a, b| {
+        (&a.1.identity, a.1.line, &a.0, &a.1.path).cmp(&(&b.1.identity, b.1.line, &b.0, &b.1.path))
+    });
+    all.dedup_by(|a, b| a.1.identity == b.1.identity && a.1.line == b.1.line && a.0 == b.0);
 }
 
 /// Tree-sitter call site detection for a set of target symbols.
@@ -271,6 +310,25 @@ fn find_callers_treesitter_batch(
 
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
+
+    // One `canonicalize` per *file that reached tree-sitter*, not per match and not per file
+    // walked. By here the size gate, the bloom prefilter and the memchr pass have all run, so the
+    // population is a small fraction of the tree, and the syscall is dwarfed by the parse it sits
+    // beside. That is why this is here rather than at the identity comparisons, which is the same
+    // fix priced per *match*: #98 listed both and this is the cheaper one.
+    //
+    // Measured, `tilth --deps`, minimum of N runs (minimum rather than mean — the spread across
+    // runs is far larger than the effect, and a mean of a noisy sample would have reported a
+    // difference that is not there):
+    //
+    //   this repository, 59 Rust files, n=9      152ms -> 155ms
+    //   `callers:` query on the same, n=9         54ms ->  56ms
+    //   a ~175k-file C++ tree, n=5             20298ms -> 20241ms
+    //
+    // The large tree is the one that matters and shows nothing: the added syscalls do not scale
+    // with tree size, only with the number of files that survive every prefilter. The small-tree
+    // deltas are 2-4% on a 150ms operation and are at the edge of what this harness resolves.
+    let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
@@ -323,6 +381,7 @@ fn find_callers_treesitter_batch(
                     matched_target,
                     CallerMatch {
                         path: path.to_path_buf(),
+                        identity: identity.clone(),
                         line,
                         calling_function,
                         call_text,
@@ -858,6 +917,134 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 }
 
 #[cfg(test)]
+pub(crate) mod symlink_identity_tests {
+    use super::*;
+
+    /// Give `link` a second route to `target`, by whatever mechanism the platform allows.
+    ///
+    /// On Unix a symlink always works, so a failure there is a real failure and panics.
+    ///
+    /// On Windows `symlink_dir` needs Developer Mode or `SeCreateSymbolicLinkPrivilege` — which is
+    /// why `search::tests::walker_follows_symlinked_*` sit in the documented set of tests that fail
+    /// on an ordinary Windows box and pass on the Linux runner. A **junction** needs no privilege
+    /// and produces the same duplicate view of one directory, so it is the fallback. That matters
+    /// more than tidiness: without it both tests in this module skip silently on the machine the
+    /// bug was found on, pass for no reason, and cannot be tripwired — which is the same "green
+    /// test that guards nothing" this module exists to prevent.
+    pub(crate) fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).expect("symlink must succeed on unix");
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+                return;
+            }
+            let ok = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "neither symlink_dir nor a junction could be created");
+        }
+    }
+
+    /// #98: one file reached by two spellings is one file.
+    ///
+    /// `follow_links(true)` walks a symlinked directory *and* its target, so `ignore` hands the
+    /// same file to the closure twice under two names. Every real caller was therefore reported
+    /// twice, and a two-caller fixture claimed four. The duplicates are indistinguishable in the
+    /// output, so the failure reads as a well-connected file rather than as a bug.
+    #[test]
+    fn a_file_reached_through_a_symlinked_directory_is_reported_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("target.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(
+                real.join(name),
+                "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
+            )
+            .unwrap();
+        }
+        link_dir(&real, &tmp.path().join("link"));
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = ["shared".to_string()].into_iter().collect();
+        let found = find_callers_batch(&targets, tmp.path(), &bloom, None).unwrap();
+
+        // Control: the fixture must actually produce callers, or the counts below are vacuous.
+        assert!(
+            !found.is_empty(),
+            "fixture produced no callers at all, so this test proves nothing"
+        );
+        assert_eq!(
+            found.len(),
+            2,
+            "each call site must be reported once, not once per spelling of its path (#98): {:?}",
+            found
+                .iter()
+                .map(|(s, m)| (s.as_str(), m.path.display().to_string(), m.line))
+                .collect::<Vec<_>>()
+        );
+
+        // The surviving entries must be distinct *files*, not two views of one.
+        let mut identities: Vec<&Path> = found.iter().map(|(_, m)| m.identity.as_path()).collect();
+        identities.sort_unstable();
+        identities.dedup();
+        assert_eq!(identities.len(), 2, "two entries collapsed to one identity");
+    }
+
+    /// The deduplicated spelling must not depend on which thread got there first.
+    ///
+    /// The walk is parallel, so keeping the first-seen path would make the rendered path vary
+    /// between runs of the same query. `dedup_by_identity` keeps the lexicographically smallest
+    /// instead; this pins that it is stable rather than merely arbitrary.
+    #[test]
+    fn the_surviving_spelling_is_stable_across_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("target.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
+        for i in 0..12 {
+            std::fs::write(
+                real.join(format!("c{i}.rs")),
+                "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
+            )
+            .unwrap();
+        }
+        link_dir(&real, &tmp.path().join("link"));
+
+        let targets: HashSet<String> = ["shared".to_string()].into_iter().collect();
+        let render = || {
+            let bloom = crate::index::bloom::BloomFilterCache::new();
+            let mut v: Vec<String> = find_callers_batch(&targets, tmp.path(), &bloom, None)
+                .unwrap()
+                .iter()
+                .map(|(s, m)| format!("{s} {} {}", m.path.display(), m.line))
+                .collect();
+            v.sort();
+            v.join("\n")
+        };
+
+        let first = render();
+        assert!(!first.is_empty(), "fixture produced nothing to compare");
+        for _ in 0..5 {
+            assert_eq!(
+                first,
+                render(),
+                "the surviving spelling varied between runs"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -950,6 +1137,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, (p, line))| CallerMatch {
                     path: PathBuf::from(p),
+                    // These fixtures name paths that do not exist, which is the same case as a
+                    // failed `canonicalize`: identity falls back to the spelling.
+                    identity: PathBuf::from(p),
                     line: *line,
                     calling_function: format!("caller_{i}"),
                     call_text: "target()".to_string(),

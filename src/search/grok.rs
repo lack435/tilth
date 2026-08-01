@@ -906,7 +906,9 @@ fn is_recursive_call_site(
     // Edge case: a legitimately distinct same-named call site nested inside the
     // target body (e.g. a recursive closure with the same name) would also be
     // filtered here. Acceptable tradeoff — true self-recursion is the common case.
-    m.path == canonical_target
+    // `identity`, not `path` — the name says which question this is, and comparing the spelling
+    // against a canonicalized target is what let a symlinked path escape this filter (#98).
+    m.identity == canonical_target
         && m.line >= target.start_line
         && m.line <= target.end_line
         && m.calling_function == target.name
