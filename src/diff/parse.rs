@@ -80,6 +80,27 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             continue;
         }
 
+        // ── Mode markers ─────────────────────────────────────────────────────
+        //
+        // Status was inferred solely from `--- /dev/null` / `+++ /dev/null`
+        // below, and git omits both for a file with no content: a zero-byte
+        // addition is just `new file mode` + `index 0000000..e69de29`, with no
+        // `---`/`+++` pair at all. Such a file parsed as Modified, so the
+        // overlay went looking for an old side that never existed — reporting
+        // "symbol analysis unavailable" for a `.gitkeep`, `__init__.py` or
+        // `py.typed`. The mode line is the authoritative marker; the
+        // `/dev/null` lines merely agree with it.
+        if line.starts_with("new file mode ") {
+            status = FileStatus::Added;
+            continue;
+        }
+        // The mirror case: deleting a zero-byte file emits `deleted file mode`
+        // with no `+++ /dev/null` either.
+        if line.starts_with("deleted file mode ") {
+            status = FileStatus::Deleted;
+            continue;
+        }
+
         // ── Binary marker ────────────────────────────────────────────────────
         if line.starts_with("Binary files ") && line.ends_with("differ") {
             is_binary = true;

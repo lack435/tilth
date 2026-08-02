@@ -6,7 +6,7 @@ pub mod parse;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use rayon::prelude::*;
 
@@ -178,10 +178,63 @@ pub fn resolve_source(
     Ok(DiffSource::GitUncommitted)
 }
 
+/// Run one `git diff` invocation.
+///
+/// `uncommitted_base` is the rev the working tree is compared against for
+/// `GitUncommitted`; every other source ignores it.
+fn git_diff_once(source: &DiffSource, uncommitted_base: &str) -> Result<Output, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.quotePath=false"]);
+    cmd.arg("diff");
+
+    match source {
+        DiffSource::GitUncommitted => {
+            // working tree vs the base (unstaged + staged)
+            cmd.arg(uncommitted_base);
+        }
+        DiffSource::GitStaged => {
+            cmd.arg("--staged");
+        }
+        DiffSource::GitRef(r) => {
+            cmd.arg(r);
+        }
+        DiffSource::Files(fa, fb) => {
+            cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
+        }
+        // Patch and Log are handled by the caller
+        DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
+    }
+
+    cmd.output()
+        .map_err(|e| format!("failed to run git diff: {e}"))
+}
+
+/// Is HEAD *unborn* — a symbolic ref to a branch that has no commit yet?
+///
+/// Two states make `git rev-parse --verify HEAD` fail, and `git diff HEAD`
+/// emits an identical fatal for both: a repository with no commit, and one
+/// whose HEAD ref is corrupt. Only the first may fall back to the empty tree.
+/// Treating the second as unborn reports a damaged repository's entire working
+/// tree as newly added — the silent-success shape #112 exists to prevent.
+///
+/// `git symbolic-ref` separates them: it resolves for an unborn branch (and for
+/// an orphan branch, which is also legitimately unborn) but fails outright when
+/// HEAD itself cannot be read.
+///
+/// Only consulted after a `git diff` has already failed, so the common path
+/// never pays for either subprocess.
+fn head_is_unborn() -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    !git(&["rev-parse", "--verify", "--quiet", "HEAD"]) && git(&["symbolic-ref", "-q", "HEAD"])
+}
+
 /// Execute a git diff command and return raw unified diff output.
 fn run_git_diff(source: &DiffSource) -> Result<String, String> {
-    use std::process::Command;
-
     match source {
         DiffSource::Log(_) => {
             return Err("log mode should not call run_git_diff directly".to_string());
@@ -194,33 +247,24 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
         _ => {}
     }
 
-    let mut cmd = Command::new("git");
-    cmd.args(["-c", "core.quotePath=false"]);
-    cmd.arg("diff");
+    let mut output = git_diff_once(source, "HEAD")?;
+    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
-    match source {
-        DiffSource::GitUncommitted => {
-            // working tree vs HEAD (unstaged + staged)
-            cmd.arg("HEAD");
-        }
-        DiffSource::GitStaged => {
-            cmd.arg("--staged");
-        }
-        DiffSource::GitRef(r) => {
-            cmd.arg(r);
-        }
-        DiffSource::Files(fa, fb) => {
-            cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
-        }
-        // Patch and Log are handled above
-        DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
+    // Before the first commit HEAD does not resolve, so `git diff HEAD` exits
+    // 128 with nothing on stdout. The empty tree is what the repository looked
+    // like then — the same fallback `diff_log` uses for a parentless commit —
+    // and it makes every tracked file read as added, which is what they are.
+    //
+    // Retried rather than pre-checked so that the overwhelmingly common case,
+    // a repo that has commits, never spends a subprocess proving it.
+    if !output.status.success()
+        && stdout.is_empty()
+        && matches!(source, DiffSource::GitUncommitted)
+        && head_is_unborn()
+    {
+        output = git_diff_once(source, &empty_tree())?;
+        stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     }
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run git diff: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
     // git diff --no-index exits 1 when there are differences; that is normal,
     // and so is any non-zero exit that still produced a diff — the caller can
@@ -869,6 +913,9 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut summaries: Vec<CommitSummary> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    // Resolved lazily and at most once: it costs a subprocess, and most log
+    // ranges contain no parentless commit at all.
+    let mut empty_tree_id: Option<String> = None;
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -895,7 +942,8 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         // true root, and a shallow clone's boundary commit (git grafts its
         // parents away). Shallow is the CI default, so this is not an edge.
         let commit_source = DiffSource::GitRef(if parents.is_empty() {
-            format!("{EMPTY_TREE}..{hash}")
+            let base = empty_tree_id.get_or_insert_with(empty_tree);
+            format!("{base}..{hash}")
         } else {
             format!("{hash}^..{hash}")
         });
@@ -983,7 +1031,29 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
 }
 
 /// Git's empty tree object — the implicit "before" of a root commit.
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// The empty tree's object id **in this repository**.
+///
+/// Not a constant: the well-known `4b825dc…` is the SHA-1 empty tree, and a
+/// repository created with `--object-format=sha256` has a different one
+/// (`6ef19b4…`). Passing the SHA-1 id there fails with "unknown revision", so
+/// the parentless-commit and unborn-HEAD paths would both silently stop working
+/// on such a repo. `git hash-object` computes whichever the repo uses.
+///
+/// Falls back to the SHA-1 id if git cannot be run, which is the same value the
+/// hardcoded constant had, so nothing regresses relative to it.
+fn empty_tree() -> String {
+    Command::new("git")
+        .args(["hash-object", "-t", "tree", "--stdin"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| EMPTY_TREE_SHA1.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2234,7 +2304,226 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 28. test_symmetric_ref_range_uses_merge_base
+    /// A repository with no commit yet, so `HEAD` does not resolve.
+    fn setup_unborn_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let p = dir.path();
+        git(p, &["init"]);
+        git(p, &["config", "user.email", "test@test.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(
+            p.join("src/main.rs"),
+            "fn hello() {\n    println!(\"hi\");\n}\n\nfn main() {\n    hello();\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    // 28. test_unborn_head_reports_staged_files
+    #[test]
+    fn test_unborn_head_reports_staged_files() {
+        let dir = setup_unborn_repo();
+        git(dir.path(), &["add", "-A"]);
+
+        // `git diff HEAD` cannot work before the first commit. That used to be
+        // reported as "No changes." — a lie, there are staged files — and #112
+        // turned it into a raw git fatal. The empty tree is the honest base.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("a repo with no commit yet must still diff");
+
+        // Assert on the symbol lines, not bare names: the fixture file is
+        // `src/main.rs`, so `contains("main")` is satisfied by the `## src/main.rs`
+        // header alone — it would hold even if no symbol were extracted, which
+        // is exactly what an abandoned overlay looks like.
+        assert!(
+            result.contains("[+]      hello") && result.contains("[+]      main"),
+            "staged files must be reported as added symbols:\n{result}"
+        );
+        assert!(
+            !result.contains("analysis unavailable"),
+            "the unborn path must not leave an overlay abandoned:\n{result}"
+        );
+        assert!(
+            !result.contains("No changes"),
+            "there are staged files, so this is not 'no changes':\n{result}"
+        );
+    }
+
+    // 29. test_unborn_head_with_nothing_tracked
+    #[test]
+    fn test_unborn_head_with_nothing_tracked() {
+        // Nothing added to the index: `git init` then `tilth diff`, which is
+        // plausible first contact with the tool. Untracked files are not part
+        // of a diff, so "No changes." is the correct answer — but it has to be
+        // reached deliberately, not by a git fatal.
+        let dir = setup_unborn_repo();
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("a freshly initialized repo must not error");
+        assert_eq!(result, "No changes.");
+    }
+
+    // 30. test_unborn_head_staged_mode_unaffected
+    #[test]
+    fn test_unborn_head_staged_mode_unaffected() {
+        // `git diff --staged` already works before the first commit. Locking it
+        // so the retry added for `GitUncommitted` cannot regress this path.
+        let dir = setup_unborn_repo();
+        git(dir.path(), &["add", "-A"]);
+
+        let result =
+            run_diff_in(dir.path(), &DiffSource::GitStaged, None, None, false, None).unwrap();
+        assert!(
+            result.contains("hello"),
+            "staged mode must still report the staged file:\n{result}"
+        );
+    }
+
+    // 31. test_corrupt_head_ref_still_errors
+    #[test]
+    fn test_corrupt_head_ref_still_errors() {
+        let dir = setup_test_repo();
+        let p = dir.path();
+
+        // Point the checked-out branch at garbage. The repository still HAS
+        // history, but HEAD cannot be resolved — and `git rev-parse --verify
+        // HEAD` fails exactly as it does for an unborn HEAD, with git emitting
+        // the same fatal for both. Falling back to the empty tree here would
+        // report the whole working tree as newly added: a damaged repo
+        // rendered as a brand new one, which is the silent-success shape #112
+        // exists to prevent.
+        let head_ref = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(p)
+                .output()
+                .expect("git")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        fs::write(p.join(".git").join(&head_ref), "garbagegarbage\n").unwrap();
+
+        let result = run_diff_in(p, &DiffSource::GitUncommitted, None, None, false, None);
+        let err = result.expect_err("a repo with an unreadable HEAD must not report a fresh tree");
+        assert!(
+            err.contains("git diff failed"),
+            "expected git's error, got {err:?}"
+        );
+    }
+
+    // 32. test_unborn_head_reports_empty_files
+    #[test]
+    fn test_unborn_head_reports_empty_files() {
+        let dir = setup_unborn_repo();
+        // A zero-byte file — `.gitkeep`, `__init__.py`, `py.typed`. git emits
+        // no `--- /dev/null` for these, only `new file mode`, so they parsed as
+        // Modified and the overlay went looking for an old side that cannot
+        // exist before the first commit.
+        fs::write(dir.path().join("src/empty.rs"), "").unwrap();
+        git(dir.path(), &["add", "-A"]);
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("an empty staged file must not break the diff");
+
+        assert!(
+            !result.contains("analysis unavailable"),
+            "a zero-byte addition has no old side to fail on:\n{result}"
+        );
+        assert!(
+            !result.contains("could not analyze"),
+            "and must not raise a warning about one:\n{result}"
+        );
+        assert!(
+            result.contains("[+]      hello"),
+            "the real file must still be reported:\n{result}"
+        );
+    }
+
+    // 33. test_deleting_an_empty_file
+    #[test]
+    fn test_deleting_an_empty_file() {
+        // The mirror of the addition case: git omits `+++ /dev/null` when the
+        // file being deleted had no content, so only `deleted file mode` marks
+        // it. Parsed as Modified, the overlay tried to read a new side that is
+        // gone from disk and was abandoned.
+        let dir = setup_test_repo();
+        let p = dir.path();
+        fs::write(p.join("src/empty.rs"), "").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "add empty"]);
+        fs::remove_file(p.join("src/empty.rs")).unwrap();
+
+        let result = run_diff_in(p, &DiffSource::GitUncommitted, None, None, false, None)
+            .expect("deleting an empty file must not break the diff");
+        assert!(
+            !result.contains("analysis unavailable") && !result.contains("could not analyze"),
+            "an empty deletion has no new side to fail on:\n{result}"
+        );
+    }
+
+    // 34. test_unborn_head_in_a_sha256_repo
+    #[test]
+    fn test_unborn_head_in_a_sha256_repo() {
+        // The well-known `4b825dc…` empty tree is SHA-1 only. A repo created
+        // with `--object-format=sha256` has a different one, and passing the
+        // SHA-1 id there fails with "unknown revision" — so a hardcoded
+        // constant made both the unborn-HEAD and parentless-commit paths
+        // silently stop working on such a repo.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "--object-format=sha256"]);
+
+        // Old git builds have no SHA-256 support; skip rather than fail there.
+        let fmt = {
+            let out = Command::new("git")
+                .args(["rev-parse", "--show-object-format"])
+                .current_dir(p)
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        if fmt != "sha256" {
+            eprintln!("skipping: git here does not support sha256 (got {fmt:?})");
+            return;
+        }
+
+        git(p, &["config", "user.email", "test@test.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("src/main.rs"), "fn sha_only() {}\n").unwrap();
+        git(p, &["add", "-A"]);
+
+        let result = run_diff_in(p, &DiffSource::GitUncommitted, None, None, false, None)
+            .expect("a sha256 repo with no commit must still diff");
+        assert!(
+            result.contains("sha_only"),
+            "staged file must be reported in a sha256 repo:\n{result}"
+        );
+    }
+
+    // 35. test_symmetric_ref_range_uses_merge_base
     #[test]
     fn test_symmetric_ref_range_uses_merge_base() {
         let dir = setup_diverged_repo();
@@ -2283,7 +2572,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 29. test_symmetric_ref_range_file_scope
+    // 36. test_symmetric_ref_range_file_scope
     #[test]
     fn test_symmetric_ref_range_file_scope() {
         let dir = setup_diverged_repo();
