@@ -4,6 +4,7 @@ pub mod overlay;
 pub mod parse;
 
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -307,7 +308,16 @@ pub fn diff(
     if let Some(term) = search {
         filter_by_search(&mut overlays, term);
         if overlays.is_empty() {
-            return Ok(format!("No changes matching '{term}'."));
+            // Collecting the warnings above is not enough on its own: an
+            // abandoned overlay has no symbols and no hunks, so the filter
+            // always drops it, and this early return is the one path that
+            // never renders `warnings`. Without them "no match" would be the
+            // #111 lie again — a file we could not read, reported as absent.
+            let mut out = format!("No changes matching '{term}'.");
+            for w in &warnings {
+                let _ = write!(out, "\n⚠ {w}");
+            }
+            return Ok(out);
         }
     }
 
@@ -477,9 +487,10 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
 fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<String, String> {
-    // Get commit list.
+    // Every field is NUL-separated: %P is a variable-length list of parent
+    // hashes, so the old positional `%H %at %s` split cannot carry it.
     let output = Command::new("git")
-        .args(["log", "--format=%H %at %s%x00%an", range])
+        .args(["log", "--format=%H%x00%at%x00%P%x00%s%x00%an", range])
         .output()
         .map_err(|e| format!("failed to run git log: {e}"))?;
 
@@ -490,6 +501,7 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut summaries: Vec<CommitSummary> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -497,22 +509,42 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
             continue;
         }
 
-        // Format: "<hash> <timestamp> <subject>\0<author>"
-        let Some((rest, author)) = line.split_once('\0') else {
+        // Format: "<hash>\0<timestamp>\0<parents>\0<subject>\0<author>"
+        let mut fields = line.splitn(5, '\0');
+        let Some(hash) = fields.next() else {
             continue;
         };
+        let timestamp: i64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let parents = fields.next().unwrap_or("").trim().to_string();
+        let message = fields.next().unwrap_or("").to_string();
+        let author = fields.next().unwrap_or("").to_string();
 
-        let mut parts = rest.splitn(3, ' ');
-        let Some(hash) = parts.next() else {
-            continue;
+        // A parentless commit has no `^`, so `<hash>^..<hash>` is not a valid
+        // range — diff it against the empty tree, which makes every file read
+        // as added, exactly as `git log --patch` shows it. Without this the
+        // whole log aborted the moment the range reached such a commit.
+        //
+        // Two kinds of commit land here, and %P reports both as parentless: the
+        // true root, and a shallow clone's boundary commit (git grafts its
+        // parents away). Shallow is the CI default, so this is not an edge.
+        let commit_source = DiffSource::GitRef(if parents.is_empty() {
+            format!("{EMPTY_TREE}..{hash}")
+        } else {
+            format!("{hash}^..{hash}")
+        });
+
+        // Defensive, with no trigger I have been able to construct: every
+        // parentless case I found is handled above. It stays because the
+        // alternative is what this commit is fixing — one unexpected commit
+        // taking down the entire log through `?`. Losing one commit's body is
+        // survivable; losing the log is not.
+        let raw = match run_git_diff(&commit_source) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warnings.push(format!("no diff for {}: {e}", &hash[..hash.len().min(7)]));
+                String::new()
+            }
         };
-        let timestamp: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let message = parts.next().unwrap_or("").to_string();
-
-        // Run diff for this commit.
-        let ref_str = format!("{hash}^..{hash}");
-        let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
@@ -521,11 +553,21 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
             .collect();
         overlay::cross_file_matching(&mut overlays);
 
+        for overlay in &overlays {
+            if let Some(reason) = &overlay.analysis_failed {
+                warnings.push(format!(
+                    "could not analyze `{}` in {} — {reason}",
+                    overlay.path.display(),
+                    &hash[..hash.len().min(7)]
+                ));
+            }
+        }
+
         summaries.push(CommitSummary {
             hash: hash.to_string(),
             timestamp,
             message,
-            author: author.to_string(),
+            author,
             overlays,
         });
     }
@@ -545,8 +587,11 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         return Ok("No commits found.".to_string());
     }
 
-    Ok(format::format_log(&summaries, range, budget))
+    Ok(format::format_log(&summaries, range, &warnings, budget))
 }
+
+/// Git's empty tree object — the implicit "before" of a root commit.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1191,7 +1236,108 @@ diff --git a/src/main.rs b/src/main.rs
         dir
     }
 
-    // 19. test_bad_ref_is_an_error_not_no_changes
+    /// A repo whose HEAD commit bumps a gitlink whose target object is absent.
+    ///
+    /// git happily diffs the pointer, but `git show <rev>:<gitlink>` fails, so
+    /// the overlay is abandoned — the cheapest reachable way to reach that path
+    /// without wiring up a real submodule. Ordinary for anyone diffing a repo
+    /// with submodules they have not initialized.
+    fn setup_dangling_gitlink_repo() -> tempfile::TempDir {
+        let dir = setup_test_repo();
+        let p = dir.path();
+        git(
+            p,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,0000000000000000000000000000000000000001,sub",
+            ],
+        );
+        git(p, &["commit", "-m", "add submodule pointer"]);
+        git(
+            p,
+            &[
+                "update-index",
+                "--cacheinfo",
+                "160000,0000000000000000000000000000000000000002,sub",
+            ],
+        );
+        git(p, &["commit", "-m", "bump submodule"]);
+        dir
+    }
+
+    // 19. test_search_keeps_unreadable_file_warning
+    #[test]
+    fn test_search_keeps_unreadable_file_warning() {
+        let dir = setup_dangling_gitlink_repo();
+
+        // `filter_by_search` always drops an abandoned overlay — no symbols and
+        // no hunks means nothing can match — and the empty-result early return
+        // is the one path that never renders `warnings`. Collecting them before
+        // the filter is necessary but was not sufficient.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("HEAD~1..HEAD".to_string()),
+            None,
+            Some("Subproject"),
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("could not analyze"),
+            "a file we could not read must not be reported as simply absent:\n{result}"
+        );
+    }
+
+    // 21. test_log_spans_the_root_commit
+    #[test]
+    fn test_log_spans_the_root_commit() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"second\")"),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "second commit"]);
+
+        // `HEAD` reaches the root commit, whose `^` does not resolve. Making a
+        // failed `git diff` fatal turned that into an aborted log for every
+        // full-history request — `test_log_mode` only ever asked for
+        // `HEAD~1..HEAD`, which stops one commit short of the problem.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("HEAD".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("a log spanning the root commit must not fail");
+
+        assert!(
+            result.contains("second commit") && result.contains("initial"),
+            "both commits must appear:\n{result}"
+        );
+        // The root commit's files are added against the empty tree, which is
+        // how `git log --patch` presents them.
+        //
+        // Assert on `goodbye`, not `hello`: the second commit touches `hello`,
+        // so that name appears either way and the assertion would pass with the
+        // root commit rendered empty. `goodbye` and `main` exist only in the
+        // root commit's add.
+        assert!(
+            result.contains("goodbye"),
+            "root commit must report its symbols as added:\n{result}"
+        );
+    }
+
+    // 22. test_bad_ref_is_an_error_not_no_changes
     #[test]
     fn test_bad_ref_is_an_error_not_no_changes() {
         let dir = setup_test_repo();
@@ -1218,7 +1364,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 20. test_symmetric_ref_range_uses_merge_base
+    // 23. test_symmetric_ref_range_uses_merge_base
     #[test]
     fn test_symmetric_ref_range_uses_merge_base() {
         let dir = setup_diverged_repo();
@@ -1267,7 +1413,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 21. test_symmetric_ref_range_file_scope
+    // 24. test_symmetric_ref_range_file_scope
     #[test]
     fn test_symmetric_ref_range_file_scope() {
         let dir = setup_diverged_repo();
