@@ -209,15 +209,28 @@ fn git_diff_once(source: &DiffSource, uncommitted_base: &str) -> Result<Output, 
         .map_err(|e| format!("failed to run git diff: {e}"))
 }
 
-/// Has this repository got a commit yet?
+/// Is HEAD *unborn* — a symbolic ref to a branch that has no commit yet?
+///
+/// Two states make `git rev-parse --verify HEAD` fail, and `git diff HEAD`
+/// emits an identical fatal for both: a repository with no commit, and one
+/// whose HEAD ref is corrupt. Only the first may fall back to the empty tree.
+/// Treating the second as unborn reports a damaged repository's entire working
+/// tree as newly added — the silent-success shape #112 exists to prevent.
+///
+/// `git symbolic-ref` separates them: it resolves for an unborn branch (and for
+/// an orphan branch, which is also legitimately unborn) but fails outright when
+/// HEAD itself cannot be read.
 ///
 /// Only consulted after a `git diff` has already failed, so the common path
-/// never pays for it.
-fn head_is_born() -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+/// never pays for either subprocess.
+fn head_is_unborn() -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    !git(&["rev-parse", "--verify", "--quiet", "HEAD"]) && git(&["symbolic-ref", "-q", "HEAD"])
 }
 
 /// Execute a git diff command and return raw unified diff output.
@@ -247,7 +260,7 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     if !output.status.success()
         && stdout.is_empty()
         && matches!(source, DiffSource::GitUncommitted)
-        && !head_is_born()
+        && head_is_unborn()
     {
         output = git_diff_once(source, &empty_tree())?;
         stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -2326,9 +2339,17 @@ diff --git a/src/main.rs b/src/main.rs
         )
         .expect("a repo with no commit yet must still diff");
 
+        // Assert on the symbol lines, not bare names: the fixture file is
+        // `src/main.rs`, so `contains("main")` is satisfied by the `## src/main.rs`
+        // header alone — it would hold even if no symbol were extracted, which
+        // is exactly what an abandoned overlay looks like.
         assert!(
-            result.contains("hello") && result.contains("main"),
-            "staged files must be reported as added:\n{result}"
+            result.contains("[+]      hello") && result.contains("[+]      main"),
+            "staged files must be reported as added symbols:\n{result}"
+        );
+        assert!(
+            !result.contains("analysis unavailable"),
+            "the unborn path must not leave an overlay abandoned:\n{result}"
         );
         assert!(
             !result.contains("No changes"),
@@ -2372,7 +2393,97 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 31. test_unborn_head_in_a_sha256_repo
+    // 31. test_corrupt_head_ref_still_errors
+    #[test]
+    fn test_corrupt_head_ref_still_errors() {
+        let dir = setup_test_repo();
+        let p = dir.path();
+
+        // Point the checked-out branch at garbage. The repository still HAS
+        // history, but HEAD cannot be resolved — and `git rev-parse --verify
+        // HEAD` fails exactly as it does for an unborn HEAD, with git emitting
+        // the same fatal for both. Falling back to the empty tree here would
+        // report the whole working tree as newly added: a damaged repo
+        // rendered as a brand new one, which is the silent-success shape #112
+        // exists to prevent.
+        let head_ref = String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(p)
+                .output()
+                .expect("git")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        fs::write(p.join(".git").join(&head_ref), "garbagegarbage\n").unwrap();
+
+        let result = run_diff_in(p, &DiffSource::GitUncommitted, None, None, false, None);
+        let err = result.expect_err("a repo with an unreadable HEAD must not report a fresh tree");
+        assert!(
+            err.contains("git diff failed"),
+            "expected git's error, got {err:?}"
+        );
+    }
+
+    // 32. test_unborn_head_reports_empty_files
+    #[test]
+    fn test_unborn_head_reports_empty_files() {
+        let dir = setup_unborn_repo();
+        // A zero-byte file — `.gitkeep`, `__init__.py`, `py.typed`. git emits
+        // no `--- /dev/null` for these, only `new file mode`, so they parsed as
+        // Modified and the overlay went looking for an old side that cannot
+        // exist before the first commit.
+        fs::write(dir.path().join("src/empty.rs"), "").unwrap();
+        git(dir.path(), &["add", "-A"]);
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("an empty staged file must not break the diff");
+
+        assert!(
+            !result.contains("analysis unavailable"),
+            "a zero-byte addition has no old side to fail on:\n{result}"
+        );
+        assert!(
+            !result.contains("could not analyze"),
+            "and must not raise a warning about one:\n{result}"
+        );
+        assert!(
+            result.contains("[+]      hello"),
+            "the real file must still be reported:\n{result}"
+        );
+    }
+
+    // 33. test_deleting_an_empty_file
+    #[test]
+    fn test_deleting_an_empty_file() {
+        // The mirror of the addition case: git omits `+++ /dev/null` when the
+        // file being deleted had no content, so only `deleted file mode` marks
+        // it. Parsed as Modified, the overlay tried to read a new side that is
+        // gone from disk and was abandoned.
+        let dir = setup_test_repo();
+        let p = dir.path();
+        fs::write(p.join("src/empty.rs"), "").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "add empty"]);
+        fs::remove_file(p.join("src/empty.rs")).unwrap();
+
+        let result = run_diff_in(p, &DiffSource::GitUncommitted, None, None, false, None)
+            .expect("deleting an empty file must not break the diff");
+        assert!(
+            !result.contains("analysis unavailable") && !result.contains("could not analyze"),
+            "an empty deletion has no new side to fail on:\n{result}"
+        );
+    }
+
+    // 34. test_unborn_head_in_a_sha256_repo
     #[test]
     fn test_unborn_head_in_a_sha256_repo() {
         // The well-known `4b825dc…` empty tree is SHA-1 only. A repo created
@@ -2412,7 +2523,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 32. test_symmetric_ref_range_uses_merge_base
+    // 35. test_symmetric_ref_range_uses_merge_base
     #[test]
     fn test_symmetric_ref_range_uses_merge_base() {
         let dir = setup_diverged_repo();
@@ -2461,7 +2572,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 33. test_symmetric_ref_range_file_scope
+    // 36. test_symmetric_ref_range_file_scope
     #[test]
     fn test_symmetric_ref_range_file_scope() {
         let dir = setup_diverged_repo();
