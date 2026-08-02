@@ -24,6 +24,8 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, source: &DiffSource) -> File
     let path = &file_diff.path;
 
     // Binary or generated files — empty overlay, formatter handles display.
+    // Deliberately not `abandoned()`: nothing failed, there is just no structure
+    // to analyze, and the formatters already label these files as such.
     if file_diff.is_binary || file_diff.is_generated {
         return FileOverlay {
             path: path.clone(),
@@ -31,6 +33,7 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, source: &DiffSource) -> File
             attributed_hunks: Vec::new(),
             conflicts: Vec::new(),
             new_content: None,
+            analysis_failed: None,
         };
     }
 
@@ -201,27 +204,33 @@ pub(crate) fn detect_conflicts(path: &Path) -> Vec<Conflict> {
 // Per-status overlay builders
 // ---------------------------------------------------------------------------
 
+/// An overlay for a file whose content could not be fetched.
+///
+/// Carries the reason so the formatters can say the analysis is missing. Before
+/// #111 these were indistinguishable from "changed but structurally identical",
+/// which is how a mis-parsed ref range came to report `+0/−0` for a real change.
+fn abandoned(path: &Path, reason: String) -> FileOverlay {
+    FileOverlay {
+        path: path.to_path_buf(),
+        symbol_changes: Vec::new(),
+        attributed_hunks: Vec::new(),
+        conflicts: Vec::new(),
+        new_content: None,
+        analysis_failed: Some(reason),
+    }
+}
+
 fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
-        // git error fetching old side — skip symbol analysis to avoid
-        // confidently-wrong all-Added overlay.
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+    // git error fetching either side — skip symbol analysis to avoid a
+    // confidently-wrong all-Added overlay.
+    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
+        Ok(c) => c,
+        Err(e) => return abandoned(path, e),
     };
-    let Ok(new_content) = get_new_content(path, source) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+    let new_content = match get_new_content(path, source) {
+        Ok(c) => c,
+        Err(e) => return abandoned(path, e),
     };
 
     let ft = detect_file_type(path);
@@ -250,19 +259,15 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         attributed_hunks,
         conflicts: Vec::new(),
         new_content: Some(new_content),
+        analysis_failed: None,
     }
 }
 
 fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(new_content) = get_new_content(path, source) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+    let new_content = match get_new_content(path, source) {
+        Ok(c) => c,
+        Err(e) => return abandoned(path, e),
     };
 
     let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
@@ -273,19 +278,15 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         attributed_hunks: Vec::new(),
         conflicts: Vec::new(),
         new_content: Some(new_content),
+        analysis_failed: None,
     }
 }
 
 fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
+        Ok(c) => c,
+        Err(e) => return abandoned(path, e),
     };
 
     let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
@@ -296,28 +297,19 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         attributed_hunks: Vec::new(),
         conflicts: Vec::new(),
         new_content: None,
+        analysis_failed: None,
     }
 }
 
 fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
     let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+    let old_content = match get_old_content(path, file_diff.old_path.as_deref(), source) {
+        Ok(c) => c,
+        Err(e) => return abandoned(path, e),
     };
-    let Ok(new_content) = get_new_content(path, source) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+    let new_content = match get_new_content(path, source) {
+        Ok(c) => c,
+        Err(e) => return abandoned(path, e),
     };
 
     let ft = detect_file_type(path);
@@ -339,6 +331,7 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         attributed_hunks,
         conflicts: Vec::new(),
         new_content: Some(new_content),
+        analysis_failed: None,
     }
 }
 
@@ -362,8 +355,8 @@ fn get_old_content(
     match source {
         DiffSource::GitUncommitted | DiffSource::GitStaged => git_show(&format!("HEAD:{path_str}")),
         DiffSource::GitRef(r) => {
-            if let Some((left, _)) = r.split_once("..") {
-                git_show(&format!("{left}:{path_str}"))
+            if let Some(range) = parse_ref_range(r) {
+                git_show(&format!("{}:{path_str}", range.old_rev()?))
             } else {
                 // `git diff HEAD~1` compares HEAD~1 (old) against HEAD (new).
                 // So old content is at the ref itself.
@@ -377,9 +370,101 @@ fn get_old_content(
     }
 }
 
+/// A git range ref, split into its two endpoints.
+///
+/// Both of git's spellings are ranges: `a..b` compares the two endpoints
+/// directly, `a...b` (symmetric) compares their merge base against `b`. An
+/// omitted endpoint means `HEAD`, which is also git's own default.
+struct RefRange {
+    left: String,
+    right: String,
+    symmetric: bool,
+}
+
+impl RefRange {
+    /// The rev holding this range's old-side content.
+    ///
+    /// For `a...b` that is the merge base, not `a` — which is why this can fail:
+    /// it has to ask git. Resolving it any other way would make the overlay
+    /// disagree with the raw diff `git` itself produced for the same range.
+    fn old_rev(&self) -> Result<String, String> {
+        if self.symmetric {
+            merge_base(&self.left, &self.right)
+        } else {
+            Ok(self.left.clone())
+        }
+    }
+}
+
+/// Split a git ref into a range, or `None` if it is a bare ref.
+///
+/// `...` is tested before `..` deliberately. Splitting `main...HEAD` on the
+/// first `..` yields a right side of `.HEAD`, which is not a valid object name;
+/// every `git show` against it failed and the file's overlay was abandoned, so
+/// a real change rendered as an authoritative `+0/−0` (issue #111).
+fn parse_ref_range(reff: &str) -> Option<RefRange> {
+    let (left, right, symmetric) = if let Some((l, r)) = reff.split_once("...") {
+        (l, r, true)
+    } else {
+        let (l, r) = reff.split_once("..")?;
+        (l, r, false)
+    };
+    let default_head = |s: &str| {
+        if s.is_empty() {
+            "HEAD".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    Some(RefRange {
+        left: default_head(left),
+        right: default_head(right),
+        symmetric,
+    })
+}
+
+/// Rewrite a symmetric range into the plain range it stands for.
+///
+/// `a...b` becomes `<merge-base>..b`, resolved once. Returns `None` when the
+/// source needs no rewriting, so callers can keep borrowing the original.
+///
+/// The error case is deliberately fatal rather than per-file: if the base of
+/// the range cannot be resolved, no file in the diff can be analyzed, and N
+/// abandoned overlays communicate that far worse than one message.
+pub(crate) fn pin_range_to_merge_base(source: &DiffSource) -> Result<Option<DiffSource>, String> {
+    let DiffSource::GitRef(reff) = source else {
+        return Ok(None);
+    };
+    let Some(range) = parse_ref_range(reff) else {
+        return Ok(None);
+    };
+    if !range.symmetric {
+        return Ok(None);
+    }
+    let base = merge_base(&range.left, &range.right)?;
+    Ok(Some(DiffSource::GitRef(format!("{base}..{}", range.right))))
+}
+
+/// Resolve the merge base of two revs, as `git diff a...b` does internally.
+fn merge_base(left: &str, right: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["merge-base", left, right])
+        .output()
+        .map_err(|e| format!("git merge-base failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git merge-base {left} {right}: {}", stderr.trim()));
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if base.is_empty() {
+        return Err(format!("git merge-base {left} {right}: no common ancestor"));
+    }
+    Ok(base)
+}
+
 /// Where the "new" side of a `GitRef` diff reads its content from.
 enum GitRefNewSide {
-    /// A range ref (`a..b`): the committed blob at the right side, via `git show`.
+    /// A range ref (`a..b` or `a...b`): the committed blob at the right side, via `git show`.
     Committed(String),
     /// A bare ref: `git diff <ref>` compares against the working tree on disk.
     WorkingTree,
@@ -387,12 +472,13 @@ enum GitRefNewSide {
 
 /// Decide how a `GitRef`'s new-side content is sourced.
 ///
-/// A range ref (`a..b`) reads the committed blob at `b` via `git show b:<path>`;
-/// a bare ref reads the working tree, because `git diff <ref>` compares `<ref>`
-/// against the working tree rather than against `HEAD`.
+/// A range ref reads the committed blob at its right endpoint via
+/// `git show b:<path>`; a bare ref reads the working tree, because
+/// `git diff <ref>` compares `<ref>` against the working tree rather than
+/// against `HEAD`.
 fn resolve_git_ref_new_side(reff: &str, path_str: &str) -> GitRefNewSide {
-    match reff.split_once("..") {
-        Some((_, right)) => GitRefNewSide::Committed(format!("{right}:{path_str}")),
+    match parse_ref_range(reff) {
+        Some(range) => GitRefNewSide::Committed(format!("{}:{path_str}", range.right)),
         None => GitRefNewSide::WorkingTree,
     }
 }
@@ -730,5 +816,89 @@ mod tests {
             overlay.symbol_changes.is_empty(),
             "overlay must be empty when old side is unavailable"
         );
+        // An empty overlay is not enough — it is indistinguishable from a file
+        // that changed without moving any symbol. The reason must survive so
+        // the formatters can refuse to report `+0/−0` (issue #111).
+        assert!(
+            overlay.analysis_failed.is_some(),
+            "an abandoned overlay must carry why, got None"
+        );
+    }
+
+    #[test]
+    fn symmetric_ref_range_new_side_is_the_right_endpoint() {
+        // The #111 mis-split: `split_once("..")` on `main...HEAD` yields a right
+        // side of `.HEAD`, and `git show .HEAD:<path>` fails for every file.
+        match resolve_git_ref_new_side("main...HEAD", "src/lib.rs") {
+            GitRefNewSide::Committed(spec) => {
+                assert_eq!(
+                    spec, "HEAD:src/lib.rs",
+                    "symmetric range must read the right endpoint, not a `.`-prefixed fragment"
+                );
+            }
+            GitRefNewSide::WorkingTree => {
+                panic!("a symmetric range is still a range — it must read the committed blob")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_ref_range_spellings() {
+        // Bare refs are not ranges.
+        assert!(parse_ref_range("HEAD").is_none());
+        assert!(parse_ref_range("v1.2.3").is_none());
+
+        let two = parse_ref_range("main..feature").expect("`a..b` is a range");
+        assert_eq!((two.left.as_str(), two.right.as_str()), ("main", "feature"));
+        assert!(!two.symmetric);
+
+        let three = parse_ref_range("main...feature").expect("`a...b` is a range");
+        assert_eq!(
+            (three.left.as_str(), three.right.as_str()),
+            ("main", "feature"),
+            "the `...` split must not leave a `.` on either endpoint"
+        );
+        assert!(three.symmetric, "`...` is the symmetric spelling");
+
+        // git fills an omitted endpoint with HEAD; so must we, or the old side
+        // of `main..` becomes an empty rev and the new side becomes the index.
+        let open_right = parse_ref_range("main..").expect("`a..` is a range");
+        assert_eq!(
+            (open_right.left.as_str(), open_right.right.as_str()),
+            ("main", "HEAD")
+        );
+        let open_left = parse_ref_range("..main").expect("`..b` is a range");
+        assert_eq!(
+            (open_left.left.as_str(), open_left.right.as_str()),
+            ("HEAD", "main")
+        );
+    }
+
+    #[test]
+    fn pinning_leaves_everything_but_symmetric_ranges_alone() {
+        // Only `a...b` needs a merge-base call. Everything else must return
+        // None with no subprocess, so the hot path stays free of one.
+        for source in [
+            DiffSource::GitUncommitted,
+            DiffSource::GitStaged,
+            DiffSource::GitRef("HEAD".to_string()),
+            DiffSource::GitRef("main..feature".to_string()),
+            DiffSource::Patch(std::path::PathBuf::from("x.patch")),
+        ] {
+            assert!(
+                pin_range_to_merge_base(&source)
+                    .expect("no git call, so no failure")
+                    .is_none(),
+                "{source:?} must not be rewritten"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_range_old_rev_does_not_consult_git() {
+        // `a..b` resolves its old side to `a` verbatim — no merge-base call, so
+        // this holds with no repository around it.
+        let range = parse_ref_range("main..feature").unwrap();
+        assert_eq!(range.old_rev().unwrap(), "main");
     }
 }

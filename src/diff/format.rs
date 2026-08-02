@@ -90,6 +90,16 @@ pub(crate) fn format_overview(
             continue;
         }
 
+        // Content fetch failed — say so. An empty symbol list here would read
+        // exactly like "changed, but no symbol moved" (issue #111).
+        if let Some(reason) = &overlay.analysis_failed {
+            let _ = writeln!(
+                out,
+                "## {rel_path} (symbol analysis unavailable — {reason})"
+            );
+            continue;
+        }
+
         // Normal file — show non-Unchanged symbol changes.
         let visible: Vec<&SymbolChange> = overlay
             .symbol_changes
@@ -154,6 +164,15 @@ pub(crate) fn format_overview(
 pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> String {
     let scope = Path::new(".");
     let rel_path = rel(&overlay.path, scope);
+
+    // Never render the `0 symbols touched, +0/−0 lines` header off a failed
+    // content fetch — git said this file changed, and that header is read as
+    // evidence that it did not (issue #111).
+    if let Some(reason) = &overlay.analysis_failed {
+        return format!(
+            "# Diff: {rel_path} — symbol analysis unavailable\n\ngit reported this file as changed, but its content could not be read: {reason}\n"
+        );
+    }
 
     let (insertions, deletions) = count_insertions_deletions(overlay);
 
@@ -223,6 +242,15 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
 
 /// Format detailed view of a single named function within a file's diff.
 pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> String {
+    // `not found in diff` would be a lie when the symbol list is empty only
+    // because the file's content could not be read (issue #111).
+    if let Some(reason) = &overlay.analysis_failed {
+        return format!(
+            "# Diff: {} — symbol analysis unavailable\n\ngit reported this file as changed, but its content could not be read: {reason}\n",
+            overlay.path.display()
+        );
+    }
+
     let change = overlay.symbol_changes.iter().find(|c| c.name == fn_name);
 
     let Some(change) = change else {
@@ -313,7 +341,12 @@ pub(crate) fn format_conflicts(conflicts: &[Conflict], path: &Path) -> String {
 /// ## abc1234 — "message" (2h ago, @author)
 ///   path:  [~:sig] name, [+] name
 /// ```
-pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Option<u64>) -> String {
+pub(crate) fn format_log(
+    summaries: &[CommitSummary],
+    scope: &str,
+    warnings: &[String],
+    budget: Option<u64>,
+) -> String {
     let path_scope = Path::new(".");
 
     let total_files: usize = summaries.iter().map(|s| s.overlays.len()).sum();
@@ -349,6 +382,15 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
 
         for overlay in &summary.overlays {
             let rel_path = rel(&overlay.path, path_scope);
+
+            // Same guard the other three formatters carry: an unreadable file
+            // must not fall through to `changed.is_empty()` below and be
+            // skipped as though the commit did not touch it (issue #111).
+            if let Some(reason) = &overlay.analysis_failed {
+                let _ = writeln!(out, "  {rel_path}:  symbol analysis unavailable — {reason}");
+                continue;
+            }
+
             let changed: Vec<&SymbolChange> = overlay
                 .symbol_changes
                 .iter()
@@ -370,6 +412,13 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
                 })
                 .collect();
             let _ = writeln!(out, "  {rel_path}:  {}", markers.join(", "));
+        }
+    }
+
+    if !warnings.is_empty() {
+        let _ = writeln!(out);
+        for w in warnings {
+            let _ = writeln!(out, "⚠ {w}");
         }
     }
 
@@ -552,6 +601,7 @@ mod tests {
             attributed_hunks: Vec::new(),
             conflicts: Vec::new(),
             new_content: None,
+            analysis_failed: None,
         }
     }
 
@@ -583,6 +633,96 @@ mod tests {
 
     // Helper: build file_meta slice referencing the overlays' paths.
     // Since lifetimes are tricky with inline vec, callers build it manually.
+
+    /// An overlay whose content fetch failed — no symbols, but a reason.
+    fn make_abandoned_overlay(path: &str, reason: &str) -> FileOverlay {
+        let mut overlay = make_overlay(path, Vec::new());
+        overlay.analysis_failed = Some(reason.to_string());
+        overlay
+    }
+
+    // Log mode renders through its own formatter, which skipped any file with
+    // no changed symbols — so an unreadable file vanished from the commit body
+    // entirely, leaving "1 file, 0 functions touched" as the whole answer.
+    #[test]
+    fn log_mode_reports_an_unreadable_file() {
+        let summary = CommitSummary {
+            hash: "abc1234def".to_string(),
+            timestamp: 0,
+            message: "bump".to_string(),
+            author: "T".to_string(),
+            overlays: vec![make_abandoned_overlay(
+                "sub",
+                "git show HEAD~1:sub: fatal: bad object",
+            )],
+        };
+        let out = format_log(&[summary], "HEAD~1..HEAD", &[], None);
+        assert!(
+            out.contains("analysis unavailable") && out.contains("bad object"),
+            "log must name the unreadable file and why:\n{out}"
+        );
+    }
+
+    #[test]
+    fn log_mode_renders_warnings() {
+        let summary = CommitSummary {
+            hash: "abc1234def".to_string(),
+            timestamp: 0,
+            message: "root".to_string(),
+            author: "T".to_string(),
+            overlays: Vec::new(),
+        };
+        let out = format_log(
+            &[summary],
+            "HEAD",
+            &["no diff for abc1234: shallow boundary".to_string()],
+            None,
+        );
+        assert!(
+            out.contains("shallow boundary"),
+            "log must render its warnings:\n{out}"
+        );
+    }
+
+    // Every formatter must refuse to answer off a failed content fetch. The
+    // three paths render independently, so a fix to one leaves the others
+    // reporting a confident zero (issue #111).
+    #[test]
+    fn abandoned_overlay_never_renders_as_no_change() {
+        let overlay = make_abandoned_overlay("src/lib.rs", "git show .feat:src/lib.rs: bad object");
+
+        let detail = format_file_detail(&overlay, None);
+        assert!(
+            !detail.contains("0 symbols touched"),
+            "file detail claimed zero symbols for an unreadable file:\n{detail}"
+        );
+        assert!(
+            detail.contains("analysis unavailable") && detail.contains("bad object"),
+            "file detail must name the failure and its reason:\n{detail}"
+        );
+
+        let func = format_function_detail(&overlay, "some_fn");
+        assert!(
+            !func.contains("not found in diff"),
+            "`not found` is a lie when the file was never read:\n{func}"
+        );
+        assert!(
+            func.contains("analysis unavailable"),
+            "function detail must report the failure:\n{func}"
+        );
+
+        let path = overlay.path.clone();
+        let meta = vec![(path.as_path(), false, false)];
+        let overview = format_overview(&[overlay], &meta, &[], "base...feat", None);
+        assert!(
+            !overview.contains("(0 symbols)"),
+            "overview claimed zero symbols for an unreadable file:\n{overview}"
+        );
+        assert!(
+            overview.contains("analysis unavailable"),
+            "overview must flag the unreadable file:\n{overview}"
+        );
+    }
 
     // 1. All 6 change types produce correct markers
     #[test]
@@ -914,7 +1054,7 @@ mod tests {
             author: "alice".to_string(),
             overlays: vec![overlay],
         };
-        let out = format_log(&[summary], "HEAD~1..HEAD", None);
+        let out = format_log(&[summary], "HEAD~1..HEAD", &[], None);
         assert!(out.starts_with("# Log:"), "bad header:\n{out}");
         assert!(out.contains("abc1234"), "missing short hash:\n{out}");
         assert!(out.contains("add foo"), "missing commit message:\n{out}");

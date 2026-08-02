@@ -4,6 +4,7 @@ pub mod overlay;
 pub mod parse;
 
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -116,6 +117,13 @@ pub struct FileOverlay {
     pub attributed_hunks: Vec<(String, Vec<DiffLine>)>,
     pub conflicts: Vec<Conflict>,
     pub new_content: Option<String>,
+    /// Why symbol analysis was abandoned for this file, if it was.
+    ///
+    /// An overlay with no symbols is otherwise indistinguishable from a file
+    /// git reported as changed but whose structure did not move — so the
+    /// formatters must say "could not analyze" rather than render a confident
+    /// `+0/−0`. See issue #111.
+    pub analysis_failed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -212,10 +220,27 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
 
-    // git diff --no-index exits 1 when there are differences; that is normal.
-    // For all other variants, a non-zero exit is unexpected but we still return
-    // whatever stdout was produced so the caller can decide.
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // git diff --no-index exits 1 when there are differences; that is normal,
+    // and so is any non-zero exit that still produced a diff — the caller can
+    // decide what to make of it.
+    //
+    // Failing with *nothing* on stdout is different: `diff()` reads empty
+    // output as "No changes." and exits 0, so `tilth diff base..typo` reported
+    // a clean tree for a ref that does not exist. Same danger as #111 — an
+    // error dressed up as authoritative evidence — one layer up.
+    if !output.status.success() && stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("git diff failed ({})", output.status)
+        } else {
+            format!("git diff failed: {detail}")
+        });
+    }
+
+    Ok(stdout)
 }
 
 /// Full diff orchestrator — parse → overlay → format pipeline.
@@ -243,26 +268,56 @@ pub fn diff(
         return Ok("No changes.".to_string());
     }
 
-    // 2. Build structural overlays in parallel — each FileDiff is independent
+    // 2. Pin a symmetric range to its merge base once, up front.
+    //
+    // `get_old_content` runs inside the parallel map below, once per file, so
+    // resolving `a...b` down there would spawn a `git merge-base` per file —
+    // a subprocess apiece on a wide diff. Rewriting the range to `<sha>..b`
+    // here costs one call and leaves every reader downstream on the plain-range
+    // path. It also pins the answer: a concurrent ref move mid-diff can no
+    // longer give two files different old sides.
+    let overlay_source = overlay::pin_range_to_merge_base(source)?;
+    let overlay_source = overlay_source.as_ref().unwrap_or(source);
+
+    // 3. Build structural overlays in parallel — each FileDiff is independent
     // and `compute_overlay` constructs its own tree-sitter parser per call
     // (see `lang::outline::get_outline_entries`), so no shared mutable state
     // crosses worker boundaries.
     let mut overlays: Vec<FileOverlay> = file_diffs
         .par_iter()
-        .map(|fd| overlay::compute_overlay(fd, source))
+        .map(|fd| overlay::compute_overlay(fd, overlay_source))
         .collect();
 
     // 3. Cross-file move detection.
     overlay::cross_file_matching(&mut overlays);
 
-    // 4. Signature warnings.
+    // 4. Signature warnings, plus any file whose analysis was abandoned.
+    // The latter are collected before the search filter below, which drops
+    // symbol-less overlays and would otherwise make the failure disappear.
     let mut warnings = overlay::signature_warnings(&overlays);
+    for overlay in &overlays {
+        if let Some(reason) = &overlay.analysis_failed {
+            warnings.push(format!(
+                "could not analyze `{}` — {reason}; symbol counts for it are missing, not zero",
+                overlay.path.display()
+            ));
+        }
+    }
 
     // 5. Search filter.
     if let Some(term) = search {
         filter_by_search(&mut overlays, term);
         if overlays.is_empty() {
-            return Ok(format!("No changes matching '{term}'."));
+            // Collecting the warnings above is not enough on its own: an
+            // abandoned overlay has no symbols and no hunks, so the filter
+            // always drops it, and this early return is the one path that
+            // never renders `warnings`. Without them "no match" would be the
+            // #111 lie again — a file we could not read, reported as absent.
+            let mut out = format!("No changes matching '{term}'.");
+            for w in &warnings {
+                let _ = write!(out, "\n⚠ {w}");
+            }
+            return Ok(out);
         }
     }
 
@@ -432,9 +487,10 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
 fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<String, String> {
-    // Get commit list.
+    // Every field is NUL-separated: %P is a variable-length list of parent
+    // hashes, so the old positional `%H %at %s` split cannot carry it.
     let output = Command::new("git")
-        .args(["log", "--format=%H %at %s%x00%an", range])
+        .args(["log", "--format=%H%x00%at%x00%P%x00%s%x00%an", range])
         .output()
         .map_err(|e| format!("failed to run git log: {e}"))?;
 
@@ -445,6 +501,7 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut summaries: Vec<CommitSummary> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -452,22 +509,42 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
             continue;
         }
 
-        // Format: "<hash> <timestamp> <subject>\0<author>"
-        let Some((rest, author)) = line.split_once('\0') else {
+        // Format: "<hash>\0<timestamp>\0<parents>\0<subject>\0<author>"
+        let mut fields = line.splitn(5, '\0');
+        let Some(hash) = fields.next() else {
             continue;
         };
+        let timestamp: i64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let parents = fields.next().unwrap_or("").trim().to_string();
+        let message = fields.next().unwrap_or("").to_string();
+        let author = fields.next().unwrap_or("").to_string();
 
-        let mut parts = rest.splitn(3, ' ');
-        let Some(hash) = parts.next() else {
-            continue;
+        // A parentless commit has no `^`, so `<hash>^..<hash>` is not a valid
+        // range — diff it against the empty tree, which makes every file read
+        // as added, exactly as `git log --patch` shows it. Without this the
+        // whole log aborted the moment the range reached such a commit.
+        //
+        // Two kinds of commit land here, and %P reports both as parentless: the
+        // true root, and a shallow clone's boundary commit (git grafts its
+        // parents away). Shallow is the CI default, so this is not an edge.
+        let commit_source = DiffSource::GitRef(if parents.is_empty() {
+            format!("{EMPTY_TREE}..{hash}")
+        } else {
+            format!("{hash}^..{hash}")
+        });
+
+        // Defensive, with no trigger I have been able to construct: every
+        // parentless case I found is handled above. It stays because the
+        // alternative is what this commit is fixing — one unexpected commit
+        // taking down the entire log through `?`. Losing one commit's body is
+        // survivable; losing the log is not.
+        let raw = match run_git_diff(&commit_source) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warnings.push(format!("no diff for {}: {e}", &hash[..hash.len().min(7)]));
+                String::new()
+            }
         };
-        let timestamp: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let message = parts.next().unwrap_or("").to_string();
-
-        // Run diff for this commit.
-        let ref_str = format!("{hash}^..{hash}");
-        let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
@@ -476,11 +553,21 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
             .collect();
         overlay::cross_file_matching(&mut overlays);
 
+        for overlay in &overlays {
+            if let Some(reason) = &overlay.analysis_failed {
+                warnings.push(format!(
+                    "could not analyze `{}` in {} — {reason}",
+                    overlay.path.display(),
+                    &hash[..hash.len().min(7)]
+                ));
+            }
+        }
+
         summaries.push(CommitSummary {
             hash: hash.to_string(),
             timestamp,
             message,
-            author: author.to_string(),
+            author,
             overlays,
         });
     }
@@ -500,8 +587,11 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         return Ok("No commits found.".to_string());
     }
 
-    Ok(format::format_log(&summaries, range, budget))
+    Ok(format::format_log(&summaries, range, &warnings, budget))
 }
+
+/// Git's empty tree object — the implicit "before" of a root commit.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1110,6 +1200,243 @@ diff --git a/src/main.rs b/src/main.rs
             resolve_source(Some("staged"), None, None, Some("x.patch"), None).unwrap(),
             DiffSource::Patch(_)
         ));
+    }
+
+    /// Diverge `base` and `feat` from a shared root, one new function on each
+    /// side, so that merge-base(base, feat) is neither branch tip. That is the
+    /// only topology where `base..feat` and `base...feat` disagree.
+    fn setup_diverged_repo() -> tempfile::TempDir {
+        let dir = setup_test_repo();
+        let p = dir.path();
+        // `git init` picks master or main depending on the host's config; pin it.
+        git(p, &["branch", "-M", "base"]);
+        let main_rs = p.join("src/main.rs");
+
+        git(p, &["checkout", "-b", "feat"]);
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            format!("{content}\nfn feat_only() {{\n    println!(\"feat\");\n}}\n"),
+        )
+        .unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "feat side"]);
+
+        git(p, &["checkout", "base"]);
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            format!("{content}\nfn base_only() {{\n    println!(\"base\");\n}}\n"),
+        )
+        .unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "base side"]);
+
+        git(p, &["checkout", "feat"]);
+        dir
+    }
+
+    /// A repo whose HEAD commit bumps a gitlink whose target object is absent.
+    ///
+    /// git happily diffs the pointer, but `git show <rev>:<gitlink>` fails, so
+    /// the overlay is abandoned — the cheapest reachable way to reach that path
+    /// without wiring up a real submodule. Ordinary for anyone diffing a repo
+    /// with submodules they have not initialized.
+    fn setup_dangling_gitlink_repo() -> tempfile::TempDir {
+        let dir = setup_test_repo();
+        let p = dir.path();
+        git(
+            p,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,0000000000000000000000000000000000000001,sub",
+            ],
+        );
+        git(p, &["commit", "-m", "add submodule pointer"]);
+        git(
+            p,
+            &[
+                "update-index",
+                "--cacheinfo",
+                "160000,0000000000000000000000000000000000000002,sub",
+            ],
+        );
+        git(p, &["commit", "-m", "bump submodule"]);
+        dir
+    }
+
+    // 19. test_search_keeps_unreadable_file_warning
+    #[test]
+    fn test_search_keeps_unreadable_file_warning() {
+        let dir = setup_dangling_gitlink_repo();
+
+        // `filter_by_search` always drops an abandoned overlay — no symbols and
+        // no hunks means nothing can match — and the empty-result early return
+        // is the one path that never renders `warnings`. Collecting them before
+        // the filter is necessary but was not sufficient.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("HEAD~1..HEAD".to_string()),
+            None,
+            Some("Subproject"),
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("could not analyze"),
+            "a file we could not read must not be reported as simply absent:\n{result}"
+        );
+    }
+
+    // 21. test_log_spans_the_root_commit
+    #[test]
+    fn test_log_spans_the_root_commit() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"second\")"),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "second commit"]);
+
+        // `HEAD` reaches the root commit, whose `^` does not resolve. Making a
+        // failed `git diff` fatal turned that into an aborted log for every
+        // full-history request — `test_log_mode` only ever asked for
+        // `HEAD~1..HEAD`, which stops one commit short of the problem.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("HEAD".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("a log spanning the root commit must not fail");
+
+        assert!(
+            result.contains("second commit") && result.contains("initial"),
+            "both commits must appear:\n{result}"
+        );
+        // The root commit's files are added against the empty tree, which is
+        // how `git log --patch` presents them.
+        //
+        // Assert on `goodbye`, not `hello`: the second commit touches `hello`,
+        // so that name appears either way and the assertion would pass with the
+        // root commit rendered empty. `goodbye` and `main` exist only in the
+        // root commit's add.
+        assert!(
+            result.contains("goodbye"),
+            "root commit must report its symbols as added:\n{result}"
+        );
+    }
+
+    // 22. test_bad_ref_is_an_error_not_no_changes
+    #[test]
+    fn test_bad_ref_is_an_error_not_no_changes() {
+        let dir = setup_test_repo();
+
+        // `git diff` exits 128 here and writes nothing to stdout. Reporting
+        // that as "No changes." with a zero exit is the #111 danger in its
+        // purest form: a failure that reads as evidence of a clean tree.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("HEAD..no-such-ref-xyz".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        let err = result.expect_err("a nonexistent ref must not succeed");
+        assert!(
+            err.contains("git diff failed"),
+            "error must say git failed, got {err:?}"
+        );
+        assert!(
+            !err.contains("No changes"),
+            "a bad ref must never be reported as no changes, got {err:?}"
+        );
+    }
+
+    // 23. test_symmetric_ref_range_uses_merge_base
+    #[test]
+    fn test_symmetric_ref_range_uses_merge_base() {
+        let dir = setup_diverged_repo();
+
+        // `base...feat` is merge-base(base, feat) vs feat. `feat_only` is the
+        // only symbol added on that path; `base_only` never exists on either
+        // side of it. Before #111 the ref split at the first `..`, leaving a
+        // new-side rev of `.feat` that `git show` rejects — so every file's
+        // overlay was abandoned and this rendered as an authoritative zero.
+        let symmetric = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("base...feat".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            symmetric.contains("feat_only"),
+            "`base...feat` must report the symbol added on feat:\n{symmetric}"
+        );
+        assert!(
+            !symmetric.contains("base_only"),
+            "`base...feat` must not report base-side symbols — merge-base, not base:\n{symmetric}"
+        );
+        assert!(
+            !symmetric.contains("analysis unavailable"),
+            "`base...feat` must resolve both sides:\n{symmetric}"
+        );
+
+        // The two-dot spelling asks a different question and must keep its own
+        // answer: relative to `base`, `base_only` is gone.
+        let two_dot = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("base..feat".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            two_dot.contains("base_only"),
+            "`base..feat` must still diff against the base tip:\n{two_dot}"
+        );
+    }
+
+    // 24. test_symmetric_ref_range_file_scope
+    #[test]
+    fn test_symmetric_ref_range_file_scope() {
+        let dir = setup_diverged_repo();
+
+        // The reported symptom, verbatim: a scoped symmetric diff answering
+        // "0 symbols touched, +0/−0 lines" for a file that really changed.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("base...feat".to_string()),
+            Some("src/main.rs"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !result.contains("0 symbols touched"),
+            "a real change must not report zero symbols:\n{result}"
+        );
+        assert!(
+            result.contains("feat_only"),
+            "scoped symmetric diff must name the added symbol:\n{result}"
+        );
     }
 }
 // test
