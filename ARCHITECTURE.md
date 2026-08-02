@@ -394,8 +394,9 @@ The biggest production-only file in the subsystem. Three layers stacked:
 2. **Per-language definition extraction**:
    - `find_defs_treesitter` walks the tree-sitter tree and picks
      definitions whose name field equals the query. Uses
-     `DEFINITION_KINDS` from `lang/treesitter.rs` (about 30 node-kind
-     strings spanning every supported grammar).
+     `DEFINITION_KINDS` from `lang/treesitter.rs` (37 node-kind strings
+     spanning every supported grammar, plus three language-scoped
+     lists — see the `lang/` section).
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
@@ -597,10 +598,31 @@ Make.
 - `is_minified_by_name`, `is_minified_by_content` — naming convention
   - density check.
 
-`lang::treesitter::DEFINITION_KINDS` is the canonical list of
-tree-sitter node kinds tilth treats as definitions across all
-languages. It's a flat `&[&str]` slice — additions are line-noise
-edits.
+`lang::treesitter::DEFINITION_KINDS` holds the node kinds tilth treats
+as definitions in *every* language (37 strings). It is not the whole
+answer: three companion lists are language-scoped, and
+`is_definition_node` consults them first —
+`C_FAMILY_DEFINITION_KINDS` (`field_declaration`, a class member in
+C/C++ but a struct field in Rust/Go/Java/C#),
+`RUBY_DEFINITION_KINDS` (`class`, `method`, `singleton_method`,
+`module`) and `GO_DEFINITION_KINDS` (`var_declaration`).
+
+**Adding a kind is not a line-noise edit**, which is what this said
+before and is how several cross-language defects shipped. A kind string
+is matched against every grammar tilth loads, and the bare words are
+shared: `class` is also the JS/TS class *expression*, `module` also a
+TypeScript ambient module whose `name` field is a string literal, and
+`var_declaration` also Scala's abstract member form. Registering those
+globally made a quoted string a symbol name and made a Scala `var` a
+definition while its `val` stayed a usage. Check ownership across
+grammars first — `definition_kinds_are_not_ambiguous_across_grammars`
+and `language_scoped_definition_kinds_do_not_leak` are where that gets
+pinned — and scope the kind to its language if it is shared.
+
+A kind also needs an arm in `lang/outline.rs`, not just registration
+here. `record_declaration` was added without one, so a C# record
+resolved in search and was absent from the outline — the two-walk
+drift the outline/definition parity tests exist to catch.
 
 `lang::package_root(path)` walks up looking for known manifests
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is
