@@ -341,34 +341,107 @@ pub fn diff(
 
     // 8. Format based on scope.
     let label = source_label(source);
-    let mut output = match scope {
-        None => format::format_overview(&overlays, &file_meta, &warnings, &label, budget),
-        Some(s) if s.contains(':') => {
-            // file:function scope
-            let (file_part, fn_name) = s.split_once(':').unwrap();
-            match overlays.iter().find(|o| {
-                let p = o.path.to_string_lossy();
-                p == file_part || p.ends_with(file_part)
-            }) {
-                Some(o) => format::format_function_detail(o, fn_name),
-                None => return Err(format!("file '{file_part}' not found in diff")),
+    let paths: Vec<String> = overlays
+        .iter()
+        .map(|o| normalize_path(&o.path.to_string_lossy()))
+        .collect();
+
+    // Split the symbol off first: `<path>:<symbol>` scopes a path too, and the
+    // conflict pass below must see the same selection the body was rendered
+    // from, or it reports conflicts in files the header says are out of scope.
+    let (scope_path, symbol) = match scope {
+        None => (None, None),
+        Some(s) => match split_path_symbol(s) {
+            Some((path, sym)) => (Some(path), Some(sym)),
+            None => (Some(s), None),
+        },
+    };
+
+    let selection: Option<ScopeMatch> = match scope_path {
+        None => None,
+        Some(s) => match scope_request(s) {
+            // An absolute scope that resolves to the repo root, or `.`, asks
+            // the same question as no scope at all.
+            ScopeRequest::Everything => None,
+            ScopeRequest::Paths(candidates) => match select_scope(&paths, &candidates) {
+                Some((m, _)) => Some(m),
+                None => return Err(scope_miss_error(&paths, s)),
+            },
+        },
+    };
+
+    // Label with the form that matched, not the caller's absolute path.
+    let scoped_label = |m: &ScopeMatch| -> String {
+        match scope_request(scope_path.unwrap_or(".")) {
+            ScopeRequest::Paths(c) => {
+                let _ = m;
+                format!("{label} ({})", c.last().cloned().unwrap_or_default())
             }
+            ScopeRequest::Everything => label.clone(),
         }
-        Some(file) => {
-            match overlays.iter().find(|o| {
-                let p = o.path.to_string_lossy();
-                p == file || p.ends_with(file)
-            }) {
-                Some(o) => format::format_file_detail(o, budget),
-                None => return Err(format!("file '{file}' not found in diff")),
+    };
+
+    let mut output = match (&selection, symbol) {
+        // Unscoped, or scoped to the whole repo.
+        (None, _) => {
+            let all: Vec<&FileOverlay> = overlays.iter().collect();
+            format::format_overview(&all, &file_meta, &warnings, &label, budget)
+        }
+
+        // `file:function` — one symbol inside exactly one file.
+        (Some(m), Some(fn_name)) => match m.files.as_slice() {
+            [i] if m.under.is_empty() => format::format_function_detail(&overlays[*i], fn_name),
+            // A directory has no single overlay to render a symbol from.
+            // Saying so beats "not found", which is false — it matched.
+            [] => {
+                return Err(format!(
+                    "scope '{}' is a directory ({} changed files); the file:function form needs one file",
+                    scope_path.unwrap_or_default(),
+                    m.under.len()
+                ));
             }
-        }
+            _ => {
+                return Err(scope_ambiguous_error(
+                    &paths,
+                    scope_path.unwrap_or_default(),
+                    m,
+                ))
+            }
+        },
+
+        (Some(m), None) => match m.files.as_slice() {
+            // Exactly one file and nothing under it — per-symbol detail.
+            [i] if m.under.is_empty() => format::format_file_detail(&overlays[*i], budget),
+            // A directory — overview of everything beneath it.
+            [] => {
+                let scoped: Vec<&FileOverlay> = m.under.iter().map(|&i| &overlays[i]).collect();
+                let scoped_meta: Vec<(&Path, bool, bool)> =
+                    m.under.iter().map(|&i| file_meta[i]).collect();
+                // Warnings are global, not per-file, so they ride along
+                // unfiltered — a file we could not read stays visible even when
+                // it sits outside the requested directory.
+                format::format_overview(&scoped, &scoped_meta, &warnings, &scoped_label(m), budget)
+            }
+            // More than one file, or a file shadowing a directory. Picking one
+            // silently is how a whole changed directory used to disappear.
+            _ => {
+                return Err(scope_ambiguous_error(
+                    &paths,
+                    scope_path.unwrap_or_default(),
+                    m,
+                ))
+            }
+        },
     };
 
     // 9. Conflict detection for uncommitted diffs.
     if matches!(source, DiffSource::GitUncommitted) {
+        let in_scope = |i: usize| selection.as_ref().is_none_or(|m| m.all().contains(&i));
         let mut all_conflicts = Vec::new();
-        for overlay in &overlays {
+        for (i, overlay) in overlays.iter().enumerate() {
+            if !in_scope(i) {
+                continue;
+            }
             let conflicts = overlay::detect_conflicts(&overlay.path);
             if !conflicts.is_empty() {
                 all_conflicts.push((&overlay.path, conflicts));
@@ -402,6 +475,300 @@ fn source_label(source: &DiffSource) -> String {
         DiffSource::Patch(p) => format!("patch: {}", p.display()),
         DiffSource::Log(r) => format!("log: {r}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scope resolution
+//
+// A `scope` argument names either one changed file or a directory of them. It
+// is matched against the paths *git* reported, which are always repo-relative
+// with forward slashes — so everything here normalizes to that shape first.
+// ---------------------------------------------------------------------------
+
+/// Which changed paths a scope selected. Indices into the overlay list.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScopeMatch {
+    /// Paths that *are* the scope — it named a file.
+    files: Vec<usize>,
+    /// Paths *beneath* the scope — it named a directory.
+    under: Vec<usize>,
+}
+
+impl ScopeMatch {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.under.is_empty()
+    }
+
+    /// Every selected index. Log mode filters with this — it wants all the
+    /// matches, not one of them.
+    fn all(&self) -> Vec<usize> {
+        let mut out = self.files.clone();
+        out.extend(&self.under);
+        out.sort_unstable();
+        out
+    }
+}
+
+/// How literally a scope has to match a changed path.
+///
+/// `Anchored` is git's pathspec rule — the scope is relative to the repo root.
+/// `Suffix` is tilth's convenience, letting `parse.rs` stand for
+/// `src/diff/parse.rs`, and is consulted ONLY when nothing anchored matched.
+///
+/// The ordering is the whole point. Without it a fully-qualified scope loses to
+/// a partial one: an absolute `<root>/src/util.rs` reduces to `src/util.rs` and
+/// then suffix-matched `a/src/util.rs` in a repo that had both — a confidently
+/// wrong answer about a file the caller never named.
+#[derive(Clone, Copy)]
+enum Anchoring {
+    Anchored,
+    Suffix,
+}
+
+/// Fold a path into the shape git reports: forward slashes, no trailing slash.
+fn normalize_path(p: &str) -> String {
+    let slashed = p.trim().replace('\\', "/");
+    // `std::fs::canonicalize` emits Windows' extended-length prefix, and an MCP
+    // client that canonicalizes before calling sends it verbatim. Left in place
+    // it can never match git's root, so every such scope missed.
+    let stripped = if let Some(rest) = slashed.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = slashed.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        slashed
+    };
+    stripped.trim_end_matches('/').to_string()
+}
+
+/// Compare one path component. Windows paths are case-insensitive; git's are
+/// not, so this is only used for matching against the *repository root*, never
+/// against the paths inside the diff.
+fn eq_root_component(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// Does this look like an absolute path? Used only to decide whether asking
+/// git for the repository root could possibly help — a relative scope can never
+/// be under it, so it must not pay for the subprocess.
+fn looks_absolute(p: &str) -> bool {
+    p.starts_with('/') || p.starts_with('\\') || p.as_bytes().get(1) == Some(&b':')
+}
+
+/// Make an absolute scope repo-relative by removing the repository root.
+///
+/// `prompts/mcp-base.md` tells agents never to pass a bare relative scope, so
+/// absolute is the form `tilth_diff` actually receives — and every one of them
+/// used to miss, because git's diff paths are repo-relative.
+fn strip_repo_root(scope: &str) -> RootRelative {
+    if !looks_absolute(scope) {
+        return RootRelative::Outside;
+    }
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    else {
+        return RootRelative::Outside;
+    };
+    if !output.status.success() {
+        return RootRelative::Outside;
+    }
+    let root = normalize_path(&String::from_utf8_lossy(&output.stdout));
+    if root.is_empty() {
+        return RootRelative::Outside;
+    }
+
+    // Walk components rather than slicing bytes: a case-insensitive compare on
+    // a lowercased copy cannot be mapped back to the original by offset once a
+    // non-ASCII character is involved.
+    let scope = normalize_path(scope);
+    let mut parts = scope.split('/');
+    for want in root.split('/') {
+        match parts.next() {
+            Some(got) if eq_root_component(got, want) => {}
+            _ => return RootRelative::Outside,
+        }
+    }
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        RootRelative::WholeRepo
+    } else {
+        RootRelative::Under(rest.join("/"))
+    }
+}
+
+/// Where an absolute scope sits relative to the repository root.
+enum RootRelative {
+    /// Not under the root — or not absolute, so it cannot be.
+    Outside,
+    /// The root itself. An agent resolving "the repo" to its path lands here,
+    /// and it means the same thing as passing no scope at all.
+    WholeRepo,
+    /// A path beneath the root, repo-relative.
+    Under(String),
+}
+
+/// Collect every changed path this scope selects, at one anchoring level.
+fn match_tier(paths: &[String], want: &str, how: Anchoring) -> ScopeMatch {
+    let mut m = ScopeMatch::default();
+    for (i, path) in paths.iter().enumerate() {
+        let (is_file, is_under) = match how {
+            Anchoring::Anchored => (path == want, path.starts_with(&format!("{want}/"))),
+            Anchoring::Suffix => (
+                path.ends_with(&format!("/{want}")),
+                path.contains(&format!("/{want}/")),
+            ),
+        };
+        if is_file {
+            m.files.push(i);
+        } else if is_under {
+            m.under.push(i);
+        }
+    }
+    m
+}
+
+/// Resolve a `scope` argument against the changed paths.
+///
+/// Anchored matches are tried across every candidate form before any suffix
+/// match is considered, so a path the caller fully qualified always beats a
+/// partial one. Returns the form that matched alongside the selection, so
+/// output can be labelled `src/diff` rather than echoing back the caller's
+/// `C:/dev/tilth/src/diff`.
+///
+/// Every match is returned, not the first — log mode filters on all of them,
+/// and `diff()` needs to see multiplicity to report it rather than silently
+/// picking one.
+fn select_scope(paths: &[String], candidates: &[String]) -> Option<(ScopeMatch, String)> {
+    for how in [Anchoring::Anchored, Anchoring::Suffix] {
+        for want in candidates {
+            let m = match_tier(paths, want, how);
+            if !m.is_empty() {
+                return Some((m, want.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// What a scope is asking for.
+enum ScopeRequest {
+    /// The whole repository — equivalent to no scope.
+    Everything,
+    /// Path forms worth matching, most literal first.
+    Paths(Vec<String>),
+}
+
+/// Work out what a scope asks for, resolving the repository root at most once.
+///
+/// Log mode calls `select_scope` once per commit — building this in there would
+/// have spawned a subprocess per commit, the same per-item-subprocess shape as
+/// the merge-base call fixed in #112.
+fn scope_request(scope: &str) -> ScopeRequest {
+    let direct = normalize_path(scope);
+    if direct == "." || direct.is_empty() {
+        return ScopeRequest::Everything;
+    }
+    let mut out = vec![direct];
+    match strip_repo_root(scope) {
+        RootRelative::WholeRepo => return ScopeRequest::Everything,
+        RootRelative::Under(relative) => {
+            if !out.contains(&relative) {
+                out.push(relative);
+            }
+        }
+        RootRelative::Outside => {}
+    }
+    ScopeRequest::Paths(out)
+}
+
+/// Split a scope into `(path, symbol)` if it uses the `file:function` form.
+///
+/// Splits on the LAST colon, and only when the tail could be a symbol name.
+/// Splitting on the first colon made `C:/dev/x.rs` a request for the file `C`,
+/// which is why every absolute Windows scope reported `file 'C' not found`.
+fn split_path_symbol(scope: &str) -> Option<(&str, &str)> {
+    let (path, symbol) = scope.rsplit_once(':')?;
+    if path.is_empty() || symbol.is_empty() {
+        return None;
+    }
+    if symbol.contains('/') || symbol.contains('\\') {
+        return None;
+    }
+    Some((path, symbol))
+}
+
+/// Error text for a scope that matched nothing, naming what *did* change.
+///
+/// `file 'x' not found in diff` left the caller with no way to tell a typo from
+/// a genuinely untouched path.
+fn scope_miss_error(paths: &[String], scope: &str) -> String {
+    const SHOWN: usize = 10;
+    if paths.is_empty() {
+        return format!("scope '{scope}' matched no changed files — the diff is empty");
+    }
+    let shown: Vec<&str> = paths.iter().take(SHOWN).map(String::as_str).collect();
+    let more = paths.len().saturating_sub(shown.len());
+    let suffix = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "scope '{scope}' matched no changed file or directory. Changed: {}{suffix}",
+        shown.join(", ")
+    )
+}
+
+/// Error text for a scope that names more than one thing.
+///
+/// The alternative is picking one and not saying so, which is how
+/// `--scope hooks` came back as the single file `scripts/hooks` while quietly
+/// dropping a whole changed `tools/hooks/` directory.
+fn scope_ambiguous_error(paths: &[String], matched: &str, m: &ScopeMatch) -> String {
+    let name = |i: &usize| paths[*i].as_str();
+    let files: Vec<&str> = m.files.iter().map(name).collect();
+    let under: Vec<&str> = m.under.iter().map(name).collect();
+
+    let mut out = format!("scope '{matched}' is ambiguous — it matches ");
+    if !files.is_empty() {
+        let _ = write!(out, "the file{} {}", plural(files.len()), files.join(", "));
+    }
+    if !files.is_empty() && !under.is_empty() {
+        out.push_str(" and ");
+    }
+    if !under.is_empty() {
+        let _ = write!(
+            out,
+            "a directory containing {}",
+            join_capped(&under, 5, "file")
+        );
+    }
+    out.push_str(". Qualify it with more of the path.");
+    out
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+/// `a, b, c (+N more)` — never a silent truncation.
+fn join_capped(items: &[&str], cap: usize, noun: &str) -> String {
+    let shown = items.len().min(cap);
+    let more = items.len() - shown;
+    let mut out = items[..shown].join(", ");
+    if more > 0 {
+        let _ = write!(out, " (+{more} more {noun}{})", plural(more));
+    }
+    out
 }
 
 /// Filter overlays to only symbols whose diff lines contain the search term
@@ -573,11 +940,36 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
     }
 
     // Filter by scope if set.
-    if let Some(file_scope) = scope {
+    //
+    // Log mode keeps its own filter because it applies per commit, but it must
+    // use the same matcher as `diff()` — this copy accepted only files, and
+    // matched them by loose suffix, so `--scope src/diff --log` came back empty
+    // while `--scope src/diff` errored. Two different wrong answers to the same
+    // question.
+    // Built once, outside the loop: it can shell out to git.
+    let candidates = match scope.map(scope_request) {
+        None | Some(ScopeRequest::Everything) => None,
+        Some(ScopeRequest::Paths(c)) => Some(c),
+    };
+    if let Some(candidates) = candidates {
         for summary in &mut summaries {
-            summary.overlays.retain(|o| {
-                let p = o.path.to_string_lossy();
-                p == file_scope || p.ends_with(file_scope)
+            let paths: Vec<String> = summary
+                .overlays
+                .iter()
+                .map(|o| normalize_path(&o.path.to_string_lossy()))
+                .collect();
+            // Every match, not the first. Log mode is a filter, not a picker —
+            // taking one match here dropped a real change to the very file the
+            // caller scoped to, and relabelled the commit with a different one.
+            let keep: HashSet<usize> = match select_scope(&paths, &candidates) {
+                Some((m, _)) => m.all().into_iter().collect(),
+                None => HashSet::new(),
+            };
+            let mut i = 0;
+            summary.overlays.retain(|_| {
+                let keep_this = keep.contains(&i);
+                i += 1;
+                keep_this
             });
         }
         summaries.retain(|s| !s.overlays.is_empty());
@@ -1025,7 +1417,477 @@ mod tests {
         );
     }
 
-    // 14. test_file_scope_not_found
+    /// A repo with changes in two sibling directories, so a directory scope has
+    /// something to include *and* something to exclude.
+    fn setup_two_dir_repo() -> tempfile::TempDir {
+        let dir = setup_test_repo();
+        let p = dir.path();
+        let tools = p.join("tools/hooks");
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(tools.join("prefer.py"), "def old():\n    pass\n").unwrap();
+        fs::write(tools.join("other.py"), "def other_old():\n    pass\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "add tools"]);
+
+        fs::write(
+            tools.join("prefer.py"),
+            "def old():\n    pass\n\ndef prefer_added():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            tools.join("other.py"),
+            "def other_old():\n    pass\n\ndef other_added():\n    pass\n",
+        )
+        .unwrap();
+        let main_rs = p.join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(&main_rs, format!("{content}\nfn src_side_added() {{}}\n")).unwrap();
+        dir
+    }
+
+    // 14. test_directory_scope
+    #[test]
+    fn test_directory_scope() {
+        let dir = setup_two_dir_repo();
+
+        // Issue #110: this errored with "file 'tools/hooks' not found in diff"
+        // while an exact file scope in the same directory worked.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("tools/hooks"),
+            None,
+            false,
+            None,
+        )
+        .expect("a directory scope must be accepted");
+
+        assert!(
+            result.contains("prefer_added") && result.contains("other_added"),
+            "every changed file beneath the directory must appear:\n{result}"
+        );
+        assert!(
+            !result.contains("src_side_added"),
+            "a directory scope must exclude changes outside it:\n{result}"
+        );
+        assert!(
+            result.contains("2 files"),
+            "header must count only the scoped files:\n{result}"
+        );
+    }
+
+    // 15. test_directory_scope_in_log_mode
+    #[test]
+    fn test_directory_scope_in_log_mode() {
+        let dir = setup_two_dir_repo();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "second round"]);
+
+        // Log mode filters scope through its own code path. It accepted only
+        // files, so a directory scope came back "No commits found." — a
+        // different wrong answer to the same question `diff()` errored on.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("HEAD~1..HEAD".to_string()),
+            Some("tools/hooks"),
+            None,
+            false,
+            None,
+        )
+        .expect("log mode must accept a directory scope");
+
+        assert!(
+            result.contains("prefer_added") && result.contains("other_added"),
+            "log must report the scoped directory's changes:\n{result}"
+        );
+        assert!(
+            !result.contains("src_side_added"),
+            "log scope must exclude changes outside the directory:\n{result}"
+        );
+    }
+
+    // 16. test_scope_naming_a_file_and_a_directory_errors
+    #[test]
+    fn test_scope_naming_a_file_and_a_directory_errors() {
+        // Its own fixture: `setup_two_dir_repo` leaves its edits uncommitted,
+        // so committing a new file on top of it would swallow them and leave
+        // only one changed path — a fixture that cannot express the collision.
+        let dir = setup_test_repo();
+        let p = dir.path();
+        fs::create_dir_all(p.join("scripts")).unwrap();
+        fs::create_dir_all(p.join("tools/hooks")).unwrap();
+        fs::write(p.join("scripts/hooks"), "#!/bin/sh\necho old\n").unwrap();
+        fs::write(p.join("tools/hooks/a.py"), "def a():\n    pass\n").unwrap();
+        fs::write(p.join("tools/hooks/b.py"), "def b():\n    pass\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "baseline"]);
+
+        // A file whose basename equals the directory everyone means by `hooks`,
+        // and the directory itself — both changed, neither committed.
+        fs::write(p.join("scripts/hooks"), "#!/bin/sh\necho new\n").unwrap();
+        fs::write(
+            p.join("tools/hooks/a.py"),
+            "def a():\n    pass\n\ndef a_added():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            p.join("tools/hooks/b.py"),
+            "def b():\n    pass\n\ndef b_added():\n    pass\n",
+        )
+        .unwrap();
+
+        // Answering with just the file dropped two changed Python files and
+        // reported `+0/−0` — reading as "nothing happened in hooks".
+        let result = run_diff_in(
+            p,
+            &DiffSource::GitUncommitted,
+            Some("hooks"),
+            None,
+            false,
+            None,
+        );
+        let err = result.expect_err("a scope naming two different things must not pick one");
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(
+            err.contains("scripts/hooks") && err.contains("tools/hooks"),
+            "the error must name both interpretations: {err}"
+        );
+    }
+
+    // 17. test_directory_scope_excludes_outside_conflicts
+    #[test]
+    fn test_directory_scope_excludes_outside_conflicts() {
+        let dir = setup_two_dir_repo();
+        // A conflict in a file the scope excludes.
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            format!("{content}\n<<<<<<< HEAD\nfn ours() {{}}\n=======\nfn theirs() {{}}\n>>>>>>> other\n"),
+        )
+        .unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("tools/hooks"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        // The header says `(tools/hooks)`; a conflict block from `src/` under it
+        // makes the body contradict the header.
+        assert!(
+            !result.contains("Conflicts"),
+            "a scoped diff must not report conflicts outside the scope:\n{result}"
+        );
+
+        // But the conflict is still reported when nothing is scoped out.
+        let unscoped = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            unscoped.contains("Conflicts"),
+            "the unscoped diff must still report it:\n{unscoped}"
+        );
+    }
+
+    // 18. test_absolute_scope
+    #[test]
+    fn test_absolute_scope() {
+        let dir = setup_two_dir_repo();
+
+        // `prompts/mcp-base.md` tells agents: "DO NOT pass a relative path or
+        // scope without also setting root (absolute)". So absolute is the form
+        // `tilth_diff` actually receives — and every one of them missed, because
+        // git's diff paths are repo-relative. On Windows the drive-letter colon
+        // also split the scope, turning it into a request for the file `C`.
+        // Canonicalize, don't just join. `git rev-parse --show-toplevel`
+        // reports the physical path, and a TempDir is reached through a
+        // symlink on macOS (`/var` → `/private/var`), so a raw `dir.path()`
+        // would never match the root there. Canonicalizing is also what an MCP
+        // client does before sending an absolute scope — hence the `\\?\`
+        // prefix handling in `normalize_path`.
+        let root = dir.path().canonicalize().unwrap();
+        let abs_file = root.join("tools/hooks/prefer.py");
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some(&abs_file.to_string_lossy()),
+            None,
+            false,
+            None,
+        )
+        .expect("an absolute file scope must be accepted");
+        assert!(
+            result.contains("prefer_added"),
+            "absolute file scope must resolve:\n{result}"
+        );
+
+        let abs_dir = root.join("tools/hooks");
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some(&abs_dir.to_string_lossy()),
+            None,
+            false,
+            None,
+        )
+        .expect("an absolute directory scope must be accepted");
+        assert!(
+            result.contains("prefer_added") && result.contains("other_added"),
+            "absolute directory scope must resolve:\n{result}"
+        );
+        assert!(
+            !result.contains("src_side_added"),
+            "absolute directory scope must still exclude outside changes:\n{result}"
+        );
+
+        // The label reports the resolved relative path, not the caller's
+        // absolute one — an agent's temp-dir prefix is noise in the output.
+        assert!(
+            result.contains("(tools/hooks)"),
+            "expected the resolved relative scope in the header:\n{result}"
+        );
+
+        // An absolute scope that IS the repo root asks the unscoped question.
+        // An agent resolving "the repo" to its path used to get an error.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some(&root.to_string_lossy()),
+            None,
+            false,
+            None,
+        )
+        .expect("the repo root is a valid scope");
+        assert!(
+            result.contains("prefer_added") && result.contains("src_side_added"),
+            "a root scope must cover the whole repo:\n{result}"
+        );
+    }
+
+    // 19. test_absolute_scope_with_symbol
+    #[test]
+    fn test_absolute_scope_with_symbol() {
+        let dir = setup_two_dir_repo();
+        // Canonicalized for the same reason as `test_absolute_scope`.
+        let abs = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("tools/hooks/prefer.py");
+
+        // `<abs path>:<symbol>` must split at the symbol, not the drive letter.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some(&format!("{}:prefer_added", abs.to_string_lossy())),
+            None,
+            false,
+            None,
+        )
+        .expect("absolute file:function scope must be accepted");
+        assert!(
+            result.contains("prefer_added"),
+            "expected the named symbol:\n{result}"
+        );
+    }
+
+    fn paths(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Resolve a relative scope. Relative never consults git, so this needs no
+    /// repository around it.
+    fn sel(p: &[String], scope: &str) -> Option<ScopeMatch> {
+        match scope_request(scope) {
+            ScopeRequest::Paths(c) => select_scope(p, &c).map(|(m, _)| m),
+            ScopeRequest::Everything => None,
+        }
+    }
+
+    fn files_of(m: &Option<ScopeMatch>) -> Vec<usize> {
+        m.as_ref().map(|m| m.files.clone()).unwrap_or_default()
+    }
+
+    fn under_of(m: &Option<ScopeMatch>) -> Vec<usize> {
+        m.as_ref().map(|m| m.under.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn scope_matches_on_component_boundaries() {
+        let p = paths(&["src/diff/parse.rs", "tools/hooks/prefer_tools.py"]);
+
+        // Exact and component-boundary suffix.
+        assert_eq!(files_of(&sel(&p, "src/diff/parse.rs")), vec![0]);
+        assert_eq!(files_of(&sel(&p, "parse.rs")), vec![0]);
+        assert_eq!(files_of(&sel(&p, "diff/parse.rs")), vec![0]);
+
+        // A bare substring is not a path. `arse.rs` used to select parse.rs and
+        // answer confidently about a file nobody asked for.
+        assert!(sel(&p, "arse.rs").is_none());
+        assert!(sel(&p, "refer_tools.py").is_none());
+        assert!(sel(&p, "rc").is_none());
+    }
+
+    #[test]
+    fn scope_accepts_directories() {
+        let p = paths(&[
+            "tools/hooks/prefer_tools.py",
+            "tools/hooks/other.py",
+            "src/main.rs",
+        ]);
+
+        // The reported case: a directory selects everything beneath it.
+        assert_eq!(under_of(&sel(&p, "tools/hooks")), vec![0, 1]);
+        // Trailing slash is the same request.
+        assert_eq!(under_of(&sel(&p, "tools/hooks/")), vec![0, 1]);
+        // Directories get the same suffix latitude files do.
+        assert_eq!(under_of(&sel(&p, "hooks")), vec![0, 1]);
+        // Windows separators normalize to git's.
+        assert_eq!(under_of(&sel(&p, r"tools\hooks")), vec![0, 1]);
+        // A directory that changed nothing is a miss, not an empty success.
+        assert!(sel(&p, "tools/other").is_none());
+        // A file scope still resolves to its file.
+        assert_eq!(files_of(&sel(&p, "src/main.rs")), vec![2]);
+    }
+
+    #[test]
+    fn anchored_matches_beat_suffix_matches() {
+        // A monorepo where the same relative path exists in several trees. This
+        // is the shape that made a fully-qualified scope answer about the wrong
+        // file: `src/util.rs` was suffix-matched, and `a/src/util.rs` sorts
+        // first, so it won.
+        let p = paths(&[
+            "a/src/util.rs",
+            "b/src/util.rs",
+            "src/util.rs",
+            "vendor/src/util.rs",
+        ]);
+
+        // Anchored at the repo root: exactly the one git's pathspec would give.
+        assert_eq!(files_of(&sel(&p, "src/util.rs")), vec![2]);
+        assert_eq!(under_of(&sel(&p, "src")), vec![2]);
+
+        // A scope that is anchored nowhere still gets the suffix pass — but now
+        // it reports every match rather than silently picking the first.
+        assert_eq!(files_of(&sel(&p, "util.rs")), vec![0, 1, 2, 3]);
+
+        // An inner tree is still reachable by qualifying it.
+        assert_eq!(files_of(&sel(&p, "a/src/util.rs")), vec![0]);
+        assert_eq!(under_of(&sel(&p, "vendor/src")), vec![3]);
+    }
+
+    #[test]
+    fn a_file_never_silently_shadows_a_directory() {
+        // `scripts/hooks` is a file; `tools/hooks/` is a directory. `hooks`
+        // names both, and answering with just the file dropped two changed
+        // Python files while reporting `+0/−0` — "nothing happened in hooks".
+        let p = paths(&["scripts/hooks", "tools/hooks/a.py", "tools/hooks/b.py"]);
+        let m = sel(&p, "hooks").expect("both interpretations match");
+        assert_eq!(m.files, vec![0]);
+        assert_eq!(m.under, vec![1, 2]);
+
+        // The caller sees the collision rather than one arbitrary half of it.
+        let err = scope_ambiguous_error(&p, "hooks", &m);
+        assert!(err.contains("scripts/hooks"), "{err}");
+        assert!(err.contains("tools/hooks/a.py"), "{err}");
+    }
+
+    #[test]
+    fn a_scope_naming_the_repo_itself_means_everything() {
+        // An agent resolving "the repo" to its root path, or passing `.`, is
+        // asking the same question as passing no scope at all.
+        assert!(matches!(scope_request("."), ScopeRequest::Everything));
+        assert!(matches!(scope_request("./"), ScopeRequest::Everything));
+        assert!(matches!(scope_request(""), ScopeRequest::Everything));
+    }
+
+    #[test]
+    fn extended_length_prefixes_normalize_away() {
+        // `std::fs::canonicalize` emits this on Windows, so an MCP client that
+        // canonicalizes sends it verbatim. Left in place it can never match
+        // git's root.
+        assert_eq!(normalize_path(r"\\?\C:\dev\t\src"), "C:/dev/t/src");
+        assert_eq!(
+            normalize_path(r"\\?\UNC\server\share\r"),
+            "//server/share/r"
+        );
+        assert_eq!(normalize_path("src/diff/"), "src/diff");
+    }
+
+    #[test]
+    fn relative_scopes_never_consult_git() {
+        // `strip_repo_root` shells out. A relative scope can never live under
+        // the repo root, so it must bail before paying for that — log mode
+        // resolves a scope per commit, and this is the same per-item-subprocess
+        // shape as the merge-base call fixed in #112.
+        assert!(!looks_absolute("src/main.rs"));
+        assert!(!looks_absolute("tools/hooks"));
+        assert!(looks_absolute("/home/u/repo/src/main.rs"));
+        assert!(looks_absolute(r"C:\dev\t\src\main.rs"));
+        assert!(looks_absolute("C:/dev/t/src/main.rs"));
+
+        // Holds with no repository around it, which is the proof there was no
+        // git call: a relative scope yields exactly one candidate, itself.
+        assert!(matches!(
+            strip_repo_root("src/main.rs"),
+            RootRelative::Outside
+        ));
+        let one = |s: &str| match scope_request(s) {
+            ScopeRequest::Paths(c) => c,
+            ScopeRequest::Everything => panic!("{s} should not be whole-repo"),
+        };
+        assert_eq!(one("src/main.rs"), vec!["src/main.rs"]);
+        assert_eq!(one(r"tools\hooks\"), vec!["tools/hooks"]);
+    }
+
+    #[test]
+    fn path_symbol_split_survives_drive_letters() {
+        // The `file:function` form.
+        assert_eq!(
+            split_path_symbol("src/main.rs:hello"),
+            Some(("src/main.rs", "hello"))
+        );
+        assert_eq!(
+            split_path_symbol("C:/dev/t/src/main.rs:hello"),
+            Some(("C:/dev/t/src/main.rs", "hello"))
+        );
+
+        // A bare absolute path is NOT a file:function request. Splitting on the
+        // first colon made every absolute Windows scope a request for the file
+        // `C`, which is what `file 'C' not found in diff` was.
+        assert_eq!(split_path_symbol("C:/dev/t/src/main.rs"), None);
+        assert_eq!(split_path_symbol(r"C:\dev\t\src\main.rs"), None);
+        assert_eq!(split_path_symbol("C:"), None);
+        assert_eq!(split_path_symbol("src/main.rs"), None);
+    }
+
+    #[test]
+    fn scope_miss_names_the_changed_files() {
+        let p = paths(&["src/a.rs", "src/b.rs"]);
+        let err = scope_miss_error(&p, "src/nope");
+        assert!(
+            err.contains("src/a.rs") && err.contains("src/b.rs"),
+            "{err}"
+        );
+
+        // Long diffs are truncated with a count, not silently cut.
+        let many: Vec<String> = (0..25).map(|i| format!("src/f{i}.rs")).collect();
+        let err = scope_miss_error(&many, "nope");
+        assert!(err.contains("(+15 more)"), "{err}");
+    }
+
+    // 20. test_file_scope_not_found
     #[test]
     fn test_file_scope_not_found() {
         let dir = setup_test_repo();
@@ -1046,13 +1908,21 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "expected error for missing file scope");
+        let err = result.unwrap_err();
         assert!(
-            result.unwrap_err().contains("not found"),
-            "expected 'not found' in error"
+            err.contains("matched no changed file"),
+            "expected a scope-miss error, got {err:?}"
+        );
+        // The old message named only the thing that was missing, which left no
+        // way to tell a typo from a genuinely untouched path. Name what did
+        // change instead.
+        assert!(
+            err.contains("src/main.rs"),
+            "a scope miss must name the changed files, got {err:?}"
         );
     }
 
-    // 15. test_patch_file
+    // 21. test_patch_file
     #[test]
     fn test_patch_file() {
         let dir = setup_test_repo();
@@ -1084,7 +1954,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 16. test_file_to_file
+    // 22. test_file_to_file
     #[test]
     fn test_file_to_file() {
         let dir = setup_test_repo();
@@ -1109,7 +1979,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 17. test_log_mode
+    // 23. test_log_mode
     #[test]
     fn test_log_mode() {
         let dir = setup_test_repo();
@@ -1144,7 +2014,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 18. test_resolve_source_variants
+    // 24. test_resolve_source_variants
     #[test]
     fn test_resolve_source_variants() {
         // Default → uncommitted.
@@ -1267,7 +2137,7 @@ diff --git a/src/main.rs b/src/main.rs
         dir
     }
 
-    // 19. test_search_keeps_unreadable_file_warning
+    // 25. test_search_keeps_unreadable_file_warning
     #[test]
     fn test_search_keeps_unreadable_file_warning() {
         let dir = setup_dangling_gitlink_repo();
@@ -1292,7 +2162,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 21. test_log_spans_the_root_commit
+    // 26. test_log_spans_the_root_commit
     #[test]
     fn test_log_spans_the_root_commit() {
         let dir = setup_test_repo();
@@ -1337,7 +2207,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 22. test_bad_ref_is_an_error_not_no_changes
+    // 27. test_bad_ref_is_an_error_not_no_changes
     #[test]
     fn test_bad_ref_is_an_error_not_no_changes() {
         let dir = setup_test_repo();
@@ -1364,7 +2234,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 23. test_symmetric_ref_range_uses_merge_base
+    // 28. test_symmetric_ref_range_uses_merge_base
     #[test]
     fn test_symmetric_ref_range_uses_merge_base() {
         let dir = setup_diverged_repo();
@@ -1413,7 +2283,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 24. test_symmetric_ref_range_file_scope
+    // 29. test_symmetric_ref_range_file_scope
     #[test]
     fn test_symmetric_ref_range_file_scope() {
         let dir = setup_diverged_repo();

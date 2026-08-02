@@ -105,7 +105,8 @@ enum Command {
         #[arg(default_value = "uncommitted")]
         source: String,
 
-        /// Restrict diff to a specific file or directory.
+        /// Restrict diff to a file or directory (absolute or repo-relative).
+        /// Append `:symbol` to a file path for one symbol, e.g. `src/lib.rs:parse`.
         #[arg(long)]
         scope: Option<String>,
 
