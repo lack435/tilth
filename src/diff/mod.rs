@@ -355,7 +355,7 @@ pub fn diff(
         // `file:function` — one symbol inside one file.
         Some(s) if split_path_symbol(s).is_some() => {
             let (file_part, fn_name) = split_path_symbol(s).unwrap();
-            match select_scope(&paths, file_part) {
+            match select_scope(&paths, &scope_candidates(file_part)) {
                 Some((ScopeSelection::File(i), _)) => {
                     format::format_function_detail(&overlays[i], fn_name)
                 }
@@ -371,7 +371,7 @@ pub fn diff(
             }
         }
 
-        Some(s) => match select_scope(&paths, s) {
+        Some(s) => match select_scope(&paths, &scope_candidates(s)) {
             Some((ScopeSelection::File(i), _)) => format::format_file_detail(&overlays[i], budget),
             Some((ScopeSelection::Directory(under), matched)) => {
                 let scoped: Vec<&FileOverlay> = under.iter().map(|&i| &overlays[i]).collect();
@@ -467,6 +467,13 @@ fn eq_root_component(a: &str, b: &str) -> bool {
     }
 }
 
+/// Does this look like an absolute path? Used only to decide whether asking
+/// git for the repository root could possibly help — a relative scope can never
+/// be under it, so it must not pay for the subprocess.
+fn looks_absolute(p: &str) -> bool {
+    p.starts_with('/') || p.starts_with('\\') || p.as_bytes().get(1) == Some(&b':')
+}
+
 /// Make an absolute scope repo-relative by removing the repository root.
 ///
 /// `prompts/mcp-base.md` tells agents never to pass a bare relative scope, so
@@ -474,6 +481,9 @@ fn eq_root_component(a: &str, b: &str) -> bool {
 /// used to miss, because git's diff paths are repo-relative. Returns `None`
 /// when `scope` is not under the root (including when it is already relative).
 fn strip_repo_root(scope: &str) -> Option<String> {
+    if !looks_absolute(scope) {
+        return None;
+    }
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -526,28 +536,39 @@ fn is_under_dir(path: &str, want: &str) -> bool {
 /// Returns the form that actually matched alongside the selection, so output
 /// can be labelled `src/diff` rather than echoing back the caller's
 /// `C:/dev/tilth/src/diff`.
-fn select_scope(paths: &[String], scope: &str) -> Option<(ScopeSelection, String)> {
-    let direct = normalize_path(scope);
-    let relative = strip_repo_root(scope);
-
-    for want in [Some(direct), relative].into_iter().flatten() {
-        if want.is_empty() {
-            continue;
-        }
-        if let Some(i) = paths.iter().position(|p| is_file_match(p, &want)) {
-            return Some((ScopeSelection::File(i), want));
+fn select_scope(paths: &[String], candidates: &[String]) -> Option<(ScopeSelection, String)> {
+    for want in candidates {
+        if let Some(i) = paths.iter().position(|p| is_file_match(p, want)) {
+            return Some((ScopeSelection::File(i), want.clone()));
         }
         let under: Vec<usize> = paths
             .iter()
             .enumerate()
-            .filter(|(_, p)| is_under_dir(p, &want))
+            .filter(|(_, p)| is_under_dir(p, want))
             .map(|(i, _)| i)
             .collect();
         if !under.is_empty() {
-            return Some((ScopeSelection::Directory(under), want));
+            return Some((ScopeSelection::Directory(under), want.clone()));
         }
     }
     None
+}
+
+/// The forms of a scope worth matching, most literal first.
+///
+/// Resolving the repository root shells out to git, so this is computed once
+/// per command. Log mode calls `select_scope` once per commit — building the
+/// candidates in there would have spawned a subprocess per commit, the same
+/// per-item-subprocess shape as the merge-base call fixed in #112.
+fn scope_candidates(scope: &str) -> Vec<String> {
+    let mut out = vec![normalize_path(scope)];
+    if let Some(relative) = strip_repo_root(scope) {
+        if !out.contains(&relative) {
+            out.push(relative);
+        }
+    }
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 /// Split a scope into `(path, symbol)` if it uses the `file:function` form.
@@ -764,13 +785,15 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
     // while `--scope src/diff` errored. Two different wrong answers to the same
     // question.
     if let Some(file_scope) = scope {
+        // Built once, outside the loop: it can shell out to git.
+        let candidates = scope_candidates(file_scope);
         for summary in &mut summaries {
             let paths: Vec<String> = summary
                 .overlays
                 .iter()
                 .map(|o| normalize_path(&o.path.to_string_lossy()))
                 .collect();
-            let keep: HashSet<usize> = match select_scope(&paths, file_scope) {
+            let keep: HashSet<usize> = match select_scope(&paths, &candidates) {
                 Some((ScopeSelection::File(i), _)) => std::iter::once(i).collect(),
                 Some((ScopeSelection::Directory(under), _)) => under.into_iter().collect(),
                 None => HashSet::new(),
@@ -1400,23 +1423,23 @@ mod tests {
 
         // Exact and component-boundary suffix.
         assert_eq!(
-            select_scope(&p, "src/diff/parse.rs").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("src/diff/parse.rs")).map(|(s, _)| s),
             Some(ScopeSelection::File(0))
         );
         assert_eq!(
-            select_scope(&p, "parse.rs").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("parse.rs")).map(|(s, _)| s),
             Some(ScopeSelection::File(0))
         );
         assert_eq!(
-            select_scope(&p, "diff/parse.rs").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("diff/parse.rs")).map(|(s, _)| s),
             Some(ScopeSelection::File(0))
         );
 
         // A bare substring is not a path. `arse.rs` used to select parse.rs and
         // answer confidently about a file nobody asked for.
-        assert!(select_scope(&p, "arse.rs").is_none());
-        assert!(select_scope(&p, "refer_tools.py").is_none());
-        assert!(select_scope(&p, "rc").is_none());
+        assert!(select_scope(&p, &scope_candidates("arse.rs")).is_none());
+        assert!(select_scope(&p, &scope_candidates("refer_tools.py")).is_none());
+        assert!(select_scope(&p, &scope_candidates("rc")).is_none());
     }
 
     #[test]
@@ -1429,31 +1452,50 @@ mod tests {
 
         // The reported case: a directory selects everything beneath it.
         assert_eq!(
-            select_scope(&p, "tools/hooks").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("tools/hooks")).map(|(s, _)| s),
             Some(ScopeSelection::Directory(vec![0, 1]))
         );
         // Trailing slash is the same request.
         assert_eq!(
-            select_scope(&p, "tools/hooks/").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("tools/hooks/")).map(|(s, _)| s),
             Some(ScopeSelection::Directory(vec![0, 1]))
         );
         // Directories get the same suffix latitude files do.
         assert_eq!(
-            select_scope(&p, "hooks").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("hooks")).map(|(s, _)| s),
             Some(ScopeSelection::Directory(vec![0, 1]))
         );
         // Windows separators normalize to git's.
         assert_eq!(
-            select_scope(&p, r"tools\hooks").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates(r"tools\hooks")).map(|(s, _)| s),
             Some(ScopeSelection::Directory(vec![0, 1]))
         );
         // A directory that changed nothing is a miss, not an empty success.
-        assert!(select_scope(&p, "tools/other").is_none());
+        assert!(select_scope(&p, &scope_candidates("tools/other")).is_none());
         // A file match still wins over a directory match.
         assert_eq!(
-            select_scope(&p, "src/main.rs").map(|(s, _)| s),
+            select_scope(&p, &scope_candidates("src/main.rs")).map(|(s, _)| s),
             Some(ScopeSelection::File(2))
         );
+    }
+
+    #[test]
+    fn relative_scopes_never_consult_git() {
+        // `strip_repo_root` shells out. A relative scope can never live under
+        // the repo root, so it must bail before paying for that — log mode
+        // resolves a scope per commit, and this is the same per-item-subprocess
+        // shape as the merge-base call fixed in #112.
+        assert!(!looks_absolute("src/main.rs"));
+        assert!(!looks_absolute("tools/hooks"));
+        assert!(looks_absolute("/home/u/repo/src/main.rs"));
+        assert!(looks_absolute(r"C:\dev\t\src\main.rs"));
+        assert!(looks_absolute("C:/dev/t/src/main.rs"));
+
+        // Holds with no repository around it, which is the proof there was no
+        // git call: a relative scope yields exactly one candidate, itself.
+        assert_eq!(strip_repo_root("src/main.rs"), None);
+        assert_eq!(scope_candidates("src/main.rs"), vec!["src/main.rs"]);
+        assert_eq!(scope_candidates(r"tools\hooks\"), vec!["tools/hooks"]);
     }
 
     #[test]
