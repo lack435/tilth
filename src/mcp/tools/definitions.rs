@@ -214,7 +214,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Restrict diff output to a specific file or directory path."
+                        "description": "Restrict diff output to a file or directory path (absolute or repo-relative). A file gives per-symbol detail; a directory gives an overview of every changed file beneath it. Append ':symbol' to a file path for one symbol's detail, e.g. 'src/lib.rs:parse'."
                     },
                     "a": {
                         "type": "string",
