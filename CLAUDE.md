@@ -104,7 +104,7 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
 
 ## Version bumps
 
-Update version in **three** places: `Cargo.toml`, `npm/package.json`, and `Cargo.lock` (via `cargo update --workspace`, which relocks only `tilth` itself). Then tag `v<version>` on main. The release workflow builds with `--locked`, which refuses a lockfile whose recorded version disagrees with the manifest — forget `Cargo.lock` and all five build jobs fail. Verify with `cargo build --release --locked` before tagging.
+Update version in **three** places: `Cargo.toml`, `npm/package.json`, and `Cargo.lock` (via `cargo update --workspace`, which relocks only `tilth` itself). Then tag `v<version>` on main. The release workflow builds with `--locked`, which refuses a lockfile whose recorded version disagrees with the manifest, so all three must agree. `version-check` compares all three against the tag and fails the release in one cheap job before the build matrix starts — it names the file and the fix. Verify with `cargo build --release --locked` before tagging.
 
 Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both names have an OIDC trusted publisher on npmjs.com (`jahala/tilth` + `release.yml`), so releases need no token. `@plotplot/tilth` was bootstrapped with a one-time manual publish — npm cannot configure trusted publishing for a package that does not exist yet.
 

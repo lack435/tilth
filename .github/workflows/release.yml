@@ -19,6 +19,11 @@ jobs:
   # across three operating systems, after the cross toolchain has been installed on each — with
   # a lockfile error that names no missed step. Checking the lock here turns that into one
   # message from one cheap job.
+  #
+  # Scope: this compares the version field only — the thing the three-place bump ritual gets
+  # wrong. A lock that is stale some other way (a dependency added without relocking) still
+  # reaches `--locked` in the matrix; `ci.yml` builds with `--locked` to catch that at PR time,
+  # while the developer is still iterating.
   version-check:
     runs-on: ubuntu-latest
     steps:
@@ -41,7 +46,7 @@ jobs:
             exit 1
           fi
           if [ -z "$LOCK_VER" ]; then
-            echo "::error::Could not read tilth's version from Cargo.lock — its [[package]] entry may have moved or the lockfile format changed"
+            echo "::error::Could not read tilth's version from Cargo.lock — the file may be missing, or its [[package]] entry moved or changed shape"
             exit 1
           fi
           if [ "$LOCK_VER" != "$TAG" ]; then
