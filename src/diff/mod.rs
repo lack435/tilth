@@ -116,6 +116,13 @@ pub struct FileOverlay {
     pub attributed_hunks: Vec<(String, Vec<DiffLine>)>,
     pub conflicts: Vec<Conflict>,
     pub new_content: Option<String>,
+    /// Why symbol analysis was abandoned for this file, if it was.
+    ///
+    /// An overlay with no symbols is otherwise indistinguishable from a file
+    /// git reported as changed but whose structure did not move — so the
+    /// formatters must say "could not analyze" rather than render a confident
+    /// `+0/−0`. See issue #111.
+    pub analysis_failed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -255,8 +262,18 @@ pub fn diff(
     // 3. Cross-file move detection.
     overlay::cross_file_matching(&mut overlays);
 
-    // 4. Signature warnings.
+    // 4. Signature warnings, plus any file whose analysis was abandoned.
+    // The latter are collected before the search filter below, which drops
+    // symbol-less overlays and would otherwise make the failure disappear.
     let mut warnings = overlay::signature_warnings(&overlays);
+    for overlay in &overlays {
+        if let Some(reason) = &overlay.analysis_failed {
+            warnings.push(format!(
+                "could not analyze `{}` — {reason}; symbol counts for it are missing, not zero",
+                overlay.path.display()
+            ));
+        }
+    }
 
     // 5. Search filter.
     if let Some(term) = search {
@@ -1110,6 +1127,115 @@ diff --git a/src/main.rs b/src/main.rs
             resolve_source(Some("staged"), None, None, Some("x.patch"), None).unwrap(),
             DiffSource::Patch(_)
         ));
+    }
+
+    /// Diverge `base` and `feat` from a shared root, one new function on each
+    /// side, so that merge-base(base, feat) is neither branch tip. That is the
+    /// only topology where `base..feat` and `base...feat` disagree.
+    fn setup_diverged_repo() -> tempfile::TempDir {
+        let dir = setup_test_repo();
+        let p = dir.path();
+        // `git init` picks master or main depending on the host's config; pin it.
+        git(p, &["branch", "-M", "base"]);
+        let main_rs = p.join("src/main.rs");
+
+        git(p, &["checkout", "-b", "feat"]);
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            format!("{content}\nfn feat_only() {{\n    println!(\"feat\");\n}}\n"),
+        )
+        .unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "feat side"]);
+
+        git(p, &["checkout", "base"]);
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            format!("{content}\nfn base_only() {{\n    println!(\"base\");\n}}\n"),
+        )
+        .unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "base side"]);
+
+        git(p, &["checkout", "feat"]);
+        dir
+    }
+
+    // 19. test_symmetric_ref_range_uses_merge_base
+    #[test]
+    fn test_symmetric_ref_range_uses_merge_base() {
+        let dir = setup_diverged_repo();
+
+        // `base...feat` is merge-base(base, feat) vs feat. `feat_only` is the
+        // only symbol added on that path; `base_only` never exists on either
+        // side of it. Before #111 the ref split at the first `..`, leaving a
+        // new-side rev of `.feat` that `git show` rejects — so every file's
+        // overlay was abandoned and this rendered as an authoritative zero.
+        let symmetric = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("base...feat".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            symmetric.contains("feat_only"),
+            "`base...feat` must report the symbol added on feat:\n{symmetric}"
+        );
+        assert!(
+            !symmetric.contains("base_only"),
+            "`base...feat` must not report base-side symbols — merge-base, not base:\n{symmetric}"
+        );
+        assert!(
+            !symmetric.contains("analysis unavailable"),
+            "`base...feat` must resolve both sides:\n{symmetric}"
+        );
+
+        // The two-dot spelling asks a different question and must keep its own
+        // answer: relative to `base`, `base_only` is gone.
+        let two_dot = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("base..feat".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            two_dot.contains("base_only"),
+            "`base..feat` must still diff against the base tip:\n{two_dot}"
+        );
+    }
+
+    // 20. test_symmetric_ref_range_file_scope
+    #[test]
+    fn test_symmetric_ref_range_file_scope() {
+        let dir = setup_diverged_repo();
+
+        // The reported symptom, verbatim: a scoped symmetric diff answering
+        // "0 symbols touched, +0/−0 lines" for a file that really changed.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("base...feat".to_string()),
+            Some("src/main.rs"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !result.contains("0 symbols touched"),
+            "a real change must not report zero symbols:\n{result}"
+        );
+        assert!(
+            result.contains("feat_only"),
+            "scoped symmetric diff must name the added symbol:\n{result}"
+        );
     }
 }
 // test

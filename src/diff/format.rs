@@ -90,6 +90,16 @@ pub(crate) fn format_overview(
             continue;
         }
 
+        // Content fetch failed — say so. An empty symbol list here would read
+        // exactly like "changed, but no symbol moved" (issue #111).
+        if let Some(reason) = &overlay.analysis_failed {
+            let _ = writeln!(
+                out,
+                "## {rel_path} (symbol analysis unavailable — {reason})"
+            );
+            continue;
+        }
+
         // Normal file — show non-Unchanged symbol changes.
         let visible: Vec<&SymbolChange> = overlay
             .symbol_changes
@@ -154,6 +164,15 @@ pub(crate) fn format_overview(
 pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> String {
     let scope = Path::new(".");
     let rel_path = rel(&overlay.path, scope);
+
+    // Never render the `0 symbols touched, +0/−0 lines` header off a failed
+    // content fetch — git said this file changed, and that header is read as
+    // evidence that it did not (issue #111).
+    if let Some(reason) = &overlay.analysis_failed {
+        return format!(
+            "# Diff: {rel_path} — symbol analysis unavailable\n\ngit reported this file as changed, but its content could not be read: {reason}\n"
+        );
+    }
 
     let (insertions, deletions) = count_insertions_deletions(overlay);
 
@@ -223,6 +242,15 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
 
 /// Format detailed view of a single named function within a file's diff.
 pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> String {
+    // `not found in diff` would be a lie when the symbol list is empty only
+    // because the file's content could not be read (issue #111).
+    if let Some(reason) = &overlay.analysis_failed {
+        return format!(
+            "# Diff: {} — symbol analysis unavailable\n\ngit reported this file as changed, but its content could not be read: {reason}\n",
+            overlay.path.display()
+        );
+    }
+
     let change = overlay.symbol_changes.iter().find(|c| c.name == fn_name);
 
     let Some(change) = change else {
@@ -552,6 +580,7 @@ mod tests {
             attributed_hunks: Vec::new(),
             conflicts: Vec::new(),
             new_content: None,
+            analysis_failed: None,
         }
     }
 
@@ -583,6 +612,53 @@ mod tests {
 
     // Helper: build file_meta slice referencing the overlays' paths.
     // Since lifetimes are tricky with inline vec, callers build it manually.
+
+    /// An overlay whose content fetch failed — no symbols, but a reason.
+    fn make_abandoned_overlay(path: &str, reason: &str) -> FileOverlay {
+        let mut overlay = make_overlay(path, Vec::new());
+        overlay.analysis_failed = Some(reason.to_string());
+        overlay
+    }
+
+    // Every formatter must refuse to answer off a failed content fetch. The
+    // three paths render independently, so a fix to one leaves the others
+    // reporting a confident zero (issue #111).
+    #[test]
+    fn abandoned_overlay_never_renders_as_no_change() {
+        let overlay = make_abandoned_overlay("src/lib.rs", "git show .feat:src/lib.rs: bad object");
+
+        let detail = format_file_detail(&overlay, None);
+        assert!(
+            !detail.contains("0 symbols touched"),
+            "file detail claimed zero symbols for an unreadable file:\n{detail}"
+        );
+        assert!(
+            detail.contains("analysis unavailable") && detail.contains("bad object"),
+            "file detail must name the failure and its reason:\n{detail}"
+        );
+
+        let func = format_function_detail(&overlay, "some_fn");
+        assert!(
+            !func.contains("not found in diff"),
+            "`not found` is a lie when the file was never read:\n{func}"
+        );
+        assert!(
+            func.contains("analysis unavailable"),
+            "function detail must report the failure:\n{func}"
+        );
+
+        let path = overlay.path.clone();
+        let meta = vec![(path.as_path(), false, false)];
+        let overview = format_overview(&[overlay], &meta, &[], "base...feat", None);
+        assert!(
+            !overview.contains("(0 symbols)"),
+            "overview claimed zero symbols for an unreadable file:\n{overview}"
+        );
+        assert!(
+            overview.contains("analysis unavailable"),
+            "overview must flag the unreadable file:\n{overview}"
+        );
+    }
 
     // 1. All 6 change types produce correct markers
     #[test]

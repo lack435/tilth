@@ -210,7 +210,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat'). Ignored when a, b, patch, or log is set."
+                        "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat', 'main...feat'). Both range spellings follow git: 'a..b' compares the two tips, 'a...b' compares their merge base against b. Ignored when a, b, patch, or log is set."
                     },
                     "scope": {
                         "type": "string",

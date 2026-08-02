@@ -100,7 +100,8 @@ enum Command {
     },
     /// Show structural diff with function-level change summaries.
     Diff {
-        /// Diff source: uncommitted (default), staged, or a git ref (e.g. HEAD~1, main..feat).
+        /// Diff source: uncommitted (default), staged, or a git ref (e.g. HEAD~1, main..feat,
+        /// main...feat — `...` is git's symmetric range, merge base vs the right side).
         #[arg(default_value = "uncommitted")]
         source: String,
 
