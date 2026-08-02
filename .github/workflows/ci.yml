@@ -21,8 +21,17 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
+      # `--locked` here mirrors what the release matrix enforces with
+      # `cargo build --release --locked`. Without it, a PR that changes dependencies but
+      # forgets to commit Cargo.lock passes CI — cargo just updates the lockfile in the
+      # runner and throws it away — and the disagreement only surfaces at tag time, where
+      # it fails five build jobs across three operating systems. This job already resolves
+      # and downloads the dependency graph, so enforcing the lockfile costs nothing.
+      #
+      # `cargo fmt` above is left alone: it does not resolve dependencies, so it has no
+      # lockfile to disagree with.
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked
 
   markdown:
     runs-on: ubuntu-latest
