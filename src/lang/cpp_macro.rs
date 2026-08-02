@@ -1,4 +1,9 @@
-//! Blank out export macros in C/C++ type heads before the grammar sees them.
+//! Blank out macros the C/C++ grammar cannot parse, before it sees them.
+//!
+//! Two masks, with the same mechanism and two different targets: `mask_export_macros` for
+//! dllexport-style macros *inside* a type head, and `mask_annotation_macros` for Unreal
+//! reflection annotations, which sit anywhere and derail recovery from a distance. Everything
+//! below about spaces, positions and the scanner applies to both.
 //!
 //! `class MYLIB_API Widget : public Base { … };` — how essentially every Windows C++
 //! library spells dllexport — does not parse. tree-sitter-cpp has no way to know
@@ -102,16 +107,160 @@ pub fn mask_export_macros(content: &str) -> Option<String> {
     if spans.is_empty() {
         return None;
     }
-    // Byte-wise, then revalidated: every span is an ASCII identifier and every
-    // replacement an ASCII space, so this cannot split a char boundary — but an
-    // `unsafe` block to save one linear validation of a source file is a poor trade.
-    // ASCII bytes never occur inside a multi-byte UTF-8 sequence, so the scanner
+    blank_spans(content.as_bytes(), &spans)
+}
+
+/// Overwrite `spans` with spaces, **leaving control bytes where they are**.
+///
+/// Preserving newlines is not a detail — it is the whole contract. Callers parse the masked
+/// text and then read every piece of text from the *original* via `lines[row]`, so a mask that
+/// removes a line makes every row below it index the wrong source line. The failure is silent
+/// and it is not confined to the masked construct: a `UMETA(X = "a",\n Y = "b")` wrapped across
+/// two lines shifted everything after it, so the `struct` two lines below was reported at the
+/// wrong line, under the *next* struct's name, and the last one vanished.
+///
+/// A span can legitimately contain a newline — a wrapped annotation or a
+/// `UE_DEPRECATED(5.4,\n "use Foo")` in a type head — so refusing multi-line spans would give
+/// up the masking exactly where it is needed. Keeping the control bytes gives both: the tokens
+/// are gone and the line structure is untouched.
+///
+/// `\r` is preserved for the same reason on CRLF files, where dropping it would shorten a row
+/// that tree-sitter still counts — the mechanism behind `clamp_col`'s existence.
+fn blank_spans(bytes: &[u8], spans: &[(usize, usize)]) -> Option<String> {
+    // Byte-wise, then revalidated: every replacement is an ASCII space, so this cannot split a
+    // char boundary — but an `unsafe` block to save one linear validation of a source file is a
+    // poor trade. ASCII bytes never occur inside a multi-byte UTF-8 sequence, so the scanner
     // cannot have picked a span that starts mid-character either.
-    let mut out = content.as_bytes().to_vec();
-    for (start, end) in spans {
-        out[start..end].fill(b' ');
+    let mut out = bytes.to_vec();
+    for &(start, end) in spans {
+        for b in &mut out[start..end] {
+            if !b.is_ascii_control() {
+                *b = b' ';
+            }
+        }
     }
     String::from_utf8(out).ok()
+}
+
+/// Annotation macros blanked wherever they appear, arguments included.
+///
+/// `UMETA` is here because of what it does to a `UENUM`, and the interaction is worth
+/// stating precisely because neither half is broken alone:
+///
+/// ```text
+/// UENUM(BlueprintType)                  // alone: parses, macro becomes an expression_statement
+/// enum class EMode : uint8
+/// {
+///     A UMETA(DisplayName = "Alpha"),   // alone: parses, enum_specifier intact
+///     B UMETA(DisplayName = "Beta")
+/// };
+/// ```
+///
+/// Together, tree-sitter-cpp absorbs the `enum` keyword into an `ERROR` node — and that node
+/// does not stop at the enum. How far it reaches depends on what follows, and at the extreme
+/// it is the whole file: `walk_top_level` reads the root's children, so a root whose only
+/// child is the `ERROR` yields an empty outline and nothing findable by name.
+///
+/// Measured over the 262 headers in an Unreal Engine `Engine/Source` tree that contain a
+/// `UMETA`, masking took the total outline entry count from 15 325 to 18 755. The
+/// distribution matters more than the total: most files gained a handful, and the worst had
+/// lost nearly everything — one component header went from 11 entries to 521, another from 1
+/// to 143. Six files *lost* entries, all of them artifacts of the misparse being removed:
+/// `fn UMETA`, `class <anonymous>` and `prop BlueprintType` placeholders, replaced by the real
+/// enums and structs that had been hiding behind them.
+///
+/// Blanking `UMETA` removes the interaction, and costs nothing: it is pure editor metadata —
+/// display names and tooltips — so no symbol anybody searches for lives inside one. It also
+/// removes the artifact `read::outline::code` deduplicates, where each annotated enumerator
+/// parsed as a `function_declarator` and the outline gained one `fn UMETA` per enumerator.
+///
+/// The other UE macros are deliberately absent. `UCLASS`, `USTRUCT`, `UPROPERTY` and
+/// `UFUNCTION` each leave an `ERROR` or an `expression_statement` behind, but recovery is
+/// local — the declaration after them still parses — so masking them would change tested
+/// output for no correctness gain.
+const ANNOTATION_MACROS: [&[u8]; 1] = [b"UMETA"];
+
+/// Newlines an annotation's argument list may cross before the span is refused.
+///
+/// Three, because a wrapped `UMETA(DisplayName = "…",\n ToolTip = "…")` is ordinary and a
+/// clang-formatted one can take a third line, while an unterminated `UMETA(` reaching a stray
+/// `)` in unrelated code is unbounded. See the call site for why an over-long span is dropped
+/// rather than clipped.
+const MAX_ANNOTATION_LINES: usize = 3;
+
+/// Newlines in `span`. Named rather than inlined so the bound above reads as a line count.
+fn bytecount_newlines(span: &[u8]) -> usize {
+    memchr::memchr_iter(b'\n', span).count()
+}
+
+/// Rewrite `content` with `ANNOTATION_MACROS` invocations replaced by spaces.
+///
+/// `None` when there is nothing to mask, which is every file that is not UE-flavoured C++.
+/// Length- and position-preserving in the same way as `mask_export_macros`, and composable
+/// with it for that reason: both only ever overwrite ASCII spans with ASCII spaces, so
+/// neither can move a byte offset the other recorded.
+pub fn mask_annotation_macros(content: &str) -> Option<String> {
+    let bytes = content.as_bytes();
+    // The overwhelmingly common case is a file with no annotation at all, and this scan runs
+    // on every C/C++ file parsed. One SIMD pass rejects those without touching the scanner.
+    if !ANNOTATION_MACROS
+        .iter()
+        .any(|m| memchr::memmem::find(bytes, m).is_some())
+    {
+        return None;
+    }
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut scan = Scanner { bytes, pos: 0 };
+
+    while scan.pos < bytes.len() {
+        if scan.skip_trivia() {
+            continue;
+        }
+        let b = bytes[scan.pos];
+        if !is_ident_start(b) {
+            scan.pos += 1;
+            continue;
+        }
+        let start = scan.pos;
+        let name_end = scan.ident_end(start);
+        scan.pos = name_end;
+        if !ANNOTATION_MACROS.contains(&&bytes[start..name_end]) {
+            continue;
+        }
+        // Only an *invocation* is masked. A bare `UMETA` identifier — in a comment the
+        // scanner already skipped, or as somebody's variable — is left alone, because
+        // blanking a name that is not a macro would delete real code.
+        let after_name = scan.pos;
+        while scan.pos < bytes.len() && scan.skip_trivia() {}
+        if bytes.get(scan.pos) != Some(&b'(') {
+            scan.pos = after_name;
+            continue;
+        }
+        if scan.skip_balanced(b'(', b')').is_some() {
+            // Through the closing paren, so the arguments go too — including the nested
+            // parens of `UMETA(ToolTip = "Fire (primary)")`, which `skip_balanced` counts
+            // and `skip_trivia` keeps out of, since the inner ones are inside a literal.
+            //
+            // Bounded by line count, because an *unterminated* `UMETA(` does not fail — it
+            // runs to whatever stray `)` appears next, which can be many declarations later,
+            // and every identifier in between would be blanked. A real annotation is a
+            // display name or a tooltip; it wraps onto a second or third line and no further.
+            // Past the bound the span is dropped rather than truncated: a half-blanked
+            // argument list is a worse input to the grammar than an unmasked one.
+            let lines_spanned = bytecount_newlines(&bytes[start..scan.pos]);
+            if lines_spanned <= MAX_ANNOTATION_LINES {
+                spans.push((start, scan.pos));
+            }
+        } else {
+            scan.pos = after_name;
+        }
+    }
+
+    if spans.is_empty() {
+        return None;
+    }
+    blank_spans(bytes, &spans)
 }
 
 struct Scanner<'a> {
@@ -430,16 +579,30 @@ fn is_ident_continue(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_export_macros;
+    use super::{mask_annotation_macros, mask_export_macros};
 
     /// What masking must never do: change a byte offset. Every downstream position —
     /// outline ranges, search line numbers, edit anchors — is read straight off the
     /// tree built from the masked text and used against the original.
+    ///
+    /// **Line count is checked here as well as length, and equal length does not imply it.**
+    /// Blanking a newline keeps the byte count identical while deleting a row, so a mask can
+    /// satisfy every other assertion in this file and still make the tree disagree with the
+    /// source about which line anything is on. That is exactly what the annotation mask did to
+    /// a wrapped `UMETA(…,\n …)`: two structs below it were reported at the wrong lines under
+    /// each other's names, and a third disappeared. Length alone was the assertion that let it
+    /// through.
     fn assert_positions_preserved(src: &str, masked: &str) {
         assert_eq!(
             src.len(),
             masked.len(),
             "masking changed the length:\n{src:?}\n{masked:?}"
+        );
+        assert_eq!(
+            src.lines().count(),
+            masked.lines().count(),
+            "masking changed the line count — every row below the mask now indexes the wrong \
+             source line:\n{src:?}\n{masked:?}"
         );
         for (i, (a, b)) in src.bytes().zip(masked.bytes()).enumerate() {
             assert!(
@@ -668,5 +831,235 @@ struct OTHER_API C : public A { int Y; };
         assert!(masked.contains("class     A { int X; };"), "{masked}");
         assert!(masked.contains("class B bar;"), "{masked}");
         assert!(masked.contains("struct           C : public A"), "{masked}");
+    }
+
+    // -- annotation macros -------------------------------------------------------------
+
+    #[track_caller]
+    fn annotation_masks_to(src: &str, expected: &str) {
+        let masked =
+            mask_annotation_macros(src).unwrap_or_else(|| panic!("nothing masked in {src:?}"));
+        assert_positions_preserved(src, &masked);
+        // The check this helper originally skipped, which is how the newline bug shipped.
+        assert_only_head_bytes_blanked(src, &masked);
+        assert_eq!(masked, expected, "for {src:?}");
+    }
+
+    /// A wrapped annotation — the shape that broke. The mask must remove the tokens and leave
+    /// the line structure exactly as it found it, so the declarations below keep their lines.
+    #[test]
+    fn masks_a_wrapped_umeta_without_moving_any_line() {
+        let src = "\
+enum class EMode : uint8
+{
+    A UMETA(X = \"a\",
+            Y = \"b\"),
+    B
+};
+struct FAlpha { int A; };
+struct FBravo { int B; };
+";
+        let masked = mask_annotation_macros(src).expect("wrapped annotation masks");
+        assert_positions_preserved(src, &masked);
+        assert_only_head_bytes_blanked(src, &masked);
+        assert_eq!(masked.matches("UMETA").count(), 0, "{masked}");
+        // The load-bearing consequence, stated as line identity rather than as a count.
+        for (i, (a, b)) in src.lines().zip(masked.lines()).enumerate() {
+            if !a.contains("UMETA") && !a.trim_start().starts_with("Y =") {
+                assert_eq!(a, b, "line {} moved or changed", i + 1);
+            }
+        }
+    }
+
+    /// The export mask has the same newline hazard, and no test covered it.
+    ///
+    /// `span_end_after` can produce a span containing a `\n` — a `UE_DEPRECATED(5.4,\n "use
+    /// Foo")` in a type head is the ordinary spelling — and the unconditional fill this used
+    /// before `blank_spans` blanked it. Measured on the shape below: `Widget` resolved to no
+    /// definition at all, and a usage was labelled with a scope name synthesised from the
+    /// desynced row (a fragment of the deprecation string). The 20 000-iteration fuzz never
+    /// produced a maskable head with a newline inside its parens, which is why this is written
+    /// as a fixture rather than left to it.
+    #[test]
+    fn masks_a_wrapped_export_macro_without_moving_any_line() {
+        let src = "\
+class UE_DEPRECATED(5.4,
+    \"use Foo\") MYLIB_API Widget : public Base { void W(); };
+struct FTrailing { int X; };
+";
+        let masked = mask_export_macros(src).expect("wrapped head masks");
+        assert_positions_preserved(src, &masked);
+        assert_only_head_bytes_blanked(src, &masked);
+        assert!(masked.contains("Widget"), "type name blanked:\n{masked}");
+        assert!(
+            masked.contains("struct FTrailing"),
+            "the declaration below moved or was blanked:\n{masked}"
+        );
+    }
+
+    /// An unterminated invocation runs to whatever `)` comes next, which is unbounded. The
+    /// span is refused past `MAX_ANNOTATION_LINES` rather than blanking unrelated code.
+    #[test]
+    fn refuses_an_unterminated_annotation_that_would_run_away() {
+        let src = "\
+enum class EMode : uint8
+{
+    A UMETA(DisplayName = \"a\",
+    B
+};
+struct FAlpha { int A; };
+void Helper(int x);
+struct FBravo { int B; };
+int Tail(void) { return 0; }
+";
+        // Either nothing masks, or whatever did masks without touching the code below.
+        if let Some(masked) = mask_annotation_macros(src) {
+            assert_positions_preserved(src, &masked);
+            assert_only_head_bytes_blanked(src, &masked);
+            for name in ["FAlpha", "Helper", "FBravo", "Tail"] {
+                assert!(
+                    masked.contains(name),
+                    "runaway span blanked {name}:\n{masked}"
+                );
+            }
+        }
+    }
+
+    /// Blank exactly the invocation — name through closing paren — and nothing either side.
+    /// The expected string is built rather than typed so it states the rule instead of a
+    /// space count nobody can verify by eye.
+    #[track_caller]
+    fn blanks_only(prefix: &str, invocation: &str, suffix: &str) {
+        let src = format!("{prefix}{invocation}{suffix}");
+        let expected = format!("{prefix}{}{suffix}", " ".repeat(invocation.len()));
+        annotation_masks_to(&src, &expected);
+    }
+
+    #[test]
+    fn masks_a_umeta_invocation_with_its_arguments() {
+        blanks_only("    EPistol ", "UMETA(DisplayName = \"Pistol\")", ",\n");
+    }
+
+    /// The argument list is matched by balanced parens, not by "up to the next `)`", so a
+    /// tooltip containing punctuation does not cut the mask short and leave a stray `)`.
+    #[test]
+    fn masks_a_umeta_whose_argument_contains_parentheses() {
+        blanks_only("    A ", "UMETA(ToolTip = \"Fire (primary)\")", ",\n");
+    }
+
+    /// Every enumerator in a list, not just the first — the shape that actually occurs.
+    #[test]
+    fn masks_every_umeta_in_an_enumerator_list() {
+        let src = "\
+UENUM(BlueprintType)
+enum class EAmmo : uint8
+{
+    EPistol UMETA(DisplayName = \"Pistol\"),
+    ERifle  UMETA(DisplayName = \"Rifle\")
+};
+";
+        let masked = mask_annotation_macros(src).expect("two annotations mask");
+        assert_positions_preserved(src, &masked);
+        assert_eq!(masked.matches("UMETA").count(), 0, "{masked}");
+        // The enumerators themselves, the enum head and every newline survive.
+        assert!(masked.contains("    EPistol "), "{masked}");
+        assert!(masked.contains("    ERifle  "), "{masked}");
+        assert!(masked.contains("enum class EAmmo : uint8"), "{masked}");
+        assert_eq!(masked.lines().count(), src.lines().count());
+    }
+
+    /// Only invocations. A bare identifier is somebody's code, and blanking it would delete
+    /// a real name — the mask must be able to tell the two apart.
+    #[test]
+    fn leaves_a_bare_annotation_identifier_alone() {
+        assert!(mask_annotation_macros("int UMETA = 1;\n").is_none());
+        assert!(mask_annotation_macros("return UMETA;\n").is_none());
+        // In a comment or a string it is not code at all, and the scanner skips both.
+        assert!(mask_annotation_macros("// UMETA(DisplayName = \"x\")\n").is_none());
+        assert!(mask_annotation_macros("const char* s = \"UMETA(x)\";\n").is_none());
+    }
+
+    #[test]
+    fn leaves_files_without_annotations_untouched() {
+        assert!(mask_annotation_macros("class A { int x; };\n").is_none());
+        assert!(mask_annotation_macros("").is_none());
+        // The other UE macros are deliberately not masked — see `ANNOTATION_MACROS`.
+        assert!(mask_annotation_macros("UCLASS(Blueprintable)\nclass A {};\n").is_none());
+        assert!(mask_annotation_macros("UPROPERTY(EditAnywhere)\nint32 H;\n").is_none());
+    }
+
+    /// The reason this mask exists, asserted at the level that motivated it.
+    ///
+    /// A `UENUM` whose enumerators carry `UMETA` collapsed **the whole rest of the header**
+    /// into one root `ERROR` node. `walk_top_level` reads the root's children, so the outline
+    /// of a 936-line UE header came back empty and nothing declared below the enum was
+    /// findable by name.
+    ///
+    /// The fixture is a real UE header shape rather than a reduced one, and that is
+    /// deliberate: a simplified version — bare `struct FData { int Count; };` after the enum —
+    /// recovers on its own and does *not* reproduce the cascade. The unmasked half is asserted
+    /// first so this cannot silently stop testing anything if a grammar update improves
+    /// recovery.
+    ///
+    /// The masked half goes through `parse_masked`, the production path, so it covers the
+    /// composition with `mask_export_macros` (`PROBEMODULE_API`) rather than this mask alone.
+    #[test]
+    fn a_uenum_with_umeta_no_longer_swallows_the_declarations_after_it() {
+        let src = "\
+UENUM(BlueprintType)
+enum class EProbeMode : uint8
+{
+    ModeAlpha UMETA(DisplayName = \"Alpha\"),
+    ModeBeta  UMETA(DisplayName = \"Beta\")
+};
+
+USTRUCT(BlueprintType)
+struct PROBEMODULE_API FProbeData
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere)
+    int32 ProbeCount = 0;
+};
+
+UCLASS(Blueprintable)
+class PROBEMODULE_API AProbeActor : public AActor
+{
+    GENERATED_BODY()
+public:
+    AProbeActor();
+};
+";
+        let lang = crate::types::Lang::Cpp;
+        let ts = crate::lang::outline::outline_language(lang).expect("grammar");
+        let root_kinds = |tree: &tree_sitter::Tree| -> Vec<String> {
+            let mut c = tree.root_node().walk();
+            tree.root_node()
+                .children(&mut c)
+                .map(|n| n.kind().to_string())
+                .collect()
+        };
+
+        // The "before" is the *export-masked* text, not the raw file, because that is what
+        // production fed the parser before this mask existed — and the distinction matters:
+        // the raw file recovers a `class_specifier`, and blanking `PROBEMODULE_API` is what
+        // tips recovery over into swallowing everything. Reproducing the bug needs both.
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts).expect("grammar loads");
+        let exports_only = mask_export_macros(src).expect("the API macros mask");
+        let before = root_kinds(&parser.parse(&exports_only, None).expect("parse succeeds"));
+        assert_eq!(
+            before,
+            vec!["ERROR"],
+            "fixture no longer reproduces the cascade it guards"
+        );
+
+        // Masked: every declaration is back at the top level, where `walk_top_level` sees it.
+        let fixed = root_kinds(&crate::lang::parse_masked(src, Some(lang), &ts).expect("parses"));
+        for want in ["enum_specifier", "struct_specifier", "class_specifier"] {
+            assert!(
+                fixed.contains(&want.to_string()),
+                "missing {want} in {fixed:?}"
+            );
+        }
     }
 }

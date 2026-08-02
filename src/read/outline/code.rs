@@ -833,15 +833,23 @@ private:
         }
     }
 
-    /// A declaration cannot legitimately introduce one name twice, so a repeat is a misparse
-    /// artifact. Macro-annotated enumerators are the shape that produces them: `UMETA(…)`
-    /// after each enumerator makes the whole list parse as one `field_declaration` carrying a
-    /// `function_declarator` per enumerator, every one named `UMETA`.
+    /// A `UENUM` outlines as the enum it is.
     ///
-    /// Without dedup the outline gained one identical `fn UMETA` per enumerator — same name,
-    /// kind and range. Pinned at exactly one, which is what the pre-#81 outline showed.
+    /// This used to assert something much weaker, and the difference is the point. The
+    /// annotated enumerator list made the whole enum parse as one `field_declaration`
+    /// carrying a `function_declarator` per enumerator, every one named `UMETA`, so the
+    /// outline showed `fn UMETA` and no enum at all. The dedup added for #81 stopped that
+    /// artifact being *multiplied* by enumerator count, and this test pinned it at one — a
+    /// misparse held steady rather than removed.
+    ///
+    /// It is removed now: `UMETA` is masked before the parse (`cpp_macro::ANNOTATION_MACROS`),
+    /// which is also what stops a `UENUM` collapsing the rest of its header into an `ERROR`.
+    /// So the assertion is the real one — the enum is there and the artifact is not.
+    ///
+    /// The dedup itself still stands and is still tested; it guards multi-declarator C++
+    /// declarations generally, not this shape specifically.
     #[test]
-    fn a_macro_misparsed_enumerator_list_is_not_multiplied() {
+    fn a_uenum_outlines_as_its_enum_with_no_macro_artifact() {
         let rendered = outline(
             "\
 UENUM(BlueprintType)
@@ -855,12 +863,14 @@ enum class EAmmoType : uint8
             Lang::Cpp,
             1000,
         );
-        // Counting entries, not occurrences of the string: the entry carries a signature line
-        // that also contains `UMETA`, so a naive substring count is 2 even when correct.
+        assert!(
+            rendered.contains("enum EAmmoType"),
+            "the UENUM's own type must be in the outline:\n{rendered}"
+        );
         assert_eq!(
-            rendered.matches("fn UMETA").count(),
-            1,
-            "the misparse artifact must not be multiplied by enumerator count:\n{rendered}"
+            rendered.matches("UMETA").count(),
+            0,
+            "no trace of the annotation should reach the outline:\n{rendered}"
         );
     }
 

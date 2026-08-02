@@ -227,12 +227,18 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        // Ruby: `def run` and `def self.build`. Bare `method` only reaches here for Ruby —
+        // `is_definition_node` gates it on the language (`RUBY_DEFINITION_KINDS`).
+        | "method"
+        | "singleton_method"
         | "decorated_definition" => "function",
         // A C/C++ `field_declaration` is a class member; a `function_definition`
         // that actually declares a class is handled by the `class` arm below.
         "field_declaration" => "member",
-        "class_declaration" | "class_definition" | "class_specifier" => "class",
-        "struct_item" | "struct_specifier" => "struct",
+        // Bare `class` is Ruby's, gated the same way.
+        "class_declaration" | "class_definition" | "class_specifier" | "class" => "class",
+        "struct_item" | "struct_specifier" | "struct_declaration" => "struct",
+        "record_declaration" => "record",
         "union_specifier" => "union",
         "interface_declaration" => "interface",
         "trait_declaration" | "trait_item" => "trait",
@@ -248,11 +254,13 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         // macro-misparsed class head is caught by the `cpp_misparsed_class_name` check
         // above. Without it the node fell through to `_ => "definition"`, rendering
         // `in definition sCount`.
-        "declaration" | "lexical_declaration" | "variable_declaration" => "variable",
+        "declaration" | "lexical_declaration" | "variable_declaration" | "var_declaration" => {
+            "variable"
+        }
         "const_item" | "const_declaration" => "const",
         "static_item" => "static",
         "property_declaration" => "property",
-        "mod_item" | "namespace_definition" => "module",
+        "mod_item" | "namespace_definition" | "module" => "module",
         "object_declaration" => "object",
         "impl_item" => "impl",
         "export_statement" => "export",

@@ -106,16 +106,18 @@ fn extract_test_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> 
 }
 
 fn get_node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
+    // The third copy of this slice. All three clamped only the end column, and a tree-sitter
+    // column that falls past a CRLF-stripped row — or inside a multi-byte character — panicked
+    // in a walk thread and aborted the process. See `clamp_col` for both mechanisms.
     let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
-
-    if row < lines.len() && row == end_row {
-        let col_end = node.end_position().column.min(lines[row].len());
-        lines[row][col_start..col_end].to_string()
-    } else if row < lines.len() {
-        lines[row][col_start..].to_string()
+    let Some(line) = lines.get(row) else {
+        return String::new();
+    };
+    let col_start = crate::lang::treesitter::clamp_col(line, node.start_position().column);
+    let col_end = if row == node.end_position().row {
+        crate::lang::treesitter::clamp_col(line, node.end_position().column).max(col_start)
     } else {
-        String::new()
-    }
+        line.len()
+    };
+    line[col_start..col_end].to_string()
 }

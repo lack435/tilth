@@ -1,8 +1,9 @@
 use crate::lang::treesitter::{
-    c_declarator_name, c_declarators, cpp_misparsed_class_name, declarator_chain_has_function,
-    declarator_declares_function, enclosing_misparsed_class_name, is_bodied_specifier,
-    is_cpp_macro_invocation, is_named_bodied_specifier, misparsed_member_name,
-    multi_declarator_names, node_text_simple, SPECIFIER_KINDS,
+    c_declarator_name, c_declarators, clamp_col, cpp_misparsed_class_name,
+    declarator_chain_has_function, declarator_declares_function, enclosing_misparsed_class_name,
+    go_spec_nodes, is_bodied_specifier, is_cpp_macro_invocation, is_named_bodied_specifier,
+    misparsed_member_name, multi_declarator_names, node_text_simple, GO_SPEC_PARENTS,
+    SPECIFIER_KINDS,
 };
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
@@ -163,6 +164,16 @@ fn node_to_entries(
     lang: Lang,
     depth: usize,
 ) -> Vec<OutlineEntry> {
+    // Go grouped declarations — `type ( A …; B … )`, `const ( … )`, `var ( … )` — name one
+    // thing per spec, so they need the same "more than one entry from one node" treatment
+    // the C/C++ multi-declarator case gets below. Handled first because `node_to_entry`
+    // returns only the leading spec by construction.
+    if lang == Lang::Go && GO_SPEC_PARENTS.contains(&node.kind()) {
+        let entries = go_spec_entries(node, lines);
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
     let Some(first) = node_to_entry(node, lines, lang, depth) else {
         return Vec::new();
     };
@@ -199,6 +210,67 @@ fn node_to_entries(
     }
     out.insert(0, first);
     out
+}
+
+/// One outline entry per name a Go `type` / `const` / `var` declaration introduces.
+///
+/// Names come from `go_spec_names`, the same function the definition walk uses, so the two
+/// surfaces cannot disagree about what a declaration declares. What is decided here is only
+/// the *kind*, which is a rendering question the search side does not ask.
+///
+/// Ranges are the spec's, not the declaration's. For the ungrouped form the two start on the
+/// same row, so nothing changes; for a grouped one it is the difference between four entries
+/// that all claim the whole `const ( … )` block and four that point at their own line.
+fn go_spec_entries(node: tree_sitter::Node, lines: &[&str]) -> Vec<OutlineEntry> {
+    let mut out = Vec::new();
+    for spec in go_spec_nodes(node) {
+        let kind = match spec.kind() {
+            "type_spec" => go_type_spec_kind(spec),
+            "type_alias" => OutlineKind::TypeAlias,
+            "const_spec" => OutlineKind::Constant,
+            "var_spec" => OutlineKind::Variable,
+            _ => continue,
+        };
+        // Re-derives the names for this one spec rather than calling `go_spec_names` on the
+        // parent, because the entries need each name paired with *its own* spec's kind and
+        // range — a flat name list from the parent has lost that association.
+        let mut inner = spec.walk();
+        for name in spec.children_by_field_name("name", &mut inner) {
+            // Separators carry the `name` field too — see `go_spec_names`, which filters the
+            // same way. Without this a grouped `const A, B = 1, 2` outlines an entry called `,`.
+            if !name.is_named() {
+                continue;
+            }
+            let text = node_text_simple(name, lines);
+            if text.is_empty() {
+                continue;
+            }
+            out.push(OutlineEntry {
+                kind,
+                name: text,
+                start_line: spec.start_position().row as u32 + 1,
+                end_line: spec.end_position().row as u32 + 1,
+                signature: None,
+                doc: None,
+                children: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
+/// Struct, interface or type alias — read off the `type` a Go `type_spec` binds.
+///
+/// The fallback is `TypeAlias` rather than `<anonymous>` because the remaining forms are all
+/// real named types (`type Celsius float64`, `type Handler func(int) error`, `type IDs []int`),
+/// and calling them aliases is a rendering imprecision rather than a wrong answer — a defined
+/// type is not literally an alias, but it is the closest kind the outline has.
+fn go_type_spec_kind(spec: tree_sitter::Node) -> OutlineKind {
+    match spec.child_by_field_name("type").map(|t| t.kind()) {
+        Some("struct_type") => OutlineKind::Struct,
+        Some("interface_type") => OutlineKind::Interface,
+        _ => OutlineKind::TypeAlias,
+    }
 }
 
 /// The outline kind for one declarator of a multi-declarator C/C++ declaration.
@@ -264,6 +336,23 @@ fn node_to_entry(
             (kind, name, None)
         }
 
+        // Go `type` / `const` / `var`. Must precede the generic `const_declaration` arm
+        // below, which looks for a `name` field Go does not put there and rendered every Go
+        // constant as `<const>`; `type_declaration` and `var_declaration` had no arm at all,
+        // so Go structs, interfaces and named types were absent from outlines entirely.
+        //
+        // This yields the *leading* spec only, and is reached only by the callers that take a
+        // single entry — `collect_member` and the wrapper arms. `walk_top_level` goes through
+        // `node_to_entries`, which handles these kinds itself and emits every spec, so the
+        // top-level path never arrives here.
+        k if lang == Lang::Go && GO_SPEC_PARENTS.contains(&k) => {
+            let mut entries = go_spec_entries(node, lines);
+            if entries.is_empty() {
+                return None;
+            }
+            return Some(entries.remove(0));
+        }
+
         // A C/C++ type specifier with no `body` is an elaborated type specifier — a
         // forward declaration (`class Fwd;`) or a type reference (`class Fwd* p;`),
         // not a definition. Reject before the class/struct/enum arms below so it
@@ -300,14 +389,45 @@ fn node_to_entry(
             (OutlineKind::Function, name, Some(sig))
         }
 
-        // Classes & structs
+        // Ruby methods. `method` is `def foo`, `singleton_method` is `def self.foo` — the
+        // grammar spells neither of them `*_declaration`, so both fell through to
+        // `_ => return None` and no Ruby method appeared in any outline. Language-gated
+        // because `method` is an anonymous keyword token in several other grammars.
+        "method" | "singleton_method" if lang == Lang::Ruby => {
+            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
+            let sig = extract_signature(node, lines);
+            (OutlineKind::Function, name, Some(sig))
+        }
+
+        // Classes & structs. Bare `class` is Ruby's, and is language-gated for the same
+        // reason `RUBY_DEFINITION_KINDS` is: it is also the JS/TS class-expression kind.
         "class_declaration" | "class_definition" | "class_specifier" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Class, name, None)
         }
-        "struct_item" | "struct_declaration" | "struct_specifier" | "union_specifier" => {
+        "class" if lang == Lang::Ruby => {
+            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
+            (OutlineKind::Class, name, None)
+        }
+
+        // Ruby `class << self`. It declares no name — which is why it is not a definition
+        // kind — but it is where a class's singleton methods live, so it renders as their
+        // parent. Whether those methods are then shown depends on the outline's depth
+        // budget, which `collect_children` caps at `depth < 1`: a top-level `class << self`
+        // shows its methods, one nested inside a class does not. `def self.foo`, the other
+        // spelling of the same thing, is a `singleton_method` and is unaffected.
+        "singleton_class" if lang == Lang::Ruby => {
+            let subject = find_child_text(node, "value", lines).unwrap_or_else(|| "self".into());
+            (OutlineKind::Class, format!("<< {subject}"), None)
+        }
+        // `record_declaration` is C#'s and Java's `record`. It was registered as a definition
+        // kind without an arm here, so a record resolved in search and was absent from the
+        // outline — the outline/definition drift #55 exists to prevent, reintroduced by the
+        // commit that claimed these kinds "already rendered in the outline". They did not.
+        "struct_item" | "struct_declaration" | "struct_specifier" | "union_specifier"
+        | "record_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Struct, name, None)
         }
@@ -560,9 +680,18 @@ fn node_to_entry(
     };
 
     // Collect children for classes, impls, modules, traits/interfaces
+    // Ruby's `module` belongs here for the same reason C#'s `namespace` does: it is a naming
+    // wrapper, not a level of structure anyone wants to spend the depth budget on. Without it
+    // `module Helpers` → `class Widget` → 900 `def`s outlined to two entries and no methods,
+    // while the identical file without the `module` outlined all 901 — and `module X; class Y`
+    // is the ordinary shape of a gem or a Rails app, so the Ruby support added alongside this
+    // missed its main case. The flat fixtures it was justified on could not see that.
     let is_namespace = matches!(
         kind_str,
-        "namespace_declaration" | "namespace_definition" | "file_scoped_namespace_declaration"
+        "namespace_declaration"
+            | "namespace_definition"
+            | "file_scoped_namespace_declaration"
+            | "module"
     );
     let children = if matches!(
         kind,
@@ -941,7 +1070,14 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
 
 /// Find a named child and return its text.
 fn find_child_text(node: tree_sitter::Node, field: &str, lines: &[&str]) -> Option<String> {
-    node.child_by_field_name(field).map(|n| node_text(n, lines))
+    // `None` rather than `Some("")`, because every caller chains this into
+    // `.or_else(…).unwrap_or_else(|| "<anonymous>")` and `Some("")` short-circuits the whole
+    // chain — yielding an entry with no name at all instead of the fallback. `node_text` can
+    // return empty legitimately: `clamp_col` collapses a range whose columns fall outside the
+    // `str::lines` row, which is what a CRLF file plus error recovery produces.
+    node.child_by_field_name(field)
+        .map(|n| node_text(n, lines))
+        .filter(|t| !t.is_empty())
 }
 
 /// Resolve the name a C/C++ node declares through its `declarator` chain.
@@ -972,24 +1108,24 @@ fn assignment_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 /// Get the text of a node, truncated to the first line.
 fn node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
     let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
+    let Some(line) = lines.get(row) else {
+        return String::new();
+    };
+    // Both offsets go through `clamp_col` — see it for why a tree-sitter column can fall
+    // outside this line or inside a character, and why that used to abort the process.
+    let col_start = clamp_col(line, node.start_position().column);
 
-    if row < lines.len() {
-        if row == end_row {
-            let col_end = node.end_position().column.min(lines[row].len());
-            lines[row][col_start..col_end].to_string()
-        } else {
-            // Multi-line — take first line only, truncated
-            let text = &lines[row][col_start..];
-            if text.len() > 80 {
-                format!("{}...", crate::types::truncate_str(text, 77))
-            } else {
-                text.to_string()
-            }
-        }
+    if row == node.end_position().row {
+        let col_end = clamp_col(line, node.end_position().column).max(col_start);
+        line[col_start..col_end].to_string()
     } else {
-        String::new()
+        // Multi-line — take first line only, truncated
+        let text = &line[col_start..];
+        if text.len() > 80 {
+            format!("{}...", crate::types::truncate_str(text, 77))
+        } else {
+            text.to_string()
+        }
     }
 }
 
@@ -1684,6 +1820,208 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 }
 
 #[cfg(test)]
+mod crlf_column_tests {
+    use super::{get_outline_entries, outline_language};
+    use crate::types::Lang;
+
+    /// The shape that aborted `tilth` on a real checkout: a C string literal continued with a
+    /// trailing backslash, in a CRLF file.
+    ///
+    /// `str::lines` strips the `\r`, so the row `\n\` is three bytes here and four to
+    /// tree-sitter, and the continuation token it places at the row's end reports column 4.
+    /// Indexing `lines[row]` with that panicked — and the release profile sets
+    /// `panic = "abort"`, so a panic on one file in one walk thread killed the entire query,
+    /// and in the MCP server the session with it.
+    fn crlf_continued_string() -> String {
+        [
+            "#include <stdio.h>",
+            "",
+            "PyDoc_STRVAR(xx_foo_doc,",
+            "\"foo(i,j)\\n\\",
+            "\\n\\",
+            "Return the sum of i and j.\");",
+            "",
+            "int Helper(void) { return 1; }",
+            "",
+        ]
+        .join("\r\n")
+    }
+
+    /// The geometry itself, asserted directly so the regression below cannot quietly stop
+    /// exercising the bug if a future grammar version changes where it puts that token.
+    #[test]
+    fn crlf_continuation_puts_a_column_past_the_stripped_row() {
+        let src = crlf_continued_string();
+        let ts_lang = outline_language(Lang::C).expect("c grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).expect("grammar loads");
+        let tree = parser.parse(&src, None).expect("parse succeeds");
+        let lines: Vec<&str> = src.lines().collect();
+
+        let mut cursor = tree.root_node().walk();
+        let mut stack = vec![tree.root_node()];
+        let mut found = None;
+        while let Some(node) = stack.pop() {
+            let (row, col) = (node.start_position().row, node.start_position().column);
+            if lines.get(row).is_some_and(|l| col > l.len()) {
+                found = Some((row, col, lines[row].len()));
+                break;
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        assert!(
+            found.is_some(),
+            "expected a node whose column falls past its `str::lines` row — without one this \
+             fixture no longer reproduces the abort it was written for"
+        );
+    }
+
+    #[test]
+    fn crlf_continued_string_outlines_without_aborting() {
+        let entries = get_outline_entries(&crlf_continued_string(), Lang::C);
+        assert!(
+            entries.iter().any(|e| e.name == "Helper"),
+            "outline should still find the function after the continued string, got {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod go_declaration_tests {
+    use super::get_outline_entries;
+    use crate::types::{Lang, OutlineKind};
+
+    /// A Go file's outline used to list its functions and nothing else: `type_declaration` and
+    /// `var_declaration` had no arm at all, and `const_declaration` reached the generic
+    /// constant arm, which looks for a `name` field Go does not have and rendered every
+    /// constant as `<const>`. So `tilth_read` on a Go file omitted every struct, interface and
+    /// named type in it — the outline's whole job, missing for one supported language.
+    #[test]
+    fn outline_lists_every_go_declaration_with_its_kind() {
+        let src = "package main\n\n\
+                   type Widget struct {\n\tID int\n}\n\n\
+                   type Runner interface {\n\tRun() error\n}\n\n\
+                   type Alias = int\n\n\
+                   type Celsius float64\n\n\
+                   const Limit = 5\n\n\
+                   var Registry = 7\n\n\
+                   func Build() int { return 1 }\n";
+        let entries = get_outline_entries(src, Lang::Go);
+        let got: Vec<(&str, OutlineKind)> =
+            entries.iter().map(|e| (e.name.as_str(), e.kind)).collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("Widget", OutlineKind::Struct),
+                ("Runner", OutlineKind::Interface),
+                ("Alias", OutlineKind::TypeAlias),
+                ("Celsius", OutlineKind::TypeAlias),
+                ("Limit", OutlineKind::Constant),
+                ("Registry", OutlineKind::Variable),
+                ("Build", OutlineKind::Function),
+            ],
+        );
+    }
+
+    /// Grouped declarations produce one entry per spec, each pointing at its own line rather
+    /// than at the whole `( … )` block — the reason `go_spec_entries` uses the spec's range.
+    #[test]
+    fn outline_expands_go_grouped_declarations() {
+        let src = "package main\n\n\
+                   type (\n\tAlpha struct{ X int }\n\tBeta int\n)\n\n\
+                   const (\n\tGamma = 1\n\tDelta = 2\n)\n\n\
+                   var (\n\tEpsilon int\n\tZeta = 3\n)\n";
+        let entries = get_outline_entries(src, Lang::Go);
+        let got: Vec<(&str, u32)> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.start_line))
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("Alpha", 4),
+                ("Beta", 5),
+                ("Gamma", 9),
+                ("Delta", 10),
+                ("Epsilon", 14),
+                ("Zeta", 15),
+            ],
+        );
+    }
+
+    /// `module X` → `class Y` → `def z` is the ordinary shape of a gem or a Rails app, and it
+    /// is the case the flat fixtures elsewhere in this file cannot see: a `module` that spends
+    /// a depth level leaves the class inside it with no room for its methods, so the outline
+    /// was the module and the class and nothing else.
+    #[test]
+    fn outline_sees_methods_through_a_ruby_module() {
+        let mut src = String::from("module Helpers\n  class Widget\n");
+        for i in 0..3 {
+            src.push_str(&format!("    def method_{i}\n      {i}\n    end\n"));
+        }
+        src.push_str("  end\nend\n");
+
+        let names: Vec<String> = collect_names(&get_outline_entries(&src, Lang::Ruby));
+        for want in ["Helpers", "Widget", "method_0", "method_1", "method_2"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "{want} missing from a module→class→def outline: {names:?}"
+            );
+        }
+    }
+
+    /// Flatten an entry tree to its names, children included.
+    fn collect_names(entries: &[crate::types::OutlineEntry]) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in entries {
+            out.push(e.name.clone());
+            out.extend(collect_names(&e.children));
+        }
+        out
+    }
+
+    /// The outline and the definition walk must name the same things. They are separate walks
+    /// over the same tree, and this is the pairing that was broken: the outline knew about
+    /// Ruby modules and C# structs while the definition walk did not, and neither knew about
+    /// Go types.
+    #[test]
+    fn outline_names_match_definition_names() {
+        use crate::lang::treesitter::{extract_definition_names, is_definition_node};
+
+        let src = "package main\n\n\
+                   type Widget struct{ ID int }\n\n\
+                   type (\n\tAlpha struct{ X int }\n\tBeta int\n)\n\n\
+                   const Limit = 5\n\n\
+                   var Registry = 7\n\n\
+                   func Build() int { return 1 }\n";
+
+        let outlined: Vec<String> = get_outline_entries(src, Lang::Go)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+
+        let ts_lang = super::outline_language(Lang::Go).expect("go grammar");
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).expect("grammar loads");
+        let tree = parser.parse(src, None).expect("parse succeeds");
+        let lines: Vec<&str> = src.lines().collect();
+
+        let mut cursor = tree.root_node().walk();
+        let defined: Vec<String> = tree
+            .root_node()
+            .children(&mut cursor)
+            .filter(|n| is_definition_node(*n, Some(Lang::Go)))
+            .flat_map(|n| extract_definition_names(n, &lines))
+            .collect();
+
+        assert_eq!(outlined, defined);
+    }
+}
+
+#[cfg(test)]
 mod outline_entry_bom_tests {
     use super::get_outline_entries;
     use crate::types::Lang;
@@ -1893,13 +2231,17 @@ mod outline_entry_bom_tests {
 
     /// The fixtures have to actually produce entries, or the parity above is `[] == []`.
     ///
-    /// Three languages legitimately yield none — `Dockerfile` and `Make` have no grammar at all
-    /// (`outline_language` returns `None`), and the Ruby arm emits no top-level entry for a class.
-    /// Naming them here is what stops a *fourth* joining them unnoticed and quietly turning its
-    /// parity row into a comparison of two empty vectors.
+    /// Two languages legitimately yield none — `Dockerfile` and `Make` have no grammar at all
+    /// (`outline_language` returns `None`). Naming them here is what stops a *third* joining them
+    /// unnoticed and quietly turning its parity row into a comparison of two empty vectors.
+    ///
+    /// Ruby used to be the third, and this list is where that was recorded rather than fixed: the
+    /// grammar spells its declarations `class`, `module` and `method`, none of which matched an
+    /// outline arm, so a Ruby file of any size outlined to nothing. It has arms now, so an empty
+    /// Ruby outline is a regression again.
     #[test]
     fn every_language_whose_outline_can_be_empty_is_named() {
-        const KNOWN_EMPTY: &[Lang] = &[Lang::Dockerfile, Lang::Make, Lang::Ruby];
+        const KNOWN_EMPTY: &[Lang] = &[Lang::Dockerfile, Lang::Make];
         for (lang, src) in CASES {
             let empty = describe(src, *lang).is_empty();
             assert_eq!(
