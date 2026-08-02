@@ -36,11 +36,18 @@ pub fn parse_masked(
 
 /// The masked form of `content`, or `None` when masking does not apply or changes
 /// nothing — which is every non-C/C++ file and most C++ ones.
+///
+/// Two independent masks, applied in sequence. Composing them is only sound because both
+/// overwrite ASCII spans with ASCII spaces and neither changes the file's length, so the
+/// second reads exactly the byte offsets the first left in place — and the tree-sitter rows
+/// and columns both produce still index the original content.
 fn mask_for(content: &str, lang: Option<Lang>) -> Option<String> {
     if !matches!(lang, Some(Lang::C | Lang::Cpp)) {
         return None;
     }
-    cpp_macro::mask_export_macros(content)
+    let exports = cpp_macro::mask_export_macros(content);
+    let base = exports.as_deref().unwrap_or(content);
+    cpp_macro::mask_annotation_macros(base).or(exports)
 }
 
 /// Detect file type by extension, then by name.

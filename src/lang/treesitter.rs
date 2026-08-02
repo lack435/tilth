@@ -60,9 +60,17 @@ const DEFINITION_KINDS: &[&str] = &[
     "impl_item",
     "mod_item",
     "namespace_definition",
+    // C# `struct` and `record`, and Java's `record`. Both expose a `name` field, so the
+    // generic probe in `extract_definition_name` resolves them with no special case. Both
+    // are named in only those two grammars, so neither needs a language gate.
+    "struct_declaration",
+    "record_declaration",
     // Python
     "decorated_definition",
-    // Go
+    // Go. Carries its names on `*_spec` children rather than on itself — see
+    // `go_spec_names`, without which it does not resolve. (`var_declaration` and
+    // `const_declaration` are the same shape; the first is Go-scoped below because Scala
+    // owns the kind too, the second is global because it predates this work.)
     "type_declaration",
     // Go type declarations; also C/C++ `typedef` (tree-sitter-c/cpp
     // `type_definition`) and Scala `type` aliases, which share the kind string
@@ -82,6 +90,29 @@ const DEFINITION_KINDS: &[&str] = &[
 /// and Go struct field as a top-level definition, so it is gated on language
 /// instead.
 const C_FAMILY_DEFINITION_KINDS: &[&str] = &["field_declaration"];
+
+/// Definition kinds that only count in Ruby.
+///
+/// Ruby names its declarations with bare words — `class Widget`, `module Helpers`,
+/// `def run` (`method`), `def self.build` (`singleton_method`) — and those strings are not
+/// Ruby's alone. `class` is also the JS/TS **class expression** (`const P = class Inner {}`),
+/// and `module` is also a TypeScript namespace *and* an ambient `declare module "node:fs"`,
+/// whose `name` field is a string literal. Registering them globally made a quoted string a
+/// symbol name and made a JS class expression a definition or a usage depending on whether an
+/// `export` sat in front of it — two languages changed to fix a third.
+///
+/// `singleton_class` (`class << self`) is deliberately absent even here: it declares nothing
+/// by name, so there is no symbol for a search to find. It has an outline arm, because the
+/// methods inside it are real.
+const RUBY_DEFINITION_KINDS: &[&str] = &["class", "method", "singleton_method", "module"];
+
+/// Definition kinds that only count in Go.
+///
+/// `var_declaration` is Go's package-level `var`, and it is **also Scala's** abstract member
+/// form (`var slot: Int` in a trait). Registering it globally made Scala's `var` a definition
+/// while its `val` stayed a usage — an arbitrary split inside one language, introduced to fix
+/// another. Go's own `var` still resolves; Scala's is left exactly as it was.
+const GO_DEFINITION_KINDS: &[&str] = &["var_declaration"];
 
 /// C/C++ type specifiers that are a definition only when they carry a `body`.
 ///
@@ -167,9 +198,24 @@ const C_ABSTRACT_DECLARATOR_KINDS: &[&str] = &[
 /// and the body requirement that separates a C/C++ type *definition* from a
 /// reference to a type.
 pub(crate) fn is_definition_node(node: tree_sitter::Node, lang: Option<Lang>) -> bool {
+    // An anonymous node is a punctuation or keyword token, never a declaration. The check
+    // costs nothing and is what makes matching on bare kind strings safe: Ruby names its
+    // declarations `class`, `module` and `method`, and every one of those strings is *also*
+    // the keyword token inside the node it names. Without this, descending past the top
+    // level would register the `class` keyword of every Ruby class as a second definition of
+    // it, with the keyword's own text as the name.
+    if !node.is_named() {
+        return false;
+    }
     let kind = node.kind();
     if C_FAMILY_DEFINITION_KINDS.contains(&kind) {
         return matches!(lang, Some(Lang::C | Lang::Cpp));
+    }
+    if RUBY_DEFINITION_KINDS.contains(&kind) {
+        return lang == Some(Lang::Ruby);
+    }
+    if GO_DEFINITION_KINDS.contains(&kind) {
+        return lang == Some(Lang::Go);
     }
     // A macro in a class head can misparse a class definition into a `declaration`
     // (see `is_cpp_misparsed_class_head`). Only that shape counts — an ordinary
@@ -980,6 +1026,12 @@ pub(crate) fn c_declarators(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
 /// `extract_definition_name` also resolves misparsed class heads and nested-type wrappers,
 /// and re-deriving those here would be a second implementation of the same question.
 pub(crate) fn extract_definition_names(node: tree_sitter::Node, lines: &[&str]) -> Vec<String> {
+    // A grouped Go declaration names one thing per spec. Handled here rather than through
+    // the declarator machinery below, which is C/C++-shaped and would find nothing.
+    let go = go_spec_names(node, lines);
+    if !go.is_empty() {
+        return go;
+    }
     let single = extract_definition_name(node, lines);
     let Some(names) = extra_declarator_names(node, lines, single.as_deref()) else {
         return single.into_iter().collect();
@@ -1074,11 +1126,144 @@ pub(crate) fn multi_declarator_names(
     extra_declarator_names(node, lines, Some(primary))
 }
 
+/// Go declaration kinds that carry no name of their own.
+///
+/// Go puts every declared name on a `*_spec` child, never on the declaration node:
+/// `type Widget struct{…}` parses as a `type_declaration` whose only nameable child is a
+/// `type_spec`. The grouped forms — `type ( A …; B … )`, `const ( … )`, `var ( … )` — put
+/// several specs under one declaration, which is the ordinary spelling in real Go.
+///
+/// The generic `name`-field probe in `extract_definition_name` therefore found nothing on
+/// any of them. Functions and methods *do* carry a `name` field, so they resolved normally
+/// and the gap was invisible in aggregate: for a Go tree, `tilth_search` on a type name
+/// returned only usages and no definition at all, and a file's outline listed its functions
+/// while omitting every struct, interface and named type in it.
+pub(crate) const GO_SPEC_PARENTS: &[&str] =
+    &["type_declaration", "const_declaration", "var_declaration"];
+
+/// The spec children `GO_SPEC_PARENTS` wrap their names in.
+///
+/// `type_alias` is the `type A = B` form and `type_spec` everything else, including a
+/// defined type (`type Celsius float64`) — the grammar splits them but both name one type.
+const GO_SPEC_KINDS: &[&str] = &["type_spec", "type_alias", "const_spec", "var_spec"];
+
+/// The spec nodes of a Go `type` / `const` / `var` declaration, in source order.
+///
+/// **The grouped forms are not shaped alike, which is the whole reason this is a function.**
+/// `type ( … )` and `const ( … )` hang their specs directly off the declaration, but
+/// `var ( … )` interposes a `var_spec_list`. Walking direct children only — the obvious
+/// implementation, and the one this had first — therefore resolves every grouped `type` and
+/// `const` while silently finding nothing in a grouped `var`, a discrepancy in the grammar
+/// rather than in Go itself.
+///
+/// So a `*_spec_list` child is descended into. The check is by suffix rather than an exact
+/// kind list because it costs nothing to also cover a `const_spec_list` or `type_spec_list`
+/// if a future grammar version regularises the other two the same way.
+fn go_specs(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut specs = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if GO_SPEC_KINDS.contains(&child.kind()) {
+            specs.push(child);
+        } else if child.kind().ends_with("_spec_list") {
+            let mut inner = child.walk();
+            specs.extend(
+                child
+                    .children(&mut inner)
+                    .filter(|n| GO_SPEC_KINDS.contains(&n.kind())),
+            );
+        }
+    }
+    specs
+}
+
+/// Every name a Go `type` / `const` / `var` declaration introduces, in source order.
+///
+/// Empty for any other node, so callers can use a non-empty result as "this was a Go
+/// declaration and here is what it declares" without a separate language gate.
+///
+/// One spec can itself name several things — `const A, B = 1, 2` and `var x, y int` both
+/// put two `name` fields on one spec — so the inner loop takes all of them rather than the
+/// first. This is the same "which names does one declaration introduce" question
+/// `multi_declarator_names` answers for C/C++, and it has one implementation here for the
+/// same reason: the outline and the definition walk must not be able to answer it
+/// differently.
+pub(crate) fn go_spec_names(node: tree_sitter::Node, lines: &[&str]) -> Vec<String> {
+    if !GO_SPEC_PARENTS.contains(&node.kind()) {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for spec in go_specs(node) {
+        let mut inner = spec.walk();
+        for name in spec.children_by_field_name("name", &mut inner) {
+            // `is_named` filters the separators out. tree-sitter tags *every* child in a
+            // multi-name field's span with that field, commas included, so the raw iterator
+            // yields `["Iota", ",", "Kappa"]` for `const Iota, Kappa = 1, 2` — and a bare
+            // `,` would then be registered as a declared symbol.
+            if !name.is_named() {
+                continue;
+            }
+            let text = node_text_simple(name, lines);
+            if !text.is_empty() {
+                names.push(text);
+            }
+        }
+    }
+    names
+}
+
+/// `go_specs`, exposed for the outline — which needs each spec node itself, not just its
+/// names, so it can decide a per-spec kind and range.
+pub(crate) fn go_spec_nodes(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    if !GO_SPEC_PARENTS.contains(&node.kind()) {
+        return Vec::new();
+    }
+    go_specs(node)
+}
+
+/// The node whose line range should be reported for `name`, given the declaration node that
+/// declares it.
+///
+/// For everything except a Go grouped declaration this is `node` itself, unchanged.
+///
+/// Go needs the distinction because one `type (…)` / `const (…)` / `var (…)` block declares
+/// several names across many lines. Reporting the declaration's range for each of them sent
+/// every member of a block to the block's opening line, and it did more than mislocate them:
+/// two names sharing a `line` collide in `session`'s dedup key, so the second was rendered as
+/// "shown earlier" with no body, and a name whose declaration line differs from its own line
+/// escaped the usage-dedup in `find_definitions` and was reported a second time as a usage of
+/// itself. Anchoring on the spec makes all three go away, because they were one bug.
+///
+/// The outline already used the spec's range; this is what stops the two walks disagreeing.
+pub(crate) fn definition_site<'t>(
+    node: tree_sitter::Node<'t>,
+    lines: &[&str],
+    name: &str,
+) -> tree_sitter::Node<'t> {
+    for spec in go_spec_nodes(node) {
+        let mut inner = spec.walk();
+        let declares = spec
+            .children_by_field_name("name", &mut inner)
+            .filter(tree_sitter::Node::is_named)
+            .any(|n| node_text_simple(n, lines) == name);
+        if declares {
+            return spec;
+        }
+    }
+    node
+}
+
 /// Extract the name defined by a tree-sitter definition node.
 ///
 /// Walks standard field names (`name`, `identifier`, `declarator`) and handles
 /// nested declarators and export statements.
 pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    // Go declarations, before the generic probe: they have no `name` field for it to find,
+    // and `identifier` would match the *value* side of `const Foo = Bar`.
+    if let Some(first) = go_spec_names(node, lines).into_iter().next() {
+        return Some(first);
+    }
+
     // C/C++ wrap the declared name in a declarator chain rather than exposing a
     // `name` field, so resolve those before the generic field probe below. Without
     // this, the `declarator` arm of that probe returns the declarator's raw source
@@ -1183,22 +1368,61 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
     None
 }
 
+/// Clamp a tree-sitter column into `line`, landing on a char boundary at or below it.
+///
+/// **A tree-sitter column is a byte offset into the row as tree-sitter sees it, and that is
+/// not the same string as `lines[row]`.** Three things separate them, and all occur in real
+/// trees:
+///
+/// * `str::lines` strips a trailing `\r`, so on a CRLF file every row is one byte shorter
+///   here than tree-sitter measured it. This is the one that produced the crash on a real
+///   checkout, via a C string literal continued with a trailing backslash.
+/// * Error recovery can place a node past the end of its row regardless of line endings. A
+///   sweep of one Unreal `Engine/Source/Runtime` tree found 10 **named** nodes whose start
+///   column exceeded their row length — `expression_statement` and `ERROR` nodes, in headers
+///   with plain LF endings. Named matters: the outline only reads text from named nodes, so
+///   the CRLF case alone would have been unreachable from that walk.
+/// * A column can land inside a multi-byte character, which `str` slicing rejects even when
+///   the offset is in range.
+///
+/// Either one used to abort the process: these slices were `lines[row][col_start..col_end]`
+/// with only `col_end` clamped, so an out-of-range or mid-character `col_start` panicked in a
+/// walk thread and took the whole run with it. Degrading loses at most one symbol; panicking
+/// loses the query, and in the MCP server the session.
+///
+/// "Degrading" is not uniform across the two walks, and the difference is worth knowing. On
+/// the definition side every caller filters an empty name (`extract_definition_name`'s field
+/// probe, `go_spec_names`, `c_declarator_name`), so a clamped-to-empty result drops the
+/// symbol. On the outline side `find_child_text` returns `Some("")`, which short-circuits the
+/// `.or_else(…).unwrap_or_else(|| "<anonymous>")` chains — so there it could *add* a nameless
+/// entry rather than drop one. That is why `find_child_text` rejects the empty string.
+pub(crate) fn clamp_col(line: &str, col: usize) -> usize {
+    let mut i = col.min(line.len());
+    while i > 0 && !line.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Get the text of a single-line node from pre-split source lines.
 ///
 /// Returns the text slice for single-line nodes, or the text from the start
 /// column to end-of-line for multi-line nodes.
 pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> String {
     let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
-    if row < lines.len() && row == end_row {
-        let col_end = node.end_position().column.min(lines[row].len());
-        lines[row][col_start..col_end].to_string()
-    } else if row < lines.len() {
-        lines[row][col_start..].to_string()
+    let Some(line) = lines.get(row) else {
+        return String::new();
+    };
+    let start = clamp_col(line, node.start_position().column);
+    let end = if row == node.end_position().row {
+        // `max(start)` because clamping can invert the pair: a zero-width node past the end
+        // of a CRLF row clamps both offsets to the line length, and a reversed range is the
+        // other way `str` slicing panics.
+        clamp_col(line, node.end_position().column).max(start)
     } else {
-        String::new()
-    }
+        line.len()
+    };
+    line[start..end].to_string()
 }
 
 /// Extract trait name from Rust `impl Trait for Type` node.
@@ -1439,7 +1663,12 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "method_declaration"
         | "class_declaration"
         | "class_definition"
+        | "class"
+        | "method"
+        | "singleton_method"
         | "struct_item"
+        | "struct_declaration"
+        | "record_declaration"
         | "interface_declaration"
         | "trait_declaration"
         | "trait_item"
@@ -1463,8 +1692,11 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "decorated_definition" => 100,
         "impl_item" | "object_declaration" => 90,
         "const_item" | "const_declaration" | "static_item" => 80,
-        "field_declaration" | "mod_item" | "namespace_definition" | "property_declaration" => 70,
-        "lexical_declaration" | "variable_declaration" => 40,
+        "field_declaration" | "mod_item" | "module" | "namespace_definition"
+        | "property_declaration" => 70,
+        // Go's `var_declaration` ranks with the other variable forms: a package-level var
+        // is a definition, but a type or function of the same name should outrank it.
+        "lexical_declaration" | "variable_declaration" | "var_declaration" => 40,
         "variable_assignment" => 60,
         "export_statement" => 30,
         _ => 50,
@@ -1829,6 +2061,335 @@ mod tests {
             stack.extend(node.children(&mut cursor));
         }
         panic!("no {kind} node found in parsed tree");
+    }
+
+    /// The two ways a tree-sitter column can be unusable as a `str` index into `lines[row]`.
+    /// Both aborted the process before `clamp_col`, because these slices clamped only the end.
+    #[test]
+    fn clamp_col_handles_out_of_range_and_mid_character() {
+        // Past the end — the CRLF case, where `str::lines` dropped a byte tree-sitter counted.
+        assert_eq!(clamp_col("abcd", 5), 4);
+        assert_eq!(clamp_col("abcd", 4), 4);
+        assert_eq!(clamp_col("", 3), 0);
+
+        // Inside a character. "é" is two bytes, so byte 1 is not a boundary.
+        assert_eq!(clamp_col("é", 1), 0);
+        assert_eq!(clamp_col("aé", 2), 1);
+        // "aéb" is a(1) + é(2) + b(1) = 4 bytes; byte 2 splits the é.
+        assert_eq!(clamp_col("aéb", 2), 1);
+
+        // In range and on a boundary — unchanged, which is every non-degenerate call.
+        assert_eq!(clamp_col("abcd", 2), 2);
+        assert_eq!(clamp_col("aéb", 3), 3);
+        assert_eq!(clamp_col("aéb", 4), 4);
+    }
+
+    /// The guarantee the clamping exists for: whatever the columns say, this returns a string
+    /// instead of aborting the walk thread. Driven through `clamp_col` on a real line, since a
+    /// `tree_sitter::Node` with fabricated positions cannot be constructed from outside the
+    /// parser.
+    #[test]
+    fn clamped_slice_never_inverts() {
+        for line in ["", "abcd", "aéb", "тест"] {
+            for start in 0..8 {
+                for end in 0..8 {
+                    let s = clamp_col(line, start);
+                    let e = clamp_col(line, end).max(s);
+                    // Panics if either offset is out of range, inverted, or mid-character.
+                    let _ = &line[s..e];
+                }
+            }
+        }
+    }
+
+    /// The load-bearing guard: hand `node_text_simple` a node whose column really does fall
+    /// outside its `str::lines` row, and require it to return instead of aborting.
+    ///
+    /// This exists because the obvious test does not work. Outlining the same fixture and
+    /// asserting "it did not panic" passes with `clamp_col` reverted — the only bad-column node
+    /// a CRLF continued string produces is an **anonymous** `MISSING "` token, and the outline
+    /// walk only ever reads text from *named* nodes, so it never touches one. A test that
+    /// exercises the function directly cannot be dodged that way.
+    ///
+    /// The node is located by the property rather than by a hard-coded path into the tree, so a
+    /// grammar update that moves it fails the locate assertion loudly instead of silently
+    /// testing nothing.
+    #[test]
+    fn node_text_simple_survives_a_column_outside_its_row() {
+        let src = [
+            "PyDoc_STRVAR(doc,",
+            "\"foo(i,j)\\n\\",
+            "\\n\\",
+            "Return the sum.\");",
+            "",
+        ]
+        .join("\r\n");
+        let lines: Vec<&str> = src.lines().collect();
+        let tree = parse(&src, Lang::C);
+
+        let mut cursor = tree.root_node().walk();
+        let mut stack = vec![tree.root_node()];
+        let mut found = None;
+        while let Some(node) = stack.pop() {
+            let (row, col) = (node.start_position().row, node.start_position().column);
+            if lines.get(row).is_some_and(|l| col > l.len()) {
+                found = Some(node);
+                break;
+            }
+            stack.extend(node.children(&mut cursor));
+        }
+        let node = found.expect(
+            "fixture no longer produces a node whose column falls past its `str::lines` row — \
+             without one this test cannot exercise the clamp it exists for",
+        );
+
+        // The assertion is that this call returns at all. Pre-`clamp_col` it panicked, and
+        // with `panic = "abort"` in the release profile that ended the process.
+        let text = node_text_simple(node, &lines);
+        assert!(
+            text.len() <= lines[node.start_position().row].len(),
+            "clamped text ran past its row: {text:?}"
+        );
+    }
+
+    /// A CRLF file is the case that reached production: `str::lines` strips the `\r`, so every
+    /// row here is one byte shorter than tree-sitter measured it, and any node the parser places
+    /// at a row's end has a column one past this line's length.
+    #[test]
+    fn crlf_rows_are_shorter_than_tree_sitter_measured() {
+        let src = "fn a() {}\r\nfn b() {}\r\n";
+        let lines: Vec<&str> = src.lines().collect();
+        assert_eq!(lines[0], "fn a() {}");
+        assert_eq!(lines[0].len(), 9);
+        // tree-sitter counts the `\r`, so column 10 is a position it can report for row 0 —
+        // and was an immediate panic as a `str` index into `lines[0]`.
+        assert_eq!(clamp_col(lines[0], 10), 9);
+
+        // The parse still works; nothing here depends on the file being malformed. Read the
+        // children in source order — `find_by_kind` is a LIFO walk and returns the last match.
+        let tree = parse(src, Lang::Rust);
+        let mut cursor = tree.root_node().walk();
+        let names: Vec<String> = tree
+            .root_node()
+            .children(&mut cursor)
+            .filter_map(|n| extract_definition_name(n, &lines))
+            .collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// Go puts no name on the declaration node, so the generic `name`-field probe found
+    /// nothing on any of these and every Go type, interface, alias, const and package-level
+    /// var resolved as a usage with no definition anywhere in the result.
+    ///
+    /// Driven off the *declaration* node rather than the spec, because that is the node the
+    /// definition walk hands over — a version of this that tested `type_spec` directly would
+    /// have passed against the broken code.
+    #[test]
+    fn extract_definition_name_go_declarations() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "type Widget struct{ ID int }\n",
+                "type_declaration",
+                "Widget",
+            ),
+            (
+                "type Runner interface{ Run() error }\n",
+                "type_declaration",
+                "Runner",
+            ),
+            ("type Alias = int\n", "type_declaration", "Alias"),
+            ("type Celsius float64\n", "type_declaration", "Celsius"),
+            ("const Limit = 5\n", "const_declaration", "Limit"),
+            ("var Registry = 7\n", "var_declaration", "Registry"),
+        ];
+        for (src, kind, want) in cases {
+            let tree = parse(src, Lang::Go);
+            let lines: Vec<&str> = src.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*want),
+                "{src:?}"
+            );
+            assert!(
+                is_definition_node(node, Some(Lang::Go)),
+                "{src:?} must be a definition node"
+            );
+        }
+    }
+
+    /// Grouped declarations name one thing per spec, and `var` nests its specs one level
+    /// deeper than `type` and `const` do — a grammar asymmetry, not a Go one. A direct-child
+    /// walk resolves the first two and silently finds nothing in the third, so all three are
+    /// pinned together.
+    #[test]
+    fn extract_definition_names_go_grouped_declarations() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "type (\n\tAlpha struct{ X int }\n\tBeta int\n)\n",
+                "type_declaration",
+                &["Alpha", "Beta"],
+            ),
+            (
+                "const (\n\tGamma = 1\n\tDelta = 2\n)\n",
+                "const_declaration",
+                &["Gamma", "Delta"],
+            ),
+            (
+                "var (\n\tEpsilon int\n\tZeta = 3\n)\n",
+                "var_declaration",
+                &["Epsilon", "Zeta"],
+            ),
+            // One spec, several names — the other way a Go declaration declares more than one.
+            ("var Eta, Theta int\n", "var_declaration", &["Eta", "Theta"]),
+            (
+                "const Iota, Kappa = 1, 2\n",
+                "const_declaration",
+                &["Iota", "Kappa"],
+            ),
+        ];
+        for (src, kind, want) in cases {
+            let tree = parse(src, Lang::Go);
+            let lines: Vec<&str> = src.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                extract_definition_names(node, &lines),
+                want.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+                "{src:?}"
+            );
+        }
+    }
+
+    /// `go_spec_names` is the language gate as well as the resolver: callers use a non-empty
+    /// result to mean "this was a Go declaration", so it must stay empty for everything else.
+    /// A Rust `const_item` is the case that matters — it shares no kind string with Go's
+    /// `const_declaration`, but a future widening of the parent list could make it collide.
+    #[test]
+    fn go_spec_names_empty_for_non_go_declarations() {
+        for (src, lang, kind) in [
+            ("const LIMIT: u64 = 5;\n", Lang::Rust, "const_item"),
+            ("struct Widget { id: u64 }\n", Lang::Rust, "struct_item"),
+            ("class Widget { };\n", Lang::Cpp, "class_specifier"),
+        ] {
+            let tree = parse(src, lang);
+            let lines: Vec<&str> = src.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert!(
+                go_spec_names(node, &lines).is_empty(),
+                "{src:?} is not a Go declaration"
+            );
+        }
+    }
+
+    /// The kinds registered alongside the Go and Ruby work, checked on **both** surfaces.
+    ///
+    /// The earlier version of this test asserted only `extract_definition_name`, on the
+    /// stated reasoning that each kind "already rendered in the outline". That was wrong for
+    /// `record_declaration`, which had no outline arm — so a C# record resolved in search and
+    /// was missing from the outline, which is the drift #55 exists to prevent. A test that
+    /// checks one surface cannot see a disagreement between two, so this one checks both.
+    #[test]
+    fn newly_registered_definition_kinds_resolve_on_both_surfaces() {
+        let cases: &[(&str, Lang, &str, &str)] = &[
+            (
+                "public struct Point { public int X; }\n",
+                Lang::CSharp,
+                "struct_declaration",
+                "Point",
+            ),
+            (
+                "public record Pair(int X, int Y);\n",
+                Lang::CSharp,
+                "record_declaration",
+                "Pair",
+            ),
+            (
+                "record Pair(int x) { }\n",
+                Lang::Java,
+                "record_declaration",
+                "Pair",
+            ),
+            ("module Helpers\nend\n", Lang::Ruby, "module", "Helpers"),
+            ("class Widget\nend\n", Lang::Ruby, "class", "Widget"),
+            ("def run\n  1\nend\n", Lang::Ruby, "method", "run"),
+            (
+                "def self.build\n  1\nend\n",
+                Lang::Ruby,
+                "singleton_method",
+                "build",
+            ),
+        ];
+        for (src, lang, kind, want) in cases {
+            let tree = parse(src, *lang);
+            let lines: Vec<&str> = src.lines().collect();
+            let node = find_by_kind(tree.root_node(), kind);
+            assert!(
+                is_definition_node(node, Some(*lang)),
+                "{kind} must be a definition node in {lang:?}"
+            );
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(*want),
+                "definition walk, {src:?}"
+            );
+            let outlined: Vec<String> = crate::lang::outline::get_outline_entries(src, *lang)
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert!(
+                outlined.iter().any(|n| n == want),
+                "outline walk disagrees: {kind} in {lang:?} resolves as a definition named \
+                 {want:?} but the outline shows {outlined:?} — {src:?}"
+            );
+        }
+    }
+
+    /// The other half of the gate: these kinds are Ruby's and Go's, and must NOT be
+    /// definitions elsewhere. Registering them globally was a real behaviour change for three
+    /// other languages — a Scala `var` became a definition while its `val` did not, a JS
+    /// class expression became one, and a TypeScript `declare module "node:fs"` produced a
+    /// quoted string as a symbol name.
+    #[test]
+    fn language_scoped_definition_kinds_do_not_leak() {
+        // (source, language, kind, is_a_definition_here)
+        let cases: &[(&str, Lang, &str, bool)] = &[
+            ("class Widget\nend\n", Lang::Ruby, "class", true),
+            (
+                "const P = class Inner {};\n",
+                Lang::JavaScript,
+                "class",
+                false,
+            ),
+            (
+                "const P = class Inner {};\n",
+                Lang::TypeScript,
+                "class",
+                false,
+            ),
+            ("module Helpers\nend\n", Lang::Ruby, "module", true),
+            (
+                "declare module \"node:fs\" { }\n",
+                Lang::TypeScript,
+                "module",
+                false,
+            ),
+            ("var Registry = 7\n", Lang::Go, "var_declaration", true),
+            (
+                "trait Store {\n  var slot: Int\n}\n",
+                Lang::Scala,
+                "var_declaration",
+                false,
+            ),
+        ];
+        for (src, lang, kind, want) in cases {
+            let tree = parse(src, *lang);
+            let node = find_by_kind(tree.root_node(), kind);
+            assert_eq!(
+                is_definition_node(node, Some(*lang)),
+                *want,
+                "{kind} in {lang:?} — {src:?}"
+            );
+        }
     }
 
     #[test]

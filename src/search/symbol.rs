@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use super::file_metadata;
 use crate::lang::treesitter::{
-    definition_weight_for, elixir_definition_weight, extract_definition_name,
+    definition_site, definition_weight_for, elixir_definition_weight, extract_definition_name,
     extract_definition_names, extract_elixir_definition_name, extract_impl_trait,
     extract_impl_type, extract_implemented_interfaces, is_definition_node, is_elixir_definition,
 };
@@ -1279,9 +1279,13 @@ fn walk_for_definitions(
             .any(|name| name == query)
         {
             {
-                let line_num = node.start_position().row as u32 + 1;
+                // Not `node` — a Go grouped declaration declares several names over many
+                // lines, and each must report its own spec's range rather than the block's.
+                // See `definition_site`; for every other language and shape it is `node`.
+                let site = definition_site(node, lines, query);
+                let line_num = site.start_position().row as u32 + 1;
                 let line_text = lines
-                    .get(node.start_position().row)
+                    .get(site.start_position().row)
                     .unwrap_or(&"")
                     .trim_end();
                 emit(Match {
@@ -1293,8 +1297,8 @@ fn walk_for_definitions(
                     file_lines,
                     mtime,
                     def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
+                        site.start_position().row as u32 + 1,
+                        site.end_position().row as u32 + 1,
                     )),
                     def_name: Some(query.to_string()),
                     def_weight: definition_weight_for(node),
