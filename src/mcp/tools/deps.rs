@@ -20,7 +20,7 @@ pub(in crate::mcp) fn tool_deps(
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
     let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let scope = resolve_scope(args, root)?;
     let budget = args
         .get("budget")
         .and_then(serde_json::Value::as_u64)
@@ -28,9 +28,7 @@ pub(in crate::mcp) fn tool_deps(
 
     let deps_result =
         crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
-    let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&crate::search::deps::format_deps(&deps_result, budget));
-    Ok(output)
+    Ok(crate::search::deps::format_deps(&deps_result, budget))
 }
 
 #[cfg(test)]
@@ -75,24 +73,52 @@ mod tests {
         );
     }
 
-    /// #97 through the layer that shipped it, and on the platform that shipped it.
+    /// A `scope` that does not exist is refused, not widened to `root`.
     ///
-    /// `resolve_scope` canonicalizes every scope it resolves, so the one spelling that reaches
-    /// `analyze_deps` uncanonicalized is its missing-directory fallback: a `scope` that is not a
-    /// directory plus an absolute `root` returns that **`root` as the caller spelled it**
-    /// (`resolve_scope`'s `Some(r) if r.is_absolute()` arm). #97 called this the cheapest
-    /// reproduction, and it was measured by hand and guarded by nothing.
+    /// This replaces `a_non_canonical_root_fallback_does_not_make_a_file_its_own_dependent`,
+    /// which drove #97 through this layer using the missing-directory root fallback — the one
+    /// spelling that reached `analyze_deps` uncanonicalized. That fallback is gone: it silently
+    /// substituted a search the caller never asked for, and on a real Unreal checkout turned a
+    /// one-file scope into a 2M-file walk.
     ///
-    /// The `root` here is deliberately spelled `<tmp>/src/..`, which is non-canonical on every
-    /// platform. That matters: a plain tempdir path is already canonical on the Linux runner, so
-    /// the same test written the obvious way would exercise nothing there — which is the platform
-    /// the defect actually shipped on, since `resolve_scope`'s other uncanonical spelling (a
-    /// literal `"."`) can only arise on Linux.
-    ///
-    /// Asserts the *quiet* half. The rendering was the visible symptom; a file reported as its own
-    /// dependent is the wrong answer, and the one worth a layer test.
+    /// Deleting it costs no coverage, which was checked rather than assumed: on `main`, that test
+    /// **passed with #97's `scope.canonicalize()` reverted**. Its assertion could not fail against
+    /// that revert, because #98 had already moved the self-reference filter onto
+    /// `CallerMatch::identity` (a canonicalized path) and so made it independent of how `scope` is
+    /// spelled. What genuinely holds #97 down is the rendering pair in
+    /// `search::deps::scope_spelling_tests` — see the table on that module.
     #[test]
-    fn a_non_canonical_root_fallback_does_not_make_a_file_its_own_dependent() {
+    fn a_missing_scope_is_refused_rather_than_widened_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("target.rs"), "pub fn shared() -> u32 { 1 }\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": src.join("target.rs").to_str().unwrap(),
+            "scope": "no_such_dir",
+            "root": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_deps(&args, &bloom())
+            .expect_err("a scope that does not exist must be refused, not silently widened");
+
+        assert!(
+            err.contains("no_such_dir") && err.contains("does not exist"),
+            "refusal must name the bad scope: {err}"
+        );
+    }
+
+    /// A file `scope` is refused here too, and — the point of the test — refused *before*
+    /// `analyze_deps` runs, so it cannot answer with the include-boundary defect.
+    ///
+    /// `scope` is the containment boundary `resolve_c_include` uses. Handing it a file makes
+    /// `is_within(dir, boundary)` false for every directory, so local headers resolve as
+    /// external. Measured on a build that accepted file scopes: a UE-style
+    /// `#include "Module/Public/Thing.h"` went from `1 local, 0 external` to
+    /// `0 local, 1 external`. Refusing keeps that unreachable until the walk-root and
+    /// boundary roles are actually separated.
+    #[test]
+    fn a_file_scope_is_refused_before_deps_can_misclassify_includes() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -101,28 +127,18 @@ mod tests {
             "pub fn shared() -> u32 { 1 }\npub fn inner() -> u32 { shared() + 1 }\n",
         )
         .unwrap();
-        std::fs::write(
-            src.join("a.rs"),
-            "use crate::target::shared;\n\npub fn go() -> u32 { shared() }\n",
-        )
-        .unwrap();
 
         let args = serde_json::json!({
             "path": src.join("target.rs").to_str().unwrap(),
-            "scope": "no_such_dir",
-            "root": tmp.path().join("src/..").to_str().unwrap(),
+            "scope": src.join("target.rs").to_str().unwrap(),
+            "root": tmp.path().to_str().unwrap(),
         });
-        let out = tool_deps(&args, &bloom()).expect("missing scope + absolute root must not error");
+        let err = tool_deps(&args, &bloom())
+            .expect_err("a file scope must be refused until the boundary role is split out");
 
         assert!(
-            out.contains("1 dependent"),
-            "control failed: the fixture must produce exactly the one real dependent, or the \
-             assertion below proves nothing:\n{out}"
-        );
-        assert!(
-            !out.contains("target.rs:"),
-            "the target is listed among its own dependents — the self-reference filter compared \
-             a canonical target against paths spelled like the raw root (#97):\n{out}"
+            err.contains("not a directory") && err.contains("parent directory"),
+            "refusal must diagnose the file and name the fix: {err}"
         );
     }
 

@@ -785,10 +785,38 @@ fn assemble(parts: &[&str]) -> String {
 ///
 /// Nothing therefore covers `analyze_deps` under a literal `"."` scope — that MCP-layer test pins
 /// what `resolve_scope` returns and never calls deps at all. What is covered instead is the
-/// mechanism the `"."` spelling triggers, plus the same mismatch through the MCP layer in
-/// `mcp::tools::deps::tests`, which reaches it through `resolve_scope`'s root fallback and so runs
-/// on the Linux CI runner. Stated because "the MCP-layer test covers it" was the earlier claim
-/// here and overstated what that test does.
+/// mechanism the `"."` spelling triggers.
+///
+/// This used to also claim coverage from `mcp::tools::deps::tests`, reached through
+/// `resolve_scope`'s missing-directory root fallback. That fallback is gone (it widened a one-file
+/// scope to the whole checkout), and the claim was worth less than it looked even before that:
+/// **that test passed with this fix reverted.** Measured, not assumed — neutering
+/// `scope.canonicalize()` and re-running left it green.
+///
+/// Which of the tests below actually hold this fix down, same method:
+///
+/// | test | catches a reverted `scope.canonicalize()`? |
+/// |---|---|
+/// | `in_scope_paths_render_relatively_under_either_spelling` | **yes** |
+/// | `used_by_lists_same_directory_dependents_first`          | **yes** |
+/// | `a_non_canonical_scope_spelling_gives_the_same_answer`   | no |
+/// | `the_target_is_never_its_own_dependent`                  | no |
+/// | `a_target_reached_through_a_symlink_is_not_its_own_dependent` | no |
+///
+/// So the *rendering* half of #97 is what these guard; the self-reference half is not vacant but is
+/// held elsewhere, and not by scope canonicalization at all. #98 replaced that filter's comparison
+/// with `CallerMatch::identity`, which is `path` canonicalized — so it now agrees with the
+/// canonicalized target on every platform no matter how `scope` was spelled. The three "no" rows
+/// are the same statement from three angles; they guard #98's identity/spelling split instead.
+/// Recorded so the next reader does not mistake a green self-reference test for evidence about
+/// this line.
+///
+/// The residual, stated exactly rather than as "no fixture can": `identity` is
+/// `path.canonicalize().unwrap_or(path)`, and on that fallback it carries a spelling instead of an
+/// identity, which is the one shape that could resurface the symptom by this route. It is not
+/// constructible here — the target's own `canonicalize` is `?`-propagated at the top of
+/// `analyze_deps`, so a tree where canonicalize fails errors out before any assertion runs, and the
+/// walker drops `Err` entries before they become matches. See `CallerMatch::identity`.
 #[cfg(test)]
 mod scope_spelling_tests {
     use super::{analyze_deps, format_deps};

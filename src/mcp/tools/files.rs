@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_files(args: &Value) -> Result<String, String> {
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let scope = resolve_scope(args, root)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let single = args.get("pattern").and_then(|v| v.as_str());
@@ -41,9 +41,7 @@ pub(in crate::mcp) fn tool_files(args: &Value) -> Result<String, String> {
     }
     let combined = blocks.join("\n\n");
 
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(&combined, budget));
-    Ok(result)
+    Ok(apply_budget(&combined, budget))
 }
 
 #[cfg(test)]

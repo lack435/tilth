@@ -23,7 +23,7 @@ pub(in crate::mcp) fn tool_search(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let scope = resolve_scope(args, root)?;
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -101,9 +101,7 @@ pub(in crate::mcp) fn tool_search(
     }
     .map_err(|e| e.to_string())?;
 
-    let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(&output, budget));
-    Ok(result)
+    Ok(apply_budget(&output, budget))
 }
 
 #[cfg(test)]

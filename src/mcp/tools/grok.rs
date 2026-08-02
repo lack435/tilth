@@ -20,7 +20,7 @@ pub(in crate::mcp) fn tool_grok(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let scope = resolve_scope(args, root)?;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let caps = if full {
         crate::search::grok::GrokCaps::full()
@@ -30,7 +30,5 @@ pub(in crate::mcp) fn tool_grok(
 
     let result = crate::search::grok::grok(target, &scope, bloom, session, caps)
         .map_err(|e| e.to_string())?;
-    let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&crate::search::grok::format_grok(&result, &scope));
-    Ok(output)
+    Ok(crate::search::grok::format_grok(&result, &scope))
 }

@@ -31,11 +31,11 @@ pub(in crate::mcp) fn tool_read(
     // after the work is done — and so the refusal is uniform across single and batch
     // reads even though only a single read emits the hint that uses it.
     //
-    // The soft warning is dropped. `resolve_scope` emits one when the named directory does
-    // not exist and it falls back to `root`; `deps` prepends it because scope decides what
-    // that tool searches, whereas here it only tunes an advisory hint appended to content
-    // the caller did get. The hard-error half is what carries the discipline.
-    let (scope, _scope_warning) = resolve_scope(args, root)?;
+    // There is no soft-warning half left to drop: `resolve_scope` either returns a directory
+    // the caller asked for or refuses. It used to fall back to `root` with a warning when the
+    // named directory did not exist, and that fallback is what let a one-file scope silently
+    // become a whole-checkout walk.
+    let scope = resolve_scope(args, root)?;
     let full_flag = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
