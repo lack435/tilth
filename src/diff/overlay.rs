@@ -423,6 +423,28 @@ fn parse_ref_range(reff: &str) -> Option<RefRange> {
     })
 }
 
+/// Rewrite a symmetric range into the plain range it stands for.
+///
+/// `a...b` becomes `<merge-base>..b`, resolved once. Returns `None` when the
+/// source needs no rewriting, so callers can keep borrowing the original.
+///
+/// The error case is deliberately fatal rather than per-file: if the base of
+/// the range cannot be resolved, no file in the diff can be analyzed, and N
+/// abandoned overlays communicate that far worse than one message.
+pub(crate) fn pin_range_to_merge_base(source: &DiffSource) -> Result<Option<DiffSource>, String> {
+    let DiffSource::GitRef(reff) = source else {
+        return Ok(None);
+    };
+    let Some(range) = parse_ref_range(reff) else {
+        return Ok(None);
+    };
+    if !range.symmetric {
+        return Ok(None);
+    }
+    let base = merge_base(&range.left, &range.right)?;
+    Ok(Some(DiffSource::GitRef(format!("{base}..{}", range.right))))
+}
+
 /// Resolve the merge base of two revs, as `git diff a...b` does internally.
 fn merge_base(left: &str, right: &str) -> Result<String, String> {
     let output = Command::new("git")
@@ -850,6 +872,26 @@ mod tests {
             (open_left.left.as_str(), open_left.right.as_str()),
             ("HEAD", "main")
         );
+    }
+
+    #[test]
+    fn pinning_leaves_everything_but_symmetric_ranges_alone() {
+        // Only `a...b` needs a merge-base call. Everything else must return
+        // None with no subprocess, so the hot path stays free of one.
+        for source in [
+            DiffSource::GitUncommitted,
+            DiffSource::GitStaged,
+            DiffSource::GitRef("HEAD".to_string()),
+            DiffSource::GitRef("main..feature".to_string()),
+            DiffSource::Patch(std::path::PathBuf::from("x.patch")),
+        ] {
+            assert!(
+                pin_range_to_merge_base(&source)
+                    .expect("no git call, so no failure")
+                    .is_none(),
+                "{source:?} must not be rewritten"
+            );
+        }
     }
 
     #[test]

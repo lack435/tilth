@@ -267,13 +267,24 @@ pub fn diff(
         return Ok("No changes.".to_string());
     }
 
-    // 2. Build structural overlays in parallel — each FileDiff is independent
+    // 2. Pin a symmetric range to its merge base once, up front.
+    //
+    // `get_old_content` runs inside the parallel map below, once per file, so
+    // resolving `a...b` down there would spawn a `git merge-base` per file —
+    // a subprocess apiece on a wide diff. Rewriting the range to `<sha>..b`
+    // here costs one call and leaves every reader downstream on the plain-range
+    // path. It also pins the answer: a concurrent ref move mid-diff can no
+    // longer give two files different old sides.
+    let overlay_source = overlay::pin_range_to_merge_base(source)?;
+    let overlay_source = overlay_source.as_ref().unwrap_or(source);
+
+    // 3. Build structural overlays in parallel — each FileDiff is independent
     // and `compute_overlay` constructs its own tree-sitter parser per call
     // (see `lang::outline::get_outline_entries`), so no shared mutable state
     // crosses worker boundaries.
     let mut overlays: Vec<FileOverlay> = file_diffs
         .par_iter()
-        .map(|fd| overlay::compute_overlay(fd, source))
+        .map(|fd| overlay::compute_overlay(fd, overlay_source))
         .collect();
 
     // 3. Cross-file move detection.
