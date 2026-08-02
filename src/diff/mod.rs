@@ -219,10 +219,27 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
 
-    // git diff --no-index exits 1 when there are differences; that is normal.
-    // For all other variants, a non-zero exit is unexpected but we still return
-    // whatever stdout was produced so the caller can decide.
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // git diff --no-index exits 1 when there are differences; that is normal,
+    // and so is any non-zero exit that still produced a diff — the caller can
+    // decide what to make of it.
+    //
+    // Failing with *nothing* on stdout is different: `diff()` reads empty
+    // output as "No changes." and exits 0, so `tilth diff base..typo` reported
+    // a clean tree for a ref that does not exist. Same danger as #111 — an
+    // error dressed up as authoritative evidence — one layer up.
+    if !output.status.success() && stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("git diff failed ({})", output.status)
+        } else {
+            format!("git diff failed: {detail}")
+        });
+    }
+
+    Ok(stdout)
 }
 
 /// Full diff orchestrator — parse → overlay → format pipeline.
@@ -1163,7 +1180,34 @@ diff --git a/src/main.rs b/src/main.rs
         dir
     }
 
-    // 19. test_symmetric_ref_range_uses_merge_base
+    // 19. test_bad_ref_is_an_error_not_no_changes
+    #[test]
+    fn test_bad_ref_is_an_error_not_no_changes() {
+        let dir = setup_test_repo();
+
+        // `git diff` exits 128 here and writes nothing to stdout. Reporting
+        // that as "No changes." with a zero exit is the #111 danger in its
+        // purest form: a failure that reads as evidence of a clean tree.
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("HEAD..no-such-ref-xyz".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        let err = result.expect_err("a nonexistent ref must not succeed");
+        assert!(
+            err.contains("git diff failed"),
+            "error must say git failed, got {err:?}"
+        );
+        assert!(
+            !err.contains("No changes"),
+            "a bad ref must never be reported as no changes, got {err:?}"
+        );
+    }
+
+    // 20. test_symmetric_ref_range_uses_merge_base
     #[test]
     fn test_symmetric_ref_range_uses_merge_base() {
         let dir = setup_diverged_repo();
@@ -1212,7 +1256,7 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
-    // 20. test_symmetric_ref_range_file_scope
+    // 21. test_symmetric_ref_range_file_scope
     #[test]
     fn test_symmetric_ref_range_file_scope() {
         let dir = setup_diverged_repo();
