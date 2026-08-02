@@ -199,29 +199,54 @@ const EVICT_FREE_FRACTION: usize = 10;
 /// wrong costs a rebuild for no gain at all, so the only reason to reclaim is that the memory is
 /// genuinely dead — and the horizon is what separates "dead" from "waiting its turn in a rotation".
 ///
-/// An entry in a rotation over k scopes is re-probed every k passes, so any bound below k evicts a
-/// live working set; a dead entry is never probed again and crosses any bound eventually. So this
-/// wants to be comfortably larger than the longest rotation a session plausibly runs, and it costs
-/// nothing but latency to make it so.
+/// An entry in a rotation over k scopes is re-probed every k passes, so a bound below k reaches it
+/// while it is still wanted; a dead entry is never probed again and crosses any bound eventually.
+/// A rotation of exactly k is safe at a bound of k only because `fresh_entry` gives a new entry its
+/// grace bit — born clear, the drain sweep at the close of the admitting pass charges it a tick and
+/// the horizon protects k-1 instead. Review measured that off-by-one at 21.6 points on a 16-scope
+/// rotation, and it is permanent rather than a first-cycle artefact, since an evicted entry is
+/// rebuilt and born again.
 ///
-/// 16 protects rotations up to sixteen disjoint scopes. Measured on
-/// `a_rotation_over_three_or_more_scopes_does_not_collapse`, whose worst row is ten scopes at 0.70x
-/// the union: identical to the no-drain policy on every row. A rotation longer than sixteen would
-/// begin to lose entries, bounded by `EVICT_FREE_FRACTION` per sweep — a slope, not the cliff an
-/// uncapped sweep had, and the reason this is a horizon rather than a cliff-edge test.
+/// **This is a tuning parameter and the file should not pretend otherwise.** An earlier version of
+/// this comment called 16 a safety bound and claimed a rotation past it would lose entries only on
+/// a slope; both were wrong. Behaviour past the horizon was a step, not a slope — 76.7% at ten
+/// scopes to 5.9% at seventeen — and nothing about 16 argues for it over 64 or 256. What makes the
+/// constant *survivable* is not its size but the progress test in `sweep`, which stops a drain that
+/// is churning rather than reclaiming. With that in place the step is gone: measured across
+/// rotations of 15, 16, 17, 18, 20 and 25 disjoint scopes whose union fits the ceiling, every one
+/// lands at 73-77% with the live set fully resident. See
+/// `a_rotation_past_the_drain_horizon_is_not_churned`, which brackets this constant on both sides
+/// for that reason.
 ///
-/// The cost is latency. A dead set needs sixteen quiet passes before the first byte comes back and
-/// `EVICT_FREE_FRACTION` more to finish, so ~25 calls on the #40 fixture. That is the right trade
-/// when the thing being recovered is memory that is costing no hit rate: nothing is waiting on it,
-/// so nothing is gained by being quick and something real is lost by being wrong.
+/// So what 16 buys is how many rounds of a too-long rotation get churned before the drain gives up,
+/// and what it costs is latency: a dead set needs sixteen quiet passes before the first byte comes
+/// back, plus `EVICT_FREE_FRACTION` more sweeps to finish. On the #40 fixture the reclaim releases
+/// its first bytes at call ~18 and completes by call 28. That is the right trade for memory that is
+/// costing no hit rate — nothing is waiting on it, so nothing is gained by being quick.
 const QUIET_SWEEPS_BEFORE_RECLAIM: u8 = 16;
+
+/// Consecutive drain sweeps that must achieve nothing before the drain disarms.
+///
+/// Two, not one, and the reason is `fresh_entry`'s birth value. `probed_since_drain` is born set,
+/// so the first drain sweep after a workload settles spends that grace bit rather than reading
+/// evidence — every entry reads "probed" whether or not anything has probed it. Disarming on that
+/// sweep stops the drain before it has looked at anything, which is one of the ways this fix failed
+/// in development; see `drain_armed`. The second sweep is the first one whose answer means what it
+/// says.
+///
+/// It is also the bound on how long a too-short horizon can churn: the drain gives up two sweeps
+/// after it stops making progress, so the damage is a fixed number of rounds rather than a steady
+/// state. `a_rotation_past_the_drain_horizon_is_not_churned` fails at 1 in the other direction —
+/// one fruitless sweep is reached during the ordinary warm-up, before anything is old enough to
+/// release.
+const FRUITLESS_DRAINS_BEFORE_DISARM: usize = 2;
 
 /// Which question a sweep is answering. See `BloomFilterCache::sweep`.
 #[derive(Clone, Copy)]
 enum Sweep {
     /// The pass refused an admission: something is waiting for these bytes.
     Pressured,
-    /// Nothing was refused, and an earlier sweep left entries it could not fit under its cap.
+    /// Nothing was refused, and the drain is armed — see `BloomFilterCache::drain_armed`.
     Drain,
 }
 
@@ -270,19 +295,20 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// make it perfect in order to hold 32 MB it could never use.
 ///
 /// Five calls is the window #40 specified, and it is too short to show the whole shape. The same
-/// sequence run for thirty:
+/// sequence run for thirty-five:
 ///
 /// ```text
 ///                        hit rate   resident after
 /// refusing                   0.0%          32.0 MB
-/// sweeping                  90.0%           1.9 MB
-/// fresh cache (control)     96.7%           1.9 MB
+/// sweeping                  91.4%           1.9 MB
+/// fresh cache (control)     97.1%           1.9 MB
 /// ```
 ///
 /// Resident memory returns to exactly the fresh-cache figure, and the hit rate is 100.0% on every
-/// call from the fourth onward — including every call during which the reclaim was running. That
-/// second half is #104 and arrived after #40 was closed; see `drain_armed` for the mechanism and
-/// `QUIET_SWEEPS_BEFORE_RECLAIM` for why it takes until call ~18 to start.
+/// call from the fourth onward — including every call during which the reclaim was running. Per
+/// call: the reclaim releases its first bytes at ~18, finishes by 28, and from 29 the cache stops
+/// scanning at all. That second half is #104 and arrived after #40 was closed; see `drain_armed`
+/// for the mechanism and `QUIET_SWEEPS_BEFORE_RECLAIM` for the latency.
 ///
 /// **The 40% is adaptation latency, not the steady state.** Per call, sweeping arm: calls 0 and 1
 /// age the dead set out, call 2 admits the subtree, calls 3 and 4 run at 100.0%. The fresh
@@ -425,9 +451,14 @@ fn entry_bytes(filter: &BloomFilter) -> usize {
 /// than refusal.** No real tree is needed to show it and no constant removes it; see
 /// `EVICT_FREE_FRACTION` for the measurement and the mechanism. Capped, the rotation lands 0 to 4.5
 /// points under refusal across three to ten scopes; uncapped it lands at zero. At twenty scopes the
-/// loss widens to ~17 points, which is `QUIET_SWEEPS_BEFORE_RECLAIM`'s horizon being exceeded — but
-/// that row reads the same with the #104 reclaim switched off (41.3% against 41.2%), so it belongs
-/// to the capped sweep rather than to the reclaim.
+/// loss widens to ~17 points. That row belongs entirely to the capped pressured sweep and not to
+/// #104's reclaim — it reads 41.3% with the reclaim switched off against 41.2% with it on — and it
+/// is a fixture whose union (200 entries) exceeds its ceiling (140), so almost every pass takes the
+/// pressured branch and the drain barely runs. An earlier version of this paragraph attributed the
+/// same 17 points to `QUIET_SWEEPS_BEFORE_RECLAIM`'s horizon while citing that measurement as proof
+/// it was not the reclaim; the two halves contradicted each other and the horizon reading was the
+/// wrong one. What the horizon does in the *union-fits* arrangement is a separate matter, measured
+/// where the constant is defined.
 ///
 /// The honest summary of both changes together: a large gain on the shape #40 is about, memory
 /// returned to what the workload actually uses, no change at all on the overloaded single scope or
@@ -547,12 +578,21 @@ pub struct BloomFilterCache {
     /// whatever else is resident stays for the life of the process. On the #40 fixture that is
     /// ~28.8 MB of filters that will never be probed again, inside a 32 MB ceiling.
     ///
-    /// **Armed by any pressured sweep, disarmed by a drain sweep that finds every resident entry
-    /// probed.** Those two are the honest bracketing of "there might be something dead in here":
-    /// a pressured sweep only happens when the budget was in the way, which is the only way a
-    /// resident set the workload has moved off can arise; and a drain sweep that finds nothing
-    /// unprobed has just proved the whole resident set is live, which is the only way to know
-    /// there is nothing left to look for.
+    /// **Armed by any pressured sweep, disarmed by `FRUITLESS_DRAINS_BEFORE_DISARM` drain sweeps
+    /// that achieve nothing.** A pressured sweep only happens when the budget was in the way, which
+    /// is the only way a resident set the workload has moved off can arise. A drain sweep achieves
+    /// nothing when it finds every resident entry probed — the set is live — or when it evicts and
+    /// the resident total does not fall, which means the workload is readmitting as fast as the
+    /// drain releases and the drain is churning rather than reclaiming.
+    ///
+    /// That second condition is not tidiness. Armed is **sticky and has no residency condition**:
+    /// one broad call anywhere in a session arms it for the rest of the process. Without a progress
+    /// test, a rotation longer than `QUIET_SWEEPS_BEFORE_RECLAIM` whose union *fits* the ceiling
+    /// therefore has its live entries evicted on every pass, for ever, while the cache sits at a
+    /// fraction of its budget refusing nothing — review measured 76.7% at ten scopes falling to
+    /// 5.9% at seventeen, a cliff larger than the one `EVICT_FREE_FRACTION` was added to remove.
+    /// A residency floor was tried first and does nothing at all: the workload refills as fast as
+    /// the drain releases, so resident never reaches any floor.
     ///
     /// A first version armed this from the *cap* instead — a sweep that hit `EVICT_FREE_FRACTION`
     /// with entries still in hand. That reads as the tidier receipt and does not work, because
@@ -560,9 +600,15 @@ pub struct BloomFilterCache {
     /// receipt clears, and the drain stops sixteen sweeps before it would have released a byte.
     /// Measured — the dead set sat at 200 of 200 entries for 45 passes.
     ///
-    /// A workload that never refuses never arms it, so it never sweeps: `a_cache_with_room_to_spare
-    /// _never_sweeps` holds unchanged, and so does the rotation whose union fits the ceiling.
+    /// A workload that has never refused anything never arms it and never sweeps, which is what
+    /// `a_cache_with_room_to_spare_never_sweeps` pins. That is a narrower claim than it looks: one
+    /// refusal anywhere in the session is enough, so it does **not** extend to a union-fits rotation
+    /// entered after a broad call. An earlier version of this comment said it did.
     drain_armed: std::sync::atomic::AtomicBool,
+    /// Consecutive drain sweeps that achieved nothing. See `FRUITLESS_DRAINS_BEFORE_DISARM`.
+    fruitless_drains: std::sync::atomic::AtomicUsize,
+    /// Resident bytes as of the last drain sweep, for the progress test in `sweep`.
+    last_drain_bytes: std::sync::atomic::AtomicUsize,
     /// Sweeps run, and entries they dropped. Report-only, for the harness in `mod adaptivity`.
     sweeps: std::sync::atomic::AtomicUsize,
     evictions: std::sync::atomic::AtomicUsize,
@@ -632,6 +678,8 @@ impl BloomFilterCache {
             pass_refusals: std::sync::atomic::AtomicUsize::new(0),
             sweeping: std::sync::atomic::AtomicBool::new(false),
             drain_armed: std::sync::atomic::AtomicBool::new(false),
+            fruitless_drains: std::sync::atomic::AtomicUsize::new(0),
+            last_drain_bytes: std::sync::atomic::AtomicUsize::new(0),
             sweeps: std::sync::atomic::AtomicUsize::new(0),
             evictions: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -778,8 +826,9 @@ impl BloomFilterCache {
         });
     }
 
-    /// Age every entry, and drop those unprobed for `IDLE_SWEEPS_BEFORE_EVICTION` consecutive
-    /// sweeps — up to `EVICT_FREE_FRACTION` of the ceiling in one go.
+    /// Age every entry on `kind`'s clock, and drop those unprobed past that clock's bound —
+    /// `IDLE_SWEEPS_BEFORE_EVICTION` under pressure, `QUIET_SWEEPS_BEFORE_RECLAIM` for a drain —
+    /// up to `EVICT_FREE_FRACTION` of the ceiling in one go.
     ///
     /// `retain` takes one shard's write lock at a time and calls the closure while holding it, so
     /// the `sub_bytes` below is inside the lock for the key it is un-charging. That is the same
@@ -850,10 +899,43 @@ impl BloomFilterCache {
         match kind {
             // Any pressured sweep means the budget was in the way, which is the only way a resident
             // set the workload has moved off can come about. Look for one.
-            Sweep::Pressured => self.drain_armed.store(true, Relaxed),
-            // A drain sweep that found every resident entry probed has proved there is nothing to
-            // reclaim. Stop scanning until pressure says otherwise.
-            Sweep::Drain => self.drain_armed.store(found_idle, Relaxed),
+            Sweep::Pressured => {
+                self.drain_armed.store(true, Relaxed);
+                self.fruitless_drains.store(0, Relaxed);
+            }
+            Sweep::Drain => {
+                // Two ways for a drain sweep to be pointless, and it disarms on either.
+                //
+                // *Nothing idle* — every resident entry was probed — means there is nothing to
+                // reclaim. *Evicting without the resident set falling* means the reclaim is not
+                // reclaiming: the workload is re-admitting as fast as the drain releases, so the
+                // drain is not freeing memory, it is churning live entries. That second condition
+                // is what bounds a horizon too short for the workload. Without it the drain is
+                // process-sticky with no residency condition — one broad call anywhere in a session
+                // arms it for ever, and a rotation longer than `QUIET_SWEEPS_BEFORE_RECLAIM` then
+                // has its *live* entries evicted on every pass while the cache sits at a fraction
+                // of its ceiling refusing nothing. Review measured that at 76.7% falling to 5.9%
+                // between 16 and 17 scopes: a cliff larger than the one `EVICT_FREE_FRACTION` was
+                // added to remove, reached from the same "natural agent shape" #40 is about.
+                //
+                // `evicted > 0` is what keeps the progress test off the warm-up. For the first
+                // `QUIET_SWEEPS_BEFORE_RECLAIM` sweeps nothing is old enough to release, so the
+                // resident set is flat for a reason that has nothing to do with churn — and a
+                // progress test that fired there would disarm the drain before it ever ran. A
+                // residency floor was tried first and does not work at all: the workload refills
+                // as fast as the drain releases, so resident never reaches any floor.
+                let before = self.last_drain_bytes.swap(self.cached_bytes(), Relaxed);
+                let fruitless = !found_idle || (evicted > 0 && self.cached_bytes() >= before);
+                let count = if fruitless {
+                    self.fruitless_drains.fetch_add(1, Relaxed) + 1
+                } else {
+                    self.fruitless_drains.store(0, Relaxed);
+                    0
+                };
+                if count >= FRUITLESS_DRAINS_BEFORE_DISARM {
+                    self.drain_armed.store(false, Relaxed);
+                }
+            }
         }
         self.sweeps.fetch_add(1, Relaxed);
         self.evictions.fetch_add(evicted, Relaxed);
@@ -1128,14 +1210,20 @@ fn fresh_entry(filter: BloomFilter, mtime: SystemTime, cost: usize) -> CachedFil
         mtime,
         bytes: cost,
         probed: std::sync::atomic::AtomicBool::new(true),
-        // `false`, unlike `probed`. The grace period that bit gives a freshly built filter is for
-        // the pressured path, whose bound is two sweeps — short enough that admitting during a pass
-        // and being aged at the end of it would eat the work. The drain's horizon is
-        // `QUIET_SWEEPS_BEFORE_RECLAIM`, so grace buys nothing, and starting `true` actively breaks
-        // it: the first drain sweep after a workload settles would find every entry "probed", read
-        // that as proof the resident set is live, and disarm sixteen sweeps before it could release
-        // anything. Measured — the dead set sat at 200 of 200 entries for 45 passes.
-        probed_since_drain: std::sync::atomic::AtomicBool::new(false),
+        // Born set, like `probed`, and the reasoning that said otherwise was wrong in a way worth
+        // recording. Starting it clear does make the first drain sweep read real evidence — but it
+        // also charges a freshly admitted entry one `quiet_idle` tick at the close of the very pass
+        // that admitted it, so the horizon protects a rotation of only
+        // `QUIET_SWEEPS_BEFORE_RECLAIM - 1` scopes rather than the number it names. Because an
+        // evicted entry is rebuilt and born again, the shortfall is permanent rather than a
+        // first-cycle artefact. Review measured the off-by-one directly: at a bound of 16 a
+        // 16-scope rotation lost 21.6 points, and 17 collapsed.
+        //
+        // The reason it was set clear — that born-set makes the first drain sweep see every entry
+        // as probed and disarm before releasing anything — is real, and is fixed where it belongs,
+        // in `CLEAN_DRAINS_BEFORE_DISARM`: the first sweep spends the grace bit, the second reads
+        // evidence.
+        probed_since_drain: std::sync::atomic::AtomicBool::new(true),
         idle: 0,
         quiet_idle: 0,
     }
@@ -2382,10 +2470,24 @@ mod tests {
                 settled_at = Some(pass);
             }
         }
+        // Asserted as a range, not merely `is_some`. `QUIET_SWEEPS_BEFORE_RECLAIM` quiet passes
+        // must elapse before the first byte moves, and `EVICT_FREE_FRACTION` bounds the rest, so
+        // the arrival is predictable and a version of this test that only asked "did it ever
+        // drain" could not tell a horizon silently doubling from one working as designed.
+        let settled_at = settled_at.unwrap_or_else(|| {
+            panic!(
+                "the dead set never drained: {} entries still resident after 40 settled passes",
+                cache.resident_entries()
+            )
+        });
         assert!(
-            settled_at.is_some(),
-            "the dead set never drained: {} entries still resident after 40 settled passes",
-            cache.resident_entries()
+            (16..=32).contains(&settled_at),
+            "drained at pass {settled_at}, outside the window the two constants predict"
+        );
+        assert_eq!(
+            cache.cached_bytes(),
+            cache.summed_entry_bytes(),
+            "the drain lost track of the budget"
         );
 
         // And the live scope never stopped being served while that happened.
@@ -2440,6 +2542,123 @@ mod tests {
             cache.sweeps_run(),
             swept,
             "a fully drained cache is still scanning the map on every pass"
+        );
+    }
+
+    /// A rotation longer than the drain's horizon must not have its live set churned.
+    ///
+    /// The regime review found, and the one nothing covered: a workload whose scopes *fit* the
+    /// ceiling together, entered after any pressured sweep anywhere in the session. One broad call
+    /// is enough to arm the drain, and `drain_armed` has no residency condition — so with a horizon
+    /// shorter than the rotation, every scope crosses it while its neighbours are walked and the
+    /// drain evicts live entries on every pass, for ever, while the cache sits at a fraction of its
+    /// ceiling refusing nothing. Measured before the fix: 76.7% at 10 scopes falling to 5.9% at 17,
+    /// a cliff larger than the one `EVICT_FREE_FRACTION` was added to remove.
+    ///
+    /// The rotation lengths bracket `QUIET_SWEEPS_BEFORE_RECLAIM` deliberately — below it, at it,
+    /// and well past it — because the failure is a step at the horizon rather than a slope, and a
+    /// fixture that stops short of the constant cannot see it. `a_rotation_over_three_or_more_scopes
+    /// _does_not_collapse` stops at ten, which is why this needed its own test.
+    ///
+    /// Two assertions, and the second is the one that would have caught it: the live set must end
+    /// up **fully resident**, which it cannot be if the drain is evicting it as fast as the
+    /// workload readmits it.
+    #[test]
+    fn a_rotation_past_the_drain_horizon_is_not_churned() {
+        let content = ident_content(200);
+        let cost = cost_of(&content);
+        for scopes in [
+            QUIET_SWEEPS_BEFORE_RECLAIM as usize - 1,
+            QUIET_SWEEPS_BEFORE_RECLAIM as usize,
+            QUIET_SWEEPS_BEFORE_RECLAIM as usize + 1,
+            QUIET_SWEEPS_BEFORE_RECLAIM as usize + 9,
+        ] {
+            let cache = BloomFilterCache::with_ceiling(cost * 200);
+            // One broad pass, which fills the ceiling and refuses. That alone arms the drain.
+            {
+                let _pass = cache.begin_pass();
+                for f in 0..400 {
+                    probe(&cache, &format!("/broad/{f}.rs"), &content);
+                }
+            }
+            assert!(
+                cache.admissions_refused() > 0,
+                "the broad pass did not fill"
+            );
+
+            // Then a rotation whose union — 5 files per scope — fits the ceiling with room over.
+            let (hits, builds) = (cache.cache_hits(), cache.filters_built());
+            for _ in 0..6 {
+                for s in 0..scopes {
+                    let _pass = cache.begin_pass();
+                    for f in 0..5 {
+                        probe(&cache, &format!("/s{s}/{f}.rs"), &content);
+                    }
+                }
+            }
+            let (hits, builds) = (cache.cache_hits() - hits, cache.filters_built() - builds);
+
+            assert_eq!(
+                cache.resident_entries(),
+                scopes * 5,
+                "{scopes} scopes: the live set is not fully resident, so the drain is evicting it \
+                 as fast as the workload readmits it"
+            );
+            // Six rounds over k scopes: the first round is cold, the rest hit. Anything near that
+            // means the rotation is being served; the pre-fix policy scored under a tenth of it.
+            assert!(
+                hits * 3 >= (hits + builds) * 2,
+                "{scopes} scopes: rotation churned — {hits} hits of {} probes",
+                hits + builds
+            );
+        }
+    }
+
+    /// A cache whose file set keeps changing must still stop scanning.
+    ///
+    /// `drain_armed` is cleared by a drain sweep that achieves nothing, and review found the first
+    /// version of that test — "found every entry probed" — cannot fire when anything is admitted or
+    /// re-admitted between passes: a freshly built entry reads as unprobed by construction. The
+    /// shape is not exotic. It is edit mode: `tilth_write` changes a file, the next `blast_radius`
+    /// walk rebuilds that file's filter, and the cache pays a full `retain` over the map on every
+    /// call for the rest of the process.
+    #[test]
+    fn a_cache_whose_files_keep_changing_stops_scanning() {
+        let content = ident_content(200);
+        let cache = BloomFilterCache::with_ceiling(cost_of(&content) * 200);
+        {
+            let _pass = cache.begin_pass();
+            for f in 0..400 {
+                probe(&cache, &format!("/broad/{f}.rs"), &content);
+            }
+        }
+
+        // A stable working set plus one file that is edited between every call.
+        let churned = PathBuf::from("/live/churned.rs");
+        let mut mtime = SystemTime::UNIX_EPOCH;
+        for pass in 0..60 {
+            let _pass = cache.begin_pass();
+            for f in 0..20 {
+                probe(&cache, &format!("/live/{f}.rs"), &content);
+            }
+            mtime += std::time::Duration::from_secs(1);
+            assert!(cache.contains(&churned, mtime, &content, "ident_7"));
+            let _ = pass;
+        }
+
+        let swept = cache.sweeps_run();
+        for _ in 0..10 {
+            let _pass = cache.begin_pass();
+            for f in 0..20 {
+                probe(&cache, &format!("/live/{f}.rs"), &content);
+            }
+            mtime += std::time::Duration::from_secs(1);
+            assert!(cache.contains(&churned, mtime, &content, "ident_7"));
+        }
+        assert_eq!(
+            cache.sweeps_run(),
+            swept,
+            "a cache with one file changing per call never stops scanning the map"
         );
     }
 
