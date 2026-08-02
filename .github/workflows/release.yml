@@ -100,13 +100,52 @@ jobs:
           7z a ../../../tilth-${{ matrix.target }}.zip tilth.exe
           cd ../../..
 
-      # Upload to GitHub release
+      # Upload to GitHub release.
+      #
+      # Assets only. DO NOT add `generate_release_notes` or a `body` here: this step runs once
+      # per matrix target, and either input would rewrite the release body five times over —
+      # `generate_release_notes` by appending a fresh "What's Changed" block each time (#117).
+      # With neither input the action preserves the body `create-release` already set.
       - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # ratchet:softprops/action-gh-release@v3
         with:
           files: |
             tilth-*.tar.gz
             tilth-*.zip
-          generate_release_notes: true
+
+  # After all builds, write the release notes — exactly once.
+  #
+  # The notes cannot be generated in `build`: that job is a matrix, so its upload step runs
+  # once per target, and `generate_release_notes: true` against an already-existing release
+  # *appends* another generated block rather than replacing the body. Five targets meant five
+  # "What's Changed" sections on every release (#117), and the count tracked the matrix, so
+  # adding a target made it worse.
+  #
+  # This runs after the matrix rather than before it so that the release object is still first
+  # created by a build job, with an asset attached. `install.sh` resolves the download URL
+  # through `releases/latest`, so a release published ahead of the matrix would leave every
+  # platform 404ing for the whole build instead of just the targets still in flight.
+  #
+  # The notes are fetched explicitly and passed as `body` rather than via
+  # `generate_release_notes: true`. `body` replaces on update, so re-running the workflow for a
+  # tag rewrites the same notes; asking the action to generate them would append a second copy
+  # and reintroduce the bug from a single job.
+  release-notes:
+    needs: build
+    permissions:
+      contents: write # writes the release body
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body > release-notes.md
+
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # ratchet:softprops/action-gh-release@v3
+        with:
+          body_path: release-notes.md
 
   # After all builds, publish to crates.io.
   #
