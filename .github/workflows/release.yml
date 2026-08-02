@@ -11,7 +11,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Fail fast if Cargo.toml and npm/package.json versions don't match the tag
+  # Fail fast if Cargo.toml, npm/package.json, or Cargo.lock don't match the tag.
+  #
+  # All three matter. The `build` matrix compiles with `--locked`, which refuses a lockfile
+  # whose recorded version disagrees with the manifest, so a release commit that bumps two of
+  # the three places CLAUDE.md names would clear this gate and then fail all five build jobs —
+  # across three operating systems, after the cross toolchain has been installed on each — with
+  # a lockfile error that names no missed step. Checking the lock here turns that into one
+  # message from one cheap job.
+  #
+  # Scope: this compares the version field only — the thing the three-place bump ritual gets
+  # wrong. A lock that is stale some other way (a dependency added without relocking) still
+  # reaches `--locked` in the matrix; `ci.yml` builds with `--locked` to catch that at PR time,
+  # while the developer is still iterating.
   version-check:
     runs-on: ubuntu-latest
     steps:
@@ -21,13 +33,24 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/v}"
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           NPM_VER=$(node -p "require('./npm/package.json').version")
-          echo "Tag: $TAG  Cargo: $CARGO_VER  npm: $NPM_VER"
+          # The lock records every package; the one that tracks the manifest is tilth's own
+          # entry, whose `version` is the line after `name = "tilth"`.
+          LOCK_VER=$(awk '/^name = "tilth"$/{getline; print}' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          echo "Tag: $TAG  Cargo: $CARGO_VER  npm: $NPM_VER  Cargo.lock: $LOCK_VER"
           if [ "$CARGO_VER" != "$TAG" ]; then
             echo "::error::Cargo.toml version ($CARGO_VER) does not match tag ($TAG)"
             exit 1
           fi
           if [ "$NPM_VER" != "$TAG" ]; then
             echo "::error::npm/package.json version ($NPM_VER) does not match tag ($TAG)"
+            exit 1
+          fi
+          if [ -z "$LOCK_VER" ]; then
+            echo "::error::Could not read tilth's version from Cargo.lock — the file may be missing, or its [[package]] entry moved or changed shape"
+            exit 1
+          fi
+          if [ "$LOCK_VER" != "$TAG" ]; then
+            echo "::error::Cargo.lock version ($LOCK_VER) does not match tag ($TAG) — run \`cargo update --workspace\` and commit Cargo.lock"
             exit 1
           fi
 
