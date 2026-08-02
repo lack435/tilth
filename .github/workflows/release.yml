@@ -123,13 +123,73 @@ jobs:
           7z a ../../../tilth-${{ matrix.target }}.zip tilth.exe
           cd ../../..
 
-      # Upload to GitHub release
+      # Upload to GitHub release.
+      #
+      # Assets only. DO NOT add `generate_release_notes` or a `body` here: this step runs once
+      # per matrix target, and either input would rewrite the release body five times over —
+      # `generate_release_notes` by appending a fresh "What's Changed" block each time (#117).
+      # With neither input the action reads the existing body and writes it back unchanged, so
+      # whichever target creates the release leaves the body empty and the rest leave it alone.
+      # The `release-notes` job below fills it in once every target has uploaded.
       - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # ratchet:softprops/action-gh-release@v3
         with:
           files: |
             tilth-*.tar.gz
             tilth-*.zip
-          generate_release_notes: true
+
+  # After all builds, write the release notes — exactly once.
+  #
+  # The notes cannot be generated in `build`: that job is a matrix, so its upload step runs
+  # once per target, and `generate_release_notes: true` against an already-existing release
+  # *appends* another generated block rather than replacing the body. Five targets meant five
+  # "What's Changed" sections on every release (#117), and the count tracked the matrix, so
+  # adding a target made it worse.
+  #
+  # This runs after the matrix rather than before it so that the release is only ever created
+  # by a build job, with an asset already attached. Creating it up front would publish a
+  # release that is immediately the `releases/latest` target and fires `release: published` —
+  # notifying every watcher — while it still has nothing to download, for the whole build.
+  #
+  # The notes are fetched explicitly and passed as `body` rather than via
+  # `generate_release_notes: true`. `body` replaces on update, so re-running the workflow for a
+  # tag rewrites the same notes; asking the action to generate them would append a second copy
+  # and reintroduce the bug from a single job.
+  release-notes:
+    needs: build
+    # Run even when a target failed. `fail-fast: false` means the surviving targets still
+    # publish a release, and that release should carry notes — before this job existed, they
+    # did. The `gh release view` guard below is what makes this safe: on a run where *every*
+    # target failed there is no release, and without the guard the action would take its
+    # create path and publish an assetless release for a build that produced nothing.
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: write # writes the release body
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::warning::No release exists for $TAG, so no build target uploaded one. Skipping notes."
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body > release-notes.md
+          # An empty file is indistinguishable from "no body" to the action: it would fall back
+          # to preserving the existing body, which is empty, and still exit green — leaving a
+          # release with no notes and nothing to show it failed.
+          test -s release-notes.md
+
+      - name: Set the release body
+        if: steps.notes.outputs.release_exists == 'true'
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # ratchet:softprops/action-gh-release@v3
+        with:
+          body_path: release-notes.md
 
   # After all builds, publish to crates.io.
   #
