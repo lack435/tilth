@@ -35,6 +35,12 @@ from parse import RunResult, parse_stream_json, parse_codex_json, tool_call_coun
 from tasks import TASKS
 from fixtures.reset import reset_repo, ensure_repo_clean
 
+# Built-in tools a mode may restrict. Used to translate a mode's allowlist into the
+# denylist form that leaves MCP servers reachable — see the `--tools` handling below.
+# Only the navigation and edit tools the modes actually discriminate on; anything absent
+# here is simply never denied.
+_BUILTIN_TOOLS = ["Read", "Edit", "Write", "Grep", "Glob", "Bash", "WebFetch", "WebSearch"]
+
 
 def _tilth_version() -> Optional[str]:
     """Get the tilth version recorded in results, via `tilth --version`.
@@ -215,8 +221,22 @@ def run_single(
             "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}",
         ]
 
+        # `--tools <explicit list>` suppresses MCP tools entirely on Claude Code 2.1.x,
+        # despite its help text saying it selects "from the built-in set". Measured: with
+        # `--tools default` the agent calls `mcp__tilth__tilth_search`; with
+        # `--tools Read,Edit,Grep,Glob,Bash` and the same --mcp-config it reports having no
+        # tilth tool at all. So every tilth-mode run silently measured baseline.
+        #
+        # Express the same intent as a denylist over the full tool set instead, which leaves
+        # MCP servers reachable.
         if mode.tools:
-            cmd += ["--tools", ",".join(mode.tools)]
+            if mode.mcp_config_path:
+                denied = [t for t in _BUILTIN_TOOLS if t not in mode.tools]
+                cmd += ["--tools", "default"]
+                if denied:
+                    cmd += ["--disallowedTools", ",".join(denied)]
+            else:
+                cmd += ["--tools", ",".join(mode.tools)]
 
         if mode.mcp_config_path:
             cmd += ["--mcp-config", mode.mcp_config_path]
@@ -233,7 +253,14 @@ def run_single(
         cmd,
         cwd=str(repo_path),
         capture_output=True,
-        text=True,
+        # UTF-8 explicitly, not the locale default. `text=True` alone decodes with the
+        # platform encoding, which on Windows is cp1252 — and an agent transcript routinely
+        # carries bytes it cannot represent. The decode then raises *inside subprocess's
+        # reader thread*, so `result.stdout` comes back `None` rather than raising here, and
+        # the failure surfaces much later as `'NoneType' object has no attribute 'strip'` in
+        # `parse_stream_json`. Whole runs were lost to it, scored as errors.
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
         env=env,
     )
@@ -352,6 +379,14 @@ def parse_comma_list(value: str, valid_options: dict, name: str) -> list[str]:
 
 
 def main():
+    # The progress lines carry `✓`/`✗`, which a cp1252 console cannot encode. Printing one
+    # raised, and the `except` that reports the failure raised again on the same character
+    # while formatting its own message — so the run died with a UnicodeEncodeError traceback
+    # and no indication of what had actually gone wrong underneath it.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Run tilth benchmarks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
