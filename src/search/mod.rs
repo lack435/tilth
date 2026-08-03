@@ -263,12 +263,25 @@ where
     >,
 {
     let cancel = crate::cancel::current();
+    // Captured once, here, for the same reason the cancellation token is: a walk belongs to
+    // the request that started it, and a later request taking over the budget must not have
+    // this walk's visits charged against it.
+    let budget_gen = crate::walkbudget::generation();
     walker.run(move || {
         let cancel = cancel.clone();
         let mut inner = factory();
         Box::new(move |entry| {
             if cancel.is_cancelled() {
                 return ignore::WalkState::Quit;
+            }
+            // The ceiling sits here, beside the cancellation check, for the reason the doc
+            // above gives: `filter_entry` is consulted at enumeration, so a walk already
+            // past that point is only stoppable per callback -- and a pathological tree is
+            // exactly the shape that gets past enumeration and then grinds.
+            if let Ok(e) = &entry {
+                if crate::walkbudget::note_visit(budget_gen, e.path()) {
+                    return ignore::WalkState::Quit;
+                }
             }
             inner(entry)
         })

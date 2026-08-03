@@ -164,6 +164,10 @@ enum Command {
 
 fn main() {
     configure_thread_pools();
+    // The CLI gets the same walk ceiling the MCP server does. Without this the budget is
+    // inert here — `GLOBAL` starts unlimited and only `reset()` reads `TILTH_MAX_WALK` — so
+    // the trip note would advertise an env var that does nothing on this path.
+    tilth::walkbudget::reset();
     let cli = Cli::parse();
 
     // Shell completions
@@ -416,6 +420,10 @@ fn emit_result(
 
 /// Write output to stdout. When TTY and output is long, pipe through $PAGER.
 fn emit_output(output: &str, is_tty: bool) {
+    // To stderr, not stdout: a truncation warning must not land in a pipeline's data.
+    if let Some(note) = tilth::walkbudget::report() {
+        eprint!("{note}");
+    }
     let line_count = output.lines().count();
     let term_height = terminal_height();
 

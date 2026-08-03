@@ -34,6 +34,7 @@ pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
+pub mod walkbudget;
 
 pub mod util;
 

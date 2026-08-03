@@ -352,7 +352,21 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
                 .into(),
         )
     } else {
-        run_tool_with_timeout(services, tool_name, args, timeout::request_timeout())
+        // One request's walks are bracketed here. The serial request loop makes that exact
+        // for the live request; a worker abandoned by an earlier timeout keeps running, and
+        // is excluded by the generation `run_walk` captures rather than by this bracket.
+        crate::walkbudget::reset();
+        let out = run_tool_with_timeout(services, tool_name, args, timeout::request_timeout());
+        // A truncated walk says so on the response that carries its partial results.
+        // Reporting nothing would turn "incomplete" into "nothing more to find" — the same
+        // defect class as a scope silently widening to the whole checkout.
+        match out {
+            Ok(body) => match crate::walkbudget::report() {
+                Some(note) => Ok(format!("{note}{body}")),
+                None => Ok(body),
+            },
+            err => err,
+        }
     };
 
     build_tool_response(req.id.clone(), result)
