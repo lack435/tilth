@@ -72,21 +72,28 @@ use dashmap::DashMap;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
 
-/// A true checkout boundary. The ascent stops at the **outermost** of these.
+/// A real repository boundary. The **nearest** of these wins.
 ///
-/// Only real VCS roots, and only the outermost one, because both halves have already gone
-/// wrong once. Treating `.p4ignore` as a boundary decapitated the UE root rules; then
-/// treating package manifests as boundaries did the same thing one level down, because UE
-/// ships 14 nested `package.json` files and a monorepo's real root is routinely *above* a
-/// package manifest. Measured before this fix: scoping at
-/// `Engine/Source/Programs/Horde/HordeDashboard` returned 279 files with no note, against
-/// 229 for the same subtree reached from its parent — the root `.gitignore` was never read.
-const VCS_ROOT_MARKERS: &[&str] = &[".git", ".p4config", ".p4ignore", ".p4ignore.txt"];
+/// Nearest, because that is what git does: a nested repository is its own repository and the
+/// outer one's `.gitignore` does not reach into it. Taking the outermost instead — an
+/// over-correction for the decapitation problem below — made tilth hide `inner/src/thing.rs`
+/// under an outer repo's `*.rs` rule while `git check-ignore` reports it as not ignored.
+///
+/// Note what is deliberately NOT here: `.p4ignore`. Treating an ignore file as a boundary
+/// decapitated the UE root rules, because that tree carries a dozen nested `.p4ignore.txt`
+/// files. An ignore file says "there are rules here", never "the checkout starts here".
+const REPO_MARKERS: &[&str] = &[".git", ".p4config"];
 
-/// Weaker signals, used only when no [`VCS_ROOT_MARKERS`] is found anywhere above.
+/// Weaker signals, used only when no [`REPO_MARKERS`] exists anywhere above.
 ///
-/// A package manifest means "a project lives here", not "the checkout starts here". They
-/// bound an otherwise unbounded ascent in trees that have no VCS root at all, and nothing
+/// A package manifest means "a project lives here", not "the checkout starts here", so the
+/// **outermost** wins among these — the opposite of `REPO_MARKERS`, and for the same reason
+/// in reverse. Stopping at the nearest one decapitated the UE root: that tree has no `.git`
+/// at all, ships 14 nested `package.json` files, and scoping at
+/// `Engine/Source/Programs/Horde/HordeDashboard` returned 279 files with no note against 229
+/// for the same subtree reached from its parent.
+///
+/// These exist to bound an otherwise unbounded ascent in trees with no VCS root, nothing
 /// more.
 const PROJECT_MARKERS: &[&str] = &[
     "Cargo.toml",
@@ -417,29 +424,32 @@ pub(crate) fn skipped_note() -> Option<String> {
 
 /// The top of the checkout `start` belongs to.
 ///
-/// The **outermost** VCS root above `start`, falling back to the outermost project marker,
-/// falling back to the filesystem root. Outermost rather than nearest because a nested
-/// marker is a project inside a checkout, not a new checkout, and stopping at it drops
-/// exactly the root-level rules that matter most.
+/// **Nearest** repository marker, else **outermost** project marker, else the filesystem
+/// root. The two directions are deliberate and were each wrong once in the other direction:
 ///
-/// Terminates: `Path::parent()` yields `None` at the drive root (and at a `\\?\C:\`
-/// verbatim prefix), so the walk up is bounded even in a tree with no marker at all.
+/// - nearest `.git` matches git, which treats a nested repository as its own and does not
+///   apply an outer repo's rules inside it;
+/// - outermost project manifest, because a manifest marks a package inside a checkout, and
+///   stopping at the nearest one drops the root rules that matter most.
+///
+/// Terminates: `Path::parent()` yields `None` at the drive root (and at a `\\?\C:\` verbatim
+/// prefix), so the ascent is bounded even in a tree carrying no marker at all.
 fn workspace_root(start: &Path) -> PathBuf {
-    let mut outermost_vcs: Option<PathBuf> = None;
     let mut outermost_project: Option<PathBuf> = None;
     let mut last = start.to_path_buf();
 
     let mut cursor = Some(start);
     while let Some(d) = cursor {
         last = d.to_path_buf();
-        if VCS_ROOT_MARKERS.iter().any(|m| d.join(m).exists()) {
-            outermost_vcs = Some(d.to_path_buf());
-        } else if PROJECT_MARKERS.iter().any(|m| d.join(m).exists()) {
+        if REPO_MARKERS.iter().any(|m| d.join(m).exists()) {
+            return d.to_path_buf();
+        }
+        if PROJECT_MARKERS.iter().any(|m| d.join(m).exists()) {
             outermost_project = Some(d.to_path_buf());
         }
         cursor = d.parent();
     }
-    outermost_vcs.or(outermost_project).unwrap_or(last)
+    outermost_project.unwrap_or(last)
 }
 
 #[cfg(test)]
@@ -593,6 +603,69 @@ mod tests {
             note.contains("include_ignored"),
             "the report must name the way back: {note}"
         );
+    }
+
+    /// A tree with NO repository marker anywhere still finds its root.
+    ///
+    /// This is the UE shape: a Perforce checkout with no `.git` and no `.p4config`, whose
+    /// root is identifiable only by a project marker (`Default.uprojectdirs`). It is also
+    /// the only path that reaches the `outermost_project` fallback — every other test here
+    /// short-circuits on `.git`, which left that line untested and its tripwire vacuous.
+    #[test]
+    fn a_tree_with_only_project_markers_uses_the_outermost() {
+        let tmp = tempfile::tempdir().unwrap();
+        // ABOVE the checkout: must not reach in. Without this the test cannot detect an
+        // unbounded ascent at all — a ceiling that is too high still finds the checkout's
+        // own rules on the way past, so widening it looks identical to getting it right.
+        write(tmp.path(), ".gitignore", "*.cpp\n");
+
+        let root = tmp.path().join("checkout");
+        write(&root, "Default.uprojectdirs", "./\n");
+        write(&root, ".gitignore", "*.uasset\n");
+        write(&root, "Engine/Plugins/App/package.json", "{}\n");
+        write(&root, "Engine/Plugins/App/a.uasset", "x\n");
+        write(&root, "Engine/Plugins/App/keep.cpp", "void k(){}\n");
+
+        let scope = root.join("Engine/Plugins/App");
+        let vi = VcsIgnore::for_scope(&scope).expect("rules");
+        assert!(
+            vi.is_ignored(&scope.join("a.uasset"), false),
+            "the checkout-root .gitignore was not reached — the ascent stopped at the \
+             nested package.json instead of continuing to the outermost project marker"
+        );
+        assert!(
+            !vi.is_ignored(&scope.join("keep.cpp"), false),
+            "a .gitignore ABOVE the checkout reached in — the ascent is unbounded"
+        );
+    }
+
+    /// A nested repository is its own boundary — the outer repo's rules stop at it.
+    ///
+    /// This is git's own rule, and the fix for the *previous* boundary bug over-corrected
+    /// straight past it: taking the outermost marker meant an outer `*.rs` hid
+    /// `inner/src/thing.rs`, which `git check-ignore` reports as not ignored. Nearest repo
+    /// marker, outermost project marker — the two go in opposite directions on purpose.
+    #[test]
+    fn a_nested_repository_is_its_own_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        write(outer, ".git/HEAD", "ref: refs/heads/main\n");
+        write(outer, ".gitignore", "*.rs\n");
+        write(outer, "outer.rs", "fn o() {}\n");
+        let inner = outer.join("inner");
+        write(&inner, ".git/HEAD", "ref: refs/heads/main\n");
+        write(&inner, "src/thing.rs", "fn t() {}\n");
+
+        let vi = VcsIgnore::for_scope(&inner).expect("the inner repo resolves rules");
+        assert!(
+            !vi.is_ignored(&inner.join("src/thing.rs"), false),
+            "an outer repository's .gitignore reached inside a nested repository; \
+             git check-ignore says it does not apply"
+        );
+
+        // ...and the outer repo's rule still governs its own files.
+        let outer_vi = VcsIgnore::for_scope(outer).expect("rules");
+        assert!(outer_vi.is_ignored(&outer.join("outer.rs"), false));
     }
 
     /// One invalid byte must not discard the whole file.
