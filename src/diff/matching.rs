@@ -556,7 +556,7 @@ mod tests {
                 name: name.to_string(),
                 start_line: 1,
                 end_line: 1,
-                signature: sig.map(|s| s.to_string()),
+                signature: sig.map(ToString::to_string),
                 children: Vec::new(),
                 doc: None,
             },

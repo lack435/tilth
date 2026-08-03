@@ -559,8 +559,8 @@ fn args_for(label: &str, root: &Path) -> Value {
     match label {
         "read:auto/full" => json!({"path": p("lib.rs"), "mode": "auto"}),
         "read:auto/outline" => json!({"path": p("big.rs"), "mode": "auto"}),
-        "read:full" => json!({"path": p("lib.rs"), "mode": "full"}),
-        "read:full/no-edit-mode" => json!({"path": p("lib.rs"), "mode": "full"}),
+        // Same arguments; the surfaces differ in whether edit mode is on, not in what is asked.
+        "read:full" | "read:full/no-edit-mode" => json!({"path": p("lib.rs"), "mode": "full"}),
         "read:signature" => json!({"path": p("lib.rs"), "mode": "signature"}),
         "read:stripped" => json!({"path": p("lib.rs"), "mode": "stripped"}),
         "read:stripped/no-strip-pass" => json!({"path": p("notes.md"), "mode": "stripped"}),

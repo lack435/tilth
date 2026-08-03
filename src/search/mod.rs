@@ -2132,7 +2132,7 @@ mod tests {
         (RETENTION_SHALLOW_FILES + RETENTION_DEEP_FILES + 1) * RETENTION_MATCHES_PER_FILE
     }
 
-    /// Files needed to push symbol retention past `retain::MAX_RETAINED` (20_000).
+    /// Files needed to push symbol retention past `retain::MAX_RETAINED` (`20_000`).
     ///
     /// Per file rather than in total is deliberate: `SYM_RETENTION_USAGES_PER_FILE` also exceeds
     /// `retain::OFFER_CHUNK`, so each file flushes mid-search and the tail is a partial chunk.
@@ -2189,10 +2189,12 @@ mod tests {
             usages > crate::search::retain::MAX_RETAINED,
             "fixture must exceed MAX_RETAINED or the bound is untested ({usages})"
         );
-        assert!(
-            SYM_RETENTION_USAGES_PER_FILE > crate::search::retain::OFFER_CHUNK,
-            "no single file fills a chunk, so the streaming offer path is untested"
-        );
+        const {
+            assert!(
+                SYM_RETENTION_USAGES_PER_FILE > crate::search::retain::OFFER_CHUNK,
+                "no single file fills a chunk, so the streaming offer path is untested"
+            );
+        }
         assert_ne!(
             SYM_RETENTION_USAGES_PER_FILE % crate::search::retain::OFFER_CHUNK,
             0,
@@ -2561,16 +2563,18 @@ mod tests {
             expected > crate::search::retain::MAX_RETAINED,
             "fixture must exceed MAX_RETAINED or the bound is untested ({expected})"
         );
-        assert!(
-            RETENTION_SHALLOW_FILES * RETENTION_MATCHES_PER_FILE
-                > crate::search::retain::MAX_RETAINED,
-            "the shallow tier alone must exceed MAX_RETAINED, or the selection assertion below \
-             passes for the trivial reason that nothing was dropped"
-        );
-        assert!(
-            RETENTION_MATCHES_PER_FILE > crate::search::retain::OFFER_CHUNK,
-            "no single file fills a chunk, so the streaming offer path is untested"
-        );
+        const {
+            assert!(
+                RETENTION_SHALLOW_FILES * RETENTION_MATCHES_PER_FILE
+                    > crate::search::retain::MAX_RETAINED,
+                "the shallow tier alone must exceed MAX_RETAINED, or the selection assertion below \
+                 passes for the trivial reason that nothing was dropped"
+            );
+            assert!(
+                RETENTION_MATCHES_PER_FILE > crate::search::retain::OFFER_CHUNK,
+                "no single file fills a chunk, so the streaming offer path is untested"
+            );
+        }
         assert_ne!(
             RETENTION_MATCHES_PER_FILE % crate::search::retain::OFFER_CHUNK,
             0,
@@ -2671,10 +2675,12 @@ mod tests {
     /// retunes these tests instead of breaking them — up to the point where the displayed
     /// page no longer fits in `d0`, which the assertion below catches explicitly.
     fn write_glob_fixture(dir: &Path) -> Vec<String> {
-        assert!(
-            glob::MAX_FILES <= GLOB_FIXTURE_FILES_PER_DIR,
-            "expectation assumes the whole displayed page fits in d0; widen the fixture"
-        );
+        const {
+            assert!(
+                glob::MAX_FILES <= GLOB_FIXTURE_FILES_PER_DIR,
+                "expectation assumes the whole displayed page fits in d0; widen the fixture"
+            );
+        }
         for d in 0..GLOB_FIXTURE_DIRS {
             let sub = dir.join(format!("d{d}"));
             std::fs::create_dir_all(&sub).unwrap();
@@ -2917,13 +2923,14 @@ mod tests {
     /// test discriminates without pinning a thread count it does not control.
     #[test]
     fn run_walk_quits_a_cancelled_walk_after_enumeration() {
+        const FILES: usize = 400;
+
         let _publish = crate::cancel::PUBLISH_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _visible = crate::cancel::make_visible_on_this_thread();
 
         let dir = tempfile::tempdir().expect("tempdir");
-        const FILES: usize = 400;
         for i in 0..FILES {
             std::fs::write(dir.path().join(format!("f{i:04}.rs")), "fn a(){}\n").expect("write");
         }
@@ -3026,7 +3033,7 @@ mod tests {
     #[test]
     fn walker_brace_expansion_matches_multiple_extensions() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(&scope, Some("*.{rs,toml}"));
+        let filtered = walk_paths(scope, Some("*.{rs,toml}"));
         let exts = extensions(&filtered);
         assert!(
             exts.contains("rs"),
@@ -3049,8 +3056,8 @@ mod tests {
         // Use project root (not src/) — project root has .toml, .md, .lock etc.
         // alongside .rs files, so *.rs is guaranteed to be a strict subset.
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let all = walk_paths(&scope, None);
-        let rs_only = walk_paths(&scope, Some("*.rs"));
+        let all = walk_paths(scope, None);
+        let rs_only = walk_paths(scope, Some("*.rs"));
         assert!(
             rs_only.len() < all.len(),
             "whitelist ({}) should find fewer files than unfiltered ({})",
@@ -3062,7 +3069,7 @@ mod tests {
     #[test]
     fn walker_path_pattern_restricts_directory() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(&scope, Some("src/**/*.rs"));
+        let filtered = walk_paths(scope, Some("src/**/*.rs"));
         assert!(!filtered.is_empty(), "path pattern should find files");
         let src_dir = scope.join("src");
         for p in &filtered {
@@ -3328,7 +3335,7 @@ mod tests {
         assert_eq!(label, "§Outer");
     }
 
-    /// CommonMark §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
+    /// `CommonMark` §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
     /// raw text, not a heading, and must not surface as the enclosing scope.
     /// Pre-AST migration the regex matched `#######` and produced a bogus
     /// `§# Fake Heading 7` label.
@@ -3353,7 +3360,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
+    /// `CommonMark` §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
     /// is paragraph text, not a heading. Pre-AST migration the regex accepted
     /// it and produced `§NoSpace`.
     #[test]
@@ -3606,7 +3613,7 @@ mod tests {
         // Heading on line 1, then 60 body lines.
         let mut content = String::from("## Big Section\n");
         for i in 0..60 {
-            let _ = write!(content, "body line {i}\n");
+            let _ = writeln!(content, "body line {i}");
         }
         std::fs::write(&p, &content).unwrap();
 
@@ -3678,7 +3685,7 @@ mod tests {
         let p = tmp.path().join("long.md");
         let mut content = String::from("## Big Section\n");
         for i in 0..60 {
-            let _ = write!(content, "body line {i}\n");
+            let _ = writeln!(content, "body line {i}");
         }
         std::fs::write(&p, &content).unwrap();
 
@@ -3730,7 +3737,7 @@ mod tests {
         );
     }
 
-    /// Worst-case bound: with MAX_MATCHES = 10 markdown-heading defs each
+    /// Worst-case bound: with `MAX_MATCHES` = 10 markdown-heading defs each
     /// hitting the 40-line preview cap, total inlined preview content is at
     /// most 10 × 40 = 400 lines. This pins the bound by exercising the cap
     /// and asserting the truncation shape, so a future bump of either
@@ -3925,7 +3932,7 @@ mod tests {
     }
 
     /// A search on a small definition (body < 80 lines) goes through
-    /// expand_match but never hits the truncation branch, so savings
+    /// `expand_match` but never hits the truncation branch, so savings
     /// remain zero.
     #[test]
     fn search_no_truncation_records_no_savings() {
@@ -4188,7 +4195,7 @@ mod tests {
     }
 
     /// receive the caller's real `budget` instead of always being called with
-    /// `crate::budget::DEFAULT_BUDGET` (24_000). Fixture: one real definition
+    /// `crate::budget::DEFAULT_BUDGET` (`24_000`). Fixture: one real definition
     /// (`budget_probe_target`, high `def_weight`) plus a usage in a file named
     /// after the query, so `rank::sort`'s `basename_boost` (+500) renders the
     /// usage FIRST despite it being lower-value — this decouples render order

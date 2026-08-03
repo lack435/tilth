@@ -1022,7 +1022,7 @@ mod tests {
         assert!(suggest_headings(input, "###", 5).is_empty());
     }
 
-    /// CommonMark allows `~~~` as a fence delimiter. Headings inside
+    /// `CommonMark` allows `~~~` as a fence delimiter. Headings inside
     /// must not be treated as suggestable.
     #[test]
     fn suggest_headings_skips_tilde_fenced_blocks() {
@@ -1038,7 +1038,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
+    /// `CommonMark` §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
     /// hashes are not headings, even with a space after.
     #[test]
     fn suggest_headings_rejects_seven_or_more_hashes() {
@@ -1050,7 +1050,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1: hashes must be followed by a space (or EOL).
+    /// `CommonMark` §4.6.1: hashes must be followed by a space (or EOL).
     /// `##foo` (no space) is not a heading.
     #[test]
     fn suggest_headings_rejects_hashes_without_space() {

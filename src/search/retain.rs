@@ -740,8 +740,11 @@ mod tests {
         }
     }
 
+    /// One match's identity: path, line, definition range, text.
+    type MatchKey = (PathBuf, u32, Option<(u32, u32)>, String);
+
     /// Identity of a retained set, order-insensitive and covering every tie-break level.
-    fn key_of(v: Vec<Match>) -> Vec<(PathBuf, u32, Option<(u32, u32)>, String)> {
+    fn key_of(v: Vec<Match>) -> Vec<MatchKey> {
         let mut k: Vec<_> = v
             .into_iter()
             .map(|x| (x.path, x.line, x.def_range, x.text))
@@ -750,7 +753,7 @@ mod tests {
         k
     }
 
-    fn scorer<'a>(scope: &'a Path) -> Scorer<'a> {
+    fn scorer(scope: &Path) -> Scorer<'_> {
         Scorer::new("hit", scope, None)
     }
 

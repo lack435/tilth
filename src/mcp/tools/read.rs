@@ -452,7 +452,7 @@ mod tests {
         );
         assert!(!out.contains("dbg!"), "debug log should be stripped: {out}");
         assert!(
-            !out.lines().any(|l| l.contains(":") && l.contains("|")),
+            !out.lines().any(|l| l.contains(':') && l.contains('|')),
             "stripped output must not expose hash anchors: {out}"
         );
     }

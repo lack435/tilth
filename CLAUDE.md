@@ -95,12 +95,19 @@ Dockerfile, Make detected but have no tree-sitter grammar (outline returns None)
 ```bash
 cargo build --release        # release build
 cargo test                   # unit tests (in-source #[cfg(test)] modules)
-cargo clippy -- -D warnings  # lint
+cargo clippy --all-targets -- -D warnings  # lint (--all-targets so test code is linted too)
 cargo fmt --check            # format check
 cargo install --path .       # install to ~/.cargo/bin/tilth
 ```
 
-CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
+CI runs `fmt --check`, `clippy --all-targets -D warnings`, `cargo test` on every push/PR. Run clippy
+with `--all-targets` locally too — without it nothing behind `#[cfg(test)]` is linted at all.
+
+Lint config lives in `[lints.clippy]` in `Cargo.toml`, not as `#![warn(..)]` in `src/lib.rs`. Both
+halves are load-bearing: `--all-targets` decides which targets get *compiled*, `[lints]` decides
+which get the pedantic config. An inner attribute reaches only its own crate root, so while the
+config sat in `lib.rs`, `src/main.rs`, `tests/oracle.rs` and `examples/*` were compiled but never
+linted. Add a new lint allow to the Cargo.toml table, not to `lib.rs`.
 
 ## Version bumps
 

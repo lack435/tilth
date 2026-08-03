@@ -30,7 +30,17 @@ jobs:
       #
       # `cargo fmt` above is left alone: it does not resolve dependencies, so it has no
       # lockfile to disagree with.
-      - run: cargo clippy --locked -- -D warnings
+      #
+      # `--all-targets` covers the test, example and bin targets, not just the lib. Without it the
+      # pedantic config never reached anything behind `#[cfg(test)]`, so test code accumulated 87
+      # warnings no gate could see — including a detached `///` block documenting the wrong item.
+      #
+      # Two halves are needed and neither is sufficient. `--all-targets` decides which targets are
+      # *compiled*; `[lints.clippy]` in Cargo.toml decides which get the pedantic config. It lives
+      # there rather than as `#![warn(..)]` in src/lib.rs because an inner attribute reaches only its
+      # own crate root — with it in lib.rs, `--all-targets` compiled src/main.rs, tests/oracle.rs and
+      # examples/* while pedantic reached none of them, and 23 further warnings hid there.
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
   markdown:

@@ -333,24 +333,24 @@ mod is_test_file_tests {
         parts.iter().collect()
     }
 
-    /// Which of these are tripwires and which are regression guards, since the two are not the
-    /// same and a reader cannot tell by looking:
-    ///
-    ///   * `the_conventions_are_still_recognised` — a tripwire **only on Windows**, where
-    ///     `"__tests__/"` never matched a backslash path. It passes under the old spelling on
-    ///     Linux, so on CI it guards nothing.
-    ///   * `an_ancestor_directory_does_not_make_a_file_a_test` — the reported defect. Tripwire on
-    ///     both platforms.
-    ///   * `a_partial_component_is_not_the_directory_convention` — tripwire on both, but only
-    ///     because of the `my__tests__` cases: `contains("__tests__/")` needed a *trailing*
-    ///     separator, so a suffix partial like `__tests__extra` was already `false` and only a
-    ///     prefix partial distinguishes the two spellings. Review found this test was originally
-    ///     written with the two non-distinguishing cases alone, and passed in every revert.
-    ///   * `the_directory_convention_is_case_sensitive`, `an_ordinary_tests_directory_is_unchanged`
-    ///     — regression guards. They pass with the fix reverted, by design.
-    ///
-    /// That accounting exists because the `__tests__` half of this change is guarded on the Linux
-    /// runner by exactly one of these — the partial-component test — and it was not obvious.
+    // Which of these are tripwires and which are regression guards, since the two are not the
+    // same and a reader cannot tell by looking:
+    //
+    //   * `the_conventions_are_still_recognised` — a tripwire **only on Windows**, where
+    //     `"__tests__/"` never matched a backslash path. It passes under the old spelling on
+    //     Linux, so on CI it guards nothing.
+    //   * `an_ancestor_directory_does_not_make_a_file_a_test` — the reported defect. Tripwire on
+    //     both platforms.
+    //   * `a_partial_component_is_not_the_directory_convention` — tripwire on both, but only
+    //     because of the `my__tests__` cases: `contains("__tests__/")` needed a *trailing*
+    //     separator, so a suffix partial like `__tests__extra` was already `false` and only a
+    //     prefix partial distinguishes the two spellings. Review found this test was originally
+    //     written with the two non-distinguishing cases alone, and passed in every revert.
+    //   * `the_directory_convention_is_case_sensitive`, `an_ordinary_tests_directory_is_unchanged`
+    //     — regression guards. They pass with the fix reverted, by design.
+    //
+    // That accounting exists because the `__tests__` half of this change is guarded on the Linux
+    // runner by exactly one of these — the partial-component test — and it was not obvious.
 
     /// The conventions themselves must still be recognised. Without this the narrowing below
     /// passes against a function that returns `false` for everything.

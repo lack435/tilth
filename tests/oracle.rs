@@ -45,6 +45,16 @@
 //! of this comment claimed they "report as ignored-with-a-reason"; they do not, and believing that
 //! is exactly the mistake it warned about.)
 
+// `[lints.clippy]` in Cargo.toml reaches this crate root too, so pedantic applies here. Two of its
+// lints are wrong for this file specifically:
+//
+// * `format_push_string` — the same fixture-builder argument the lib makes under `cfg(test)`. This
+//   is a test crate end to end, so the allow is unconditional rather than `cfg_attr`.
+// * `naive_bytecount` — its fix is to depend on the `bytecount` crate. This file exists to be a
+//   *deliberately dumb* re-derivation written against as little as possible; taking a dependency to
+//   count newlines faster would trade away the only property that makes it a useful oracle.
+#![allow(clippy::format_push_string, clippy::naive_bytecount)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;

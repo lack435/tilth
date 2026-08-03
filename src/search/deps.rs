@@ -1272,7 +1272,15 @@ mod tests {
         const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
         // (subdirectory, entry file, body, sibling files, expected local, expected external)
-        let cases: &[(&str, &str, &str, &[(&str, &str)], &str, &[&str])] = &[
+        type BomCase<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a [(&'a str, &'a str)],
+            &'a str,
+            &'a [&'a str],
+        );
+        let cases: &[BomCase] = &[
             (
                 "",
                 "Main.cpp",
@@ -1356,7 +1364,7 @@ mod tests {
                 plain.1,
                 want_external
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(ToString::to_string)
                     .collect::<Vec<_>>(),
                 "fixture is broken: {entry} without a BOM reported external {:?}",
                 plain.1

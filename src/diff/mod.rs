@@ -1125,7 +1125,7 @@ mod tests {
         }
     }
 
-    /// Run diff() from within the test repo directory, serialized via the shared cwd lock.
+    /// Run `diff()` from within the test repo directory, serialized via the shared cwd lock.
     ///
     /// The lock has to be *shared* with every test that reads the cwd, not just with the ones that
     /// move it. Measured for #95: `mcp::bom_surfaces` would spawn `git` with the inherited cwd
@@ -1773,7 +1773,7 @@ mod tests {
     }
 
     fn paths(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+        v.iter().map(ToString::to_string).collect()
     }
 
     /// Resolve a relative scope. Relative never consults git, so this needs no
@@ -1785,12 +1785,12 @@ mod tests {
         }
     }
 
-    fn files_of(m: &Option<ScopeMatch>) -> Vec<usize> {
-        m.as_ref().map(|m| m.files.clone()).unwrap_or_default()
+    fn files_of(m: Option<ScopeMatch>) -> Vec<usize> {
+        m.map(|m| m.files).unwrap_or_default()
     }
 
-    fn under_of(m: &Option<ScopeMatch>) -> Vec<usize> {
-        m.as_ref().map(|m| m.under.clone()).unwrap_or_default()
+    fn under_of(m: Option<ScopeMatch>) -> Vec<usize> {
+        m.map(|m| m.under).unwrap_or_default()
     }
 
     #[test]
@@ -1798,9 +1798,9 @@ mod tests {
         let p = paths(&["src/diff/parse.rs", "tools/hooks/prefer_tools.py"]);
 
         // Exact and component-boundary suffix.
-        assert_eq!(files_of(&sel(&p, "src/diff/parse.rs")), vec![0]);
-        assert_eq!(files_of(&sel(&p, "parse.rs")), vec![0]);
-        assert_eq!(files_of(&sel(&p, "diff/parse.rs")), vec![0]);
+        assert_eq!(files_of(sel(&p, "src/diff/parse.rs")), vec![0]);
+        assert_eq!(files_of(sel(&p, "parse.rs")), vec![0]);
+        assert_eq!(files_of(sel(&p, "diff/parse.rs")), vec![0]);
 
         // A bare substring is not a path. `arse.rs` used to select parse.rs and
         // answer confidently about a file nobody asked for.
@@ -1818,17 +1818,17 @@ mod tests {
         ]);
 
         // The reported case: a directory selects everything beneath it.
-        assert_eq!(under_of(&sel(&p, "tools/hooks")), vec![0, 1]);
+        assert_eq!(under_of(sel(&p, "tools/hooks")), vec![0, 1]);
         // Trailing slash is the same request.
-        assert_eq!(under_of(&sel(&p, "tools/hooks/")), vec![0, 1]);
+        assert_eq!(under_of(sel(&p, "tools/hooks/")), vec![0, 1]);
         // Directories get the same suffix latitude files do.
-        assert_eq!(under_of(&sel(&p, "hooks")), vec![0, 1]);
+        assert_eq!(under_of(sel(&p, "hooks")), vec![0, 1]);
         // Windows separators normalize to git's.
-        assert_eq!(under_of(&sel(&p, r"tools\hooks")), vec![0, 1]);
+        assert_eq!(under_of(sel(&p, r"tools\hooks")), vec![0, 1]);
         // A directory that changed nothing is a miss, not an empty success.
         assert!(sel(&p, "tools/other").is_none());
         // A file scope still resolves to its file.
-        assert_eq!(files_of(&sel(&p, "src/main.rs")), vec![2]);
+        assert_eq!(files_of(sel(&p, "src/main.rs")), vec![2]);
     }
 
     #[test]
@@ -1845,16 +1845,16 @@ mod tests {
         ]);
 
         // Anchored at the repo root: exactly the one git's pathspec would give.
-        assert_eq!(files_of(&sel(&p, "src/util.rs")), vec![2]);
-        assert_eq!(under_of(&sel(&p, "src")), vec![2]);
+        assert_eq!(files_of(sel(&p, "src/util.rs")), vec![2]);
+        assert_eq!(under_of(sel(&p, "src")), vec![2]);
 
         // A scope that is anchored nowhere still gets the suffix pass — but now
         // it reports every match rather than silently picking the first.
-        assert_eq!(files_of(&sel(&p, "util.rs")), vec![0, 1, 2, 3]);
+        assert_eq!(files_of(sel(&p, "util.rs")), vec![0, 1, 2, 3]);
 
         // An inner tree is still reachable by qualifying it.
-        assert_eq!(files_of(&sel(&p, "a/src/util.rs")), vec![0]);
-        assert_eq!(under_of(&sel(&p, "vendor/src")), vec![3]);
+        assert_eq!(files_of(sel(&p, "a/src/util.rs")), vec![0]);
+        assert_eq!(under_of(sel(&p, "vendor/src")), vec![3]);
     }
 
     #[test]

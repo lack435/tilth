@@ -206,7 +206,7 @@ mod tests {
     }
 
     /// Integration test: drive the full `generate()` pipeline with a
-    /// real Rust source containing more than OUTLINE_CAP top-level
+    /// real Rust source containing more than `OUTLINE_CAP` top-level
     /// functions. Verifies the cap actually fires and that
     /// `with_omission_note` is wired into the pipeline correctly —
     /// not just exercised in isolation.
