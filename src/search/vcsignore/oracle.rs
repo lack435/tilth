@@ -21,6 +21,12 @@ use super::VcsIgnore;
 /// One tree: the ignore files to write, and the paths to ask about.
 struct Scenario {
     name: &'static str,
+    /// `git config` keys applied to the fixture repo before either side is asked.
+    ///
+    /// Exists for `core.ignorecase`, which is a property of the checkout rather than the
+    /// patterns: hard-coding it to the platform over-hid on the dangerous side, and the
+    /// oracle could not see that while every fixture used git's default.
+    git_config: &'static [(&'static str, &'static str)],
     /// (relative path, contents) for each ignore file.
     ignore_files: &'static [(&'static str, &'static str)],
     /// Relative paths, forward-slash. A trailing `/` means "ask about a directory".
@@ -29,6 +35,7 @@ struct Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
+        git_config: &[],
         name: "plain names and extensions",
         ignore_files: &[(".gitignore", "*.log\nbuild/\nexact.txt\n")],
         paths: &[
@@ -44,6 +51,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "anchored vs unanchored",
         ignore_files: &[(".gitignore", "/root-only.txt\nanywhere.txt\n/dir/\n")],
         paths: &[
@@ -58,6 +66,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "double star",
         ignore_files: &[(".gitignore", "**/gen/**\na/**/b.txt\n**/deep.log\n")],
         paths: &[
@@ -73,6 +82,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "negation in one file",
         ignore_files: &[(".gitignore", "*.json\n!keep.json\n*.tmp\n!/root.tmp\n")],
         paths: &[
@@ -86,6 +96,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "nested file overrides shallower",
         ignore_files: &[
             (".gitignore", "*.json\n"),
@@ -99,6 +110,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "nested file tightens rather than loosens",
         ignore_files: &[
             (".gitignore", "!*.keep\n"),
@@ -112,6 +124,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "three levels of alternating opinion",
         ignore_files: &[
             (".gitignore", "*.x\n"),
@@ -121,6 +134,7 @@ const SCENARIOS: &[Scenario] = &[
         paths: &["t.x", "a/t.x", "a/b/t.x", "a/b/c/t.x", "a/c/t.x"],
     },
     Scenario {
+        git_config: &[],
         name: "UE whitelist idiom",
         ignore_files: &[(
             ".gitignore",
@@ -139,6 +153,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "directory-only rules at depth",
         ignore_files: &[(".gitignore", "Intermediate/\nSaved/\nBinaries/\n")],
         paths: &[
@@ -152,6 +167,7 @@ const SCENARIOS: &[Scenario] = &[
         ],
     },
     Scenario {
+        git_config: &[],
         name: "character classes and single-char wildcard",
         ignore_files: &[(".gitignore", "f?le.txt\n[abc]start.rs\n*.o[12]\n")],
         paths: &[
@@ -168,6 +184,7 @@ const SCENARIOS: &[Scenario] = &[
     // caught by the eleven scenarios above — they are here so the oracle owns them rather
     // than a hand-written assertion about what git "should" do.
     Scenario {
+        git_config: &[],
         name: "leading whitespace is significant to git",
         // `trim()` on both edges made `   leading.txt` a live rule and hid a file git
         // tracks — the dangerous direction. Git strips only trailing whitespace.
@@ -175,6 +192,7 @@ const SCENARIOS: &[Scenario] = &[
         paths: &["leading.txt", "keep.rs", "other.txt"],
     },
     Scenario {
+        git_config: &[],
         name: "UTF-8 BOM does not eat the first pattern",
         // `str::trim` does not strip U+FEFF, so the first pattern became `\u{FEFF}*.log`
         // and matched nothing. PowerShell writes UTF-8 with BOM by default on this platform.
@@ -182,6 +200,7 @@ const SCENARIOS: &[Scenario] = &[
         paths: &["a.log", "sub/b.log", "build/x.txt", "keep.rs"],
     },
     Scenario {
+        git_config: &[],
         name: "case-mismatched patterns",
         // NTFS is case-insensitive and `git init` sets core.ignorecase=true, so git ignores
         // `a.log` under a `*.LOG` rule. Every other scenario uses case-matching patterns, so
@@ -190,6 +209,21 @@ const SCENARIOS: &[Scenario] = &[
         paths: &["a.log", "A.LOG", "build/x.txt", "Build/y.txt", "keep.rs"],
     },
     Scenario {
+        // `core.ignorecase=false` on a platform whose default is true. tilth used to hard-code
+        // the platform, so it hid `a.log` under `*.LOG` while git reports it as NOT ignored —
+        // over-hiding, with no way for a repo to opt out.
+        git_config: &[("core.ignorecase", "false")],
+        name: "case-sensitive repo on a case-insensitive platform",
+        ignore_files: &[(
+            ".gitignore",
+            "*.LOG
+Build/
+",
+        )],
+        paths: &["a.log", "A.LOG", "build/x.txt", "Build/y.txt", "keep.rs"],
+    },
+    Scenario {
+        git_config: &[],
         name: "trailing spaces and escapes",
         ignore_files: &[(
             ".gitignore",
@@ -267,6 +301,9 @@ fn every_verdict_agrees_with_git_check_ignore() {
         git(root, &["init", "-q", "."]);
         git(root, &["config", "user.email", "t@t"]);
         git(root, &["config", "user.name", "t"]);
+        for (k, v) in sc.git_config {
+            git(root, &["config", k, v]);
+        }
 
         for (rel, body) in sc.ignore_files {
             let p = root.join(rel);
@@ -317,7 +354,7 @@ fn every_verdict_agrees_with_git_check_ignore() {
     // Guards against the corpus silently shrinking (a scenario deleted, a `paths` list
     // emptied) — a green oracle over nothing is the failure mode this whole file exists to
     // avoid. The number is what the corpus currently produces, not a target.
-    assert!(checks >= 84, "only {checks} checks ran; the corpus shrank");
+    assert!(checks >= 89, "only {checks} checks ran; the corpus shrank");
     assert!(
         mismatches.is_empty(),
         "{} of {checks} verdicts disagree with git check-ignore:\n{}",

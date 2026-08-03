@@ -1183,28 +1183,23 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<PathBuf> = None;
     let mut best_priority: u8 = 0;
 
-    // `git_ignore(false)`, and the shared matcher applied below instead.
+    // `base_walk_builder`, not a hand-rolled twin.
     //
-    // This walker predates `vcsignore` and used to set `git_ignore(true)`, which is the one
-    // arrangement that module exists to replace: the crate's matcher runs ahead of any
-    // filter, so its exclusions are uncountable, unreportable, and honour neither
-    // `include_ignored` nor `TILTH_NO_VCS_IGNORE`. Having a second, differently-governed
-    // ignore policy on a path reachable from search made "every decision passes through one
-    // place" false.
-    let rules = (!matches!(
-        std::env::var("TILTH_NO_VCS_IGNORE")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Ok("1" | "true" | "yes" | "on")
-    ) && !vcsignore::include_ignored())
-    .then(|| vcsignore::VcsIgnore::for_scope(scope))
-    .flatten();
-
-    let walker = ignore::WalkBuilder::new(scope)
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(true)
-        .git_ignore(false)
+    // This walker predates `vcsignore` and set `git_ignore(true)` — the one arrangement that
+    // module exists to replace, since the crate's matcher runs ahead of any filter and its
+    // exclusions are uncountable and honour neither opt-out. The first correction applied
+    // the shared matcher here but kept the bespoke builder, and filtered only *files*: with
+    // no `filter_entry` it never pruned a directory, so it descended into an ignored tree
+    // and recorded every file inside it individually. Measured on a 21-file repo with one
+    // ignored 600-file directory: the same request reported **601 paths skipped** where the
+    // main walk collapses that directory to 1, and visited 600 files it had no reason to
+    // open. The note's own promise — "a skipped directory counts once, not its contents" —
+    // was false wherever this fired.
+    //
+    // Reusing the shared builder makes the policy, the pruning and the counting identical by
+    // construction rather than by two implementations agreeing.
+    let walker = base_walk_builder(scope)
+        .hidden(true) // narrower than the shared default: a dotfile is never the answer here
         .max_depth(Some(6))
         .build();
 
@@ -1212,12 +1207,6 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
         let path = entry.path();
         if !path.is_file() {
             continue;
-        }
-        if let Some(rules) = &rules {
-            if entry.depth() > 0 && rules.is_ignored(path, false) {
-                rules.note_skipped(path);
-                continue;
-            }
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;

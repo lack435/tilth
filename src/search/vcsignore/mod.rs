@@ -79,10 +79,19 @@ use ignore::Match;
 /// over-correction for the decapitation problem below — made tilth hide `inner/src/thing.rs`
 /// under an outer repo's `*.rs` rule while `git check-ignore` reports it as not ignored.
 ///
-/// Note what is deliberately NOT here: `.p4ignore`. Treating an ignore file as a boundary
-/// decapitated the UE root rules, because that tree carries a dozen nested `.p4ignore.txt`
-/// files. An ignore file says "there are rules here", never "the checkout starts here".
-const REPO_MARKERS: &[&str] = &[".git", ".p4config"];
+/// Note what is deliberately NOT here, and why the list is only `.git`:
+///
+/// - `.p4ignore` says "there are rules here", never "the checkout starts here". Treating it
+///   as a boundary decapitated the UE root, which carries a dozen nested `.p4ignore.txt`.
+/// - `.p4config` is the same mistake in a subtler costume. P4CONFIG's whole design is
+///   nearest-file lookup *from a subdirectory*, so a `.p4config` below a checkout root is
+///   the normal Perforce idiom rather than an edge case. With it in this list, a `.git` repo
+///   containing `sub/.p4config` stopped resolving its own root `.gitignore`: measured,
+///   `repo/.gitignore: *.gen.cpp` no longer hid `repo/sub/src/a.gen.cpp`, which
+///   `git check-ignore` reports as ignored.
+///
+/// `.git` alone, because it alone actually delimits a repository.
+const REPO_MARKERS: &[&str] = &[".git"];
 
 /// Weaker signals, used only when no [`REPO_MARKERS`] exists anywhere above.
 ///
@@ -139,6 +148,8 @@ pub(crate) struct VcsIgnore {
     /// Highest directory the ascent may reach, inclusive.
     ceiling: PathBuf,
     cache: DashMap<PathBuf, Arc<DirRules>>,
+    /// Whether patterns match case-insensitively, resolved once from the checkout.
+    case_insensitive: bool,
     /// The request this matcher was built for, captured once at construction.
     ///
     /// Compared at each skip so a walk abandoned by an earlier timeout cannot add to the
@@ -156,9 +167,11 @@ impl VcsIgnore {
             scope.parent()?.to_path_buf()
         };
         let ceiling = workspace_root(&start);
+        let ceiling_for_config = ceiling.clone();
         let me = Self {
             ceiling,
             cache: DashMap::new(),
+            case_insensitive: resolve_ignorecase(&ceiling_for_config),
             generation: crate::walkbudget::generation(),
         };
 
@@ -255,10 +268,10 @@ impl VcsIgnore {
             }
             None => (Vec::new(), Vec::new(), false),
         };
-        if let Some(m) = build(dir, GIT_NAMES, false) {
+        if let Some(m) = build(dir, GIT_NAMES, false, self.case_insensitive) {
             git.push(Arc::new(m));
         }
-        if let Some(m) = build(dir, P4_NAMES, true) {
+        if let Some(m) = build(dir, P4_NAMES, true, self.case_insensitive) {
             p4.push(Arc::new(m));
         }
         let rules = Arc::new(DirRules { git, p4, excluded });
@@ -284,13 +297,9 @@ fn verdict(layer: &Layer, path: &Path, is_dir: bool) -> bool {
 ///
 /// All files of a syntax in one directory fold into a single `Gitignore`, so ordering
 /// between `.p4ignore` and `.p4ignore.txt` is the order they are listed.
-fn build(dir: &Path, names: &[&str], translate: bool) -> Option<Gitignore> {
+fn build(dir: &Path, names: &[&str], translate: bool, case_insensitive: bool) -> Option<Gitignore> {
     let mut b = GitignoreBuilder::new(dir);
-    // Windows filesystems are case-insensitive and `git init` sets `core.ignorecase=true`
-    // on NTFS, so git ignores `a.log` under a `*.LOG` rule and this must too. Without it
-    // the oracle stays green — every scenario there uses case-matching patterns — while the
-    // verdict is wrong for any case-mismatched rule on the platform this ships to.
-    b.case_insensitive(cfg!(windows)).ok();
+    b.case_insensitive(case_insensitive).ok();
     let mut added = 0usize;
     for name in names {
         // Read as BYTES, not `read_to_string`. One invalid UTF-8 byte made `read_to_string`
@@ -420,6 +429,37 @@ pub(crate) fn skipped_note() -> Option<String> {
          directory counts once, not its contents). If something you expected is missing, \
          retry with include_ignored: true.\n\n"
     ))
+}
+
+/// Does this checkout match ignore patterns case-insensitively?
+///
+/// Read from the repository's own `core.ignorecase`, not from `cfg!(windows)`. The platform
+/// is only git's *default*: `git init` sets `ignorecase=true` on NTFS and APFS and `false`
+/// on ext4, and a user may set either anywhere. Hard-coding the platform over-hid on the
+/// dangerous side — with `core.ignorecase=false` on Windows, `git check-ignore` reports
+/// `src/a.log` as NOT ignored under a `*.LOG` rule while tilth hid it, and no repo could opt
+/// out because the value was a compile-time constant.
+///
+/// Falls back to the platform default when there is no git config to read, which is the same
+/// guess `git init` would have made.
+fn resolve_ignorecase(repo_root: &Path) -> bool {
+    let Ok(config) = std::fs::read_to_string(repo_root.join(".git/config")) else {
+        return cfg!(any(windows, target_os = "macos"));
+    };
+    for line in config.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("ignorecase") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        return !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        );
+    }
+    cfg!(any(windows, target_os = "macos"))
 }
 
 /// The top of the checkout `start` belongs to.
@@ -636,6 +676,68 @@ mod tests {
         assert!(
             !vi.is_ignored(&scope.join("keep.cpp"), false),
             "a .gitignore ABOVE the checkout reached in — the ascent is unbounded"
+        );
+    }
+
+    /// A `.p4config` below a checkout root is not a boundary.
+    ///
+    /// P4CONFIG is defined by nearest-file lookup *from a subdirectory*, so a `.p4config`
+    /// under a root is the normal Perforce idiom. Treated as a repo marker it stopped a git
+    /// repo resolving its own root `.gitignore`: `repo/.gitignore: *.gen.cpp` no longer hid
+    /// `repo/sub/src/a.gen.cpp`, which `git check-ignore` reports as ignored. Same mistake
+    /// `.p4ignore` made one round earlier, in a subtler costume.
+    #[test]
+    fn a_p4config_below_the_root_is_not_a_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, ".git/HEAD", "ref: refs/heads/main\n");
+        write(root, ".gitignore", "*.gen.cpp\n");
+        write(root, "sub/.p4config", "P4PORT=x\n");
+        write(root, "sub/src/a.gen.cpp", "void a(){}\n");
+        write(root, "sub/src/b.cpp", "void b(){}\n");
+
+        let scope = root.join("sub");
+        let vi = VcsIgnore::for_scope(&scope).expect("rules");
+        assert!(
+            vi.is_ignored(&scope.join("src/a.gen.cpp"), false),
+            "a .p4config below the root decapitated the repo's own .gitignore"
+        );
+        assert!(!vi.is_ignored(&scope.join("src/b.cpp"), false));
+    }
+
+    /// `core.ignorecase` comes from the checkout, not from the platform.
+    ///
+    /// Hard-coding `cfg!(windows)` over-hid on the dangerous side and no repo could opt out.
+    /// The behavioural half is an oracle scenario; this pins the parser, including that an
+    /// absent config falls back to git's own platform default rather than to `false`.
+    #[test]
+    fn ignorecase_is_read_from_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        write(
+            root,
+            ".git/config",
+            "[core]\n\trepositoryformatversion = 0\n",
+        );
+        assert_eq!(
+            resolve_ignorecase(root),
+            cfg!(any(windows, target_os = "macos")),
+            "no ignorecase key: fall back to the platform default git itself would pick"
+        );
+
+        write(root, ".git/config", "[core]\n\tignorecase = false\n");
+        assert!(!resolve_ignorecase(root));
+
+        write(root, ".git/config", "[core]\n\tignorecase = true\n");
+        assert!(resolve_ignorecase(root));
+
+        let bare = tmp.path().join("nogit");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(
+            resolve_ignorecase(&bare),
+            cfg!(any(windows, target_os = "macos")),
+            "no git config at all: same platform default"
         );
     }
 
