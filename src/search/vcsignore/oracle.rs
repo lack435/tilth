@@ -164,6 +164,31 @@ const SCENARIOS: &[Scenario] = &[
             "x.o3",
         ],
     },
+    // The four cases below were all found by review, all diverged from git, and none was
+    // caught by the eleven scenarios above — they are here so the oracle owns them rather
+    // than a hand-written assertion about what git "should" do.
+    Scenario {
+        name: "leading whitespace is significant to git",
+        // `trim()` on both edges made `   leading.txt` a live rule and hid a file git
+        // tracks — the dangerous direction. Git strips only trailing whitespace.
+        ignore_files: &[(".gitignore", "   leading.txt\nkeep.rs\n")],
+        paths: &["leading.txt", "keep.rs", "other.txt"],
+    },
+    Scenario {
+        name: "UTF-8 BOM does not eat the first pattern",
+        // `str::trim` does not strip U+FEFF, so the first pattern became `\u{FEFF}*.log`
+        // and matched nothing. PowerShell writes UTF-8 with BOM by default on this platform.
+        ignore_files: &[(".gitignore", "\u{FEFF}*.log\nbuild/\n")],
+        paths: &["a.log", "sub/b.log", "build/x.txt", "keep.rs"],
+    },
+    Scenario {
+        name: "case-mismatched patterns",
+        // NTFS is case-insensitive and `git init` sets core.ignorecase=true, so git ignores
+        // `a.log` under a `*.LOG` rule. Every other scenario uses case-matching patterns, so
+        // this divergence was invisible while 72/72 held.
+        ignore_files: &[(".gitignore", "*.LOG\nBuild/\n")],
+        paths: &["a.log", "A.LOG", "build/x.txt", "Build/y.txt", "keep.rs"],
+    },
     Scenario {
         name: "trailing spaces and escapes",
         ignore_files: &[(
@@ -292,7 +317,7 @@ fn every_verdict_agrees_with_git_check_ignore() {
     // Guards against the corpus silently shrinking (a scenario deleted, a `paths` list
     // emptied) — a green oracle over nothing is the failure mode this whole file exists to
     // avoid. The number is what the corpus currently produces, not a target.
-    assert!(checks >= 72, "only {checks} checks ran; the corpus shrank");
+    assert!(checks >= 84, "only {checks} checks ran; the corpus shrank");
     assert!(
         mismatches.is_empty(),
         "{} of {checks} verdicts disagree with git check-ignore:\n{}",

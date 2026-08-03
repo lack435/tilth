@@ -411,6 +411,10 @@ const PARAMS_WITHOUT_THEIR_OWN_SURFACE: &[(&str, &str)] = &[
     ("pattern", "glob for `files`; no rendering of its own"),
     ("patterns", "batch of `pattern`"),
     ("glob", "filters which files a search visits"),
+    (
+        "include_ignored",
+        "widens which files a walk visits (VCS-ignored ones); every visited file renders \n         through the same surfaces either way",
+    ),
     ("context", "biases ranking; does not add a render path"),
     ("budget", "truncates an already-rendered surface"),
     (

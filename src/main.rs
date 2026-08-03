@@ -168,6 +168,9 @@ fn main() {
     // inert here — `GLOBAL` starts unlimited and only `reset()` reads `TILTH_MAX_WALK` — so
     // the trip note would advertise an env var that does nothing on this path.
     tilth::walkbudget::reset();
+    // Also arms the VCS-ignore skip record. Without it the CLI hides files with no
+    // note at all — the exact defect the feature exists to avoid, on half its surfaces.
+    tilth::vcsignore::begin_request(false);
     let cli = Cli::parse();
 
     // Shell completions
@@ -422,6 +425,9 @@ fn emit_result(
 fn emit_output(output: &str, is_tty: bool) {
     // To stderr, not stdout: a truncation warning must not land in a pipeline's data.
     if let Some(note) = tilth::walkbudget::report() {
+        eprint!("{note}");
+    }
+    if let Some(note) = tilth::vcsignore::skipped_note() {
         eprint!("{note}");
     }
     let line_count = output.lines().count();

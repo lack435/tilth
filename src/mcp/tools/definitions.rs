@@ -34,6 +34,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
                     },
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "Also include files excluded by .gitignore/.p4ignore. Default false. Set true when something you expect to exist is not found — build output and force-added-but-tracked files are skipped by default, and the response says how many were skipped."
+                    },
                     "kind": {
                         "type": "string",
                         "enum": ["symbol", "content", "regex", "callers"],
@@ -135,6 +139,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
                     },
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "Also include files excluded by .gitignore/.p4ignore. Default false. Set true when something you expect to exist is not found — build output and force-added-but-tracked files are skipped by default, and the response says how many were skipped."
+                    },
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
@@ -162,6 +170,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Directory to search for dependents. Default: project root."
                     },
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "Also include files excluded by .gitignore/.p4ignore. Default false. Set true when something you expect to exist is not found — build output and force-added-but-tracked files are skipped by default, and the response says how many were skipped."
+                    },
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
@@ -188,6 +200,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "scope": {
                         "type": "string",
                         "description": "Subdirectory to narrow the search. Default: project root."
+                    },
+                    "include_ignored": {
+                        "type": "boolean",
+                        "description": "Also include files excluded by .gitignore/.p4ignore. Default false. Set true when something you expect to exist is not found — build output and force-added-but-tracked files are skipped by default, and the response says how many were skipped."
                     },
                     "full": {
                         "type": "boolean",

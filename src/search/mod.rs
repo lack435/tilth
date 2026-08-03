@@ -16,8 +16,13 @@ pub mod truncate;
 mod bloom_walk;
 mod vcsignore;
 
-pub(crate) use vcsignore::begin_request as vcsignore_begin_request;
-pub(crate) use vcsignore::skipped_note as vcsignore_skipped_note;
+pub(crate) fn vcsignore_begin_request(include_ignored: bool) {
+    vcsignore::begin_request(include_ignored);
+}
+#[must_use]
+pub fn vcsignore_skipped_note() -> Option<String> {
+    vcsignore::skipped_note()
+}
 mod callee_query;
 mod retain;
 pub mod scope;
@@ -164,7 +169,7 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
                 // named scope with a silent zero, and a caller naming a directory outranks
                 // a blanket rule that happens to cover it.
                 if entry.depth() > 0 && rules.is_ignored(entry.path(), is_dir) {
-                    rules.note_skipped();
+                    rules.note_skipped(entry.path());
                     return false;
                 }
             }
@@ -1178,11 +1183,28 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<PathBuf> = None;
     let mut best_priority: u8 = 0;
 
+    // `git_ignore(false)`, and the shared matcher applied below instead.
+    //
+    // This walker predates `vcsignore` and used to set `git_ignore(true)`, which is the one
+    // arrangement that module exists to replace: the crate's matcher runs ahead of any
+    // filter, so its exclusions are uncountable, unreportable, and honour neither
+    // `include_ignored` nor `TILTH_NO_VCS_IGNORE`. Having a second, differently-governed
+    // ignore policy on a path reachable from search made "every decision passes through one
+    // place" false.
+    let rules = (!matches!(
+        std::env::var("TILTH_NO_VCS_IGNORE")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    ) && !vcsignore::include_ignored())
+    .then(|| vcsignore::VcsIgnore::for_scope(scope))
+    .flatten();
+
     let walker = ignore::WalkBuilder::new(scope)
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(true)
-        .git_ignore(true)
+        .git_ignore(false)
         .max_depth(Some(6))
         .build();
 
@@ -1190,6 +1212,12 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
         let path = entry.path();
         if !path.is_file() {
             continue;
+        }
+        if let Some(rules) = &rules {
+            if entry.depth() > 0 && rules.is_ignored(path, false) {
+                rules.note_skipped(path);
+                continue;
+            }
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;

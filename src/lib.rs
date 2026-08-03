@@ -36,6 +36,24 @@ pub(crate) mod timeout;
 pub(crate) mod types;
 pub mod walkbudget;
 
+/// Per-request VCS-ignore state, for binaries that drive a walk directly.
+///
+/// A narrow public surface rather than `pub mod search`, which would promote every `pub fn`
+/// in that module to a real public API and trip `clippy::pedantic` across seven pre-existing
+/// functions that were never meant to be public.
+pub mod vcsignore {
+    /// Arm the skip record for a request and set whether ignored files are included.
+    pub fn begin_request(include_ignored: bool) {
+        crate::search::vcsignore_begin_request(include_ignored);
+    }
+
+    /// What this request hid, as caller-facing prose. `None` when it hid nothing.
+    #[must_use]
+    pub fn skipped_note() -> Option<String> {
+        crate::search::vcsignore_skipped_note()
+    }
+}
+
 pub mod util;
 
 /// Locks over process-global state that tests share.
