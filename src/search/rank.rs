@@ -952,7 +952,7 @@ mod tests {
 
         let fresh_mtime = SystemTime::now();
         // Two months old: a different `recency` bucket from "within the last hour".
-        let stale_mtime = fresh_mtime - Duration::from_secs(60 * 24 * 3600);
+        let stale_mtime = fresh_mtime - Duration::from_hours(1440);
 
         let mut fresh = make_match("/repo/src/a.rs", "handleAuth(user)", false, None);
         fresh.mtime = fresh_mtime;

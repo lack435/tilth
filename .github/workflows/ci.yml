@@ -30,7 +30,13 @@ jobs:
       #
       # `cargo fmt` above is left alone: it does not resolve dependencies, so it has no
       # lockfile to disagree with.
-      - run: cargo clippy --locked -- -D warnings
+      #
+      # `--all-targets` covers the test and bench targets, not just the lib and bin. Without it
+      # `#![warn(clippy::pedantic)]` never reaches anything behind `#[cfg(test)]`, so test code
+      # accumulated 87 warnings that no gate could see — including one detached `///` block that
+      # was documenting the wrong item, and four `assert!`s on constants that read as guards but
+      # were checking compile-time-known values. Test code is code; lint it.
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
   markdown:

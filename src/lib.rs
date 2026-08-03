@@ -13,6 +13,11 @@
     clippy::missing_errors_doc,        // internal pub(crate) fns don't need error docs
     clippy::missing_panics_doc,        // same
 )]
+// Test code only. Both lints exist to avoid an intermediate allocation per append, and every site
+// they fire on is a fixture builder, where `push_str(&format!(..))` reads better than a `write!`
+// whose `Result` has to be discarded. Production code still gets both — the walk and the
+// formatters are where that allocation actually costs something.
+#![cfg_attr(test, allow(clippy::format_push_string, clippy::format_collect))]
 
 pub(crate) mod budget;
 pub mod cache;

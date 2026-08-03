@@ -1885,7 +1885,7 @@ mod tests {
     /// Both runs share **one** cache, and `contains_any` goes first so it builds and admits. The
     /// per-target run then queries that same admitted filter, which is what makes the comparison
     /// about loop logic and nothing else. Two caches would compare two *differently seeded*
-    /// filters: `fastbloom`'s `with_false_pos` derives a fresh SipHash key per filter instance, so
+    /// filters: `fastbloom`'s `with_false_pos` derives a fresh `SipHash` key per filter instance, so
     /// filters built from identical content have different false-positive sets. Measured on this
     /// fixture — a 64-bit filter over 3 identifiers — two independent filters disagree on ~6 of
     /// 20000 absent probes, so the two-absent-target case would flake, and it would look like

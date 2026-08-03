@@ -1834,7 +1834,7 @@ mod tests {
     ) -> Vec<Match> {
         let mut out = Vec::new();
         stream_defs_markdown(path, query, content, file_lines, mtime, &mut |m| {
-            out.push(m)
+            out.push(m);
         });
         out
     }
@@ -2068,7 +2068,7 @@ end
 
     #[test]
     fn elixir_guard_clause_definitions() {
-        let code = r#"defmodule Guards do
+        let code = r"defmodule Guards do
   def safe_div(a, b) when b != 0 do
     a / b
   end
@@ -2077,7 +2077,7 @@ end
 
   defguard is_positive(x) when x > 0
 end
-"#;
+";
         // Guard clause with `when` — block form
         assert!(
             !elixir_find(code, "safe_div").is_empty(),
@@ -2123,7 +2123,7 @@ end
 
     #[test]
     fn elixir_protocol_impl_exception() {
-        let code = r#"defprotocol Printable do
+        let code = r"defprotocol Printable do
   @callback format(t) :: String.t()
   def to_string(data)
 end
@@ -2135,7 +2135,7 @@ end
 defmodule MyError do
   defexception [:message, :code]
 end
-"#;
+";
         // Protocol + defimpl: both indexed under the protocol name "Printable"
         let defs = elixir_find(code, "Printable");
         assert!(
@@ -2159,14 +2159,14 @@ end
 
     #[test]
     fn elixir_delegate_and_nested_modules() {
-        let code = r#"defmodule Outer do
+        let code = r"defmodule Outer do
   defdelegate count(list), to: Enum
 
   defmodule Inner do
     def nested_func, do: :ok
   end
 end
-"#;
+";
         // defdelegate
         assert!(
             !elixir_find(code, "count").is_empty(),
@@ -2718,7 +2718,7 @@ using MyAlias = float;
         // Create 15 Rust files each defining WidelyUsedThing.
         for i in 0..15 {
             let path = scope.join(format!("file_{i:02}.rs"));
-            std::fs::write(&path, format!("pub fn WidelyUsedThing() {{}}\n")).expect("write");
+            std::fs::write(&path, "pub fn WidelyUsedThing() {}\n").expect("write");
         }
 
         let result_default =
