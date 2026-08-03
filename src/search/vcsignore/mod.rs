@@ -403,6 +403,17 @@ mod tests {
         write(root, ".p4ignore", "!secret.txt\n*/Intermediate/*\n");
         write(root, "secret.txt", "x\n");
         write(root, "Engine/Intermediate/gen.cpp", "void G(){}\n");
+        // THREE segments before `Intermediate`. A one-level fixture cannot detect the
+        // anchoring bug this translation exists to fix: under gitignore semantics
+        // `*/Intermediate/*` still matches `Engine/Intermediate/x` — one segment, then
+        // Intermediate, then the file — so the test passed with the fix reverted. It is
+        // the deep case that diverges, and the deep case is 50,893 of the 133,279
+        // build-output files on the measured UE checkout.
+        write(
+            root,
+            "Engine/Plugins/Acme/Intermediate/Build/deep.cpp",
+            "void D(){}\n",
+        );
 
         let vi = VcsIgnore::for_scope(root).expect("rules exist");
         assert!(
@@ -411,7 +422,15 @@ mod tests {
         );
         assert!(
             vi.is_ignored(&root.join("Engine/Intermediate/gen.cpp"), false),
-            "the translated p4 rule must match at depth"
+            "the translated p4 rule must match one level down"
+        );
+        assert!(
+            vi.is_ignored(
+                &root.join("Engine/Plugins/Acme/Intermediate/Build/deep.cpp"),
+                false
+            ),
+            "P4 patterns are unanchored and must match at ANY depth — this is the case \
+             gitignore semantics get wrong, and the only one that distinguishes them"
         );
     }
 
@@ -457,6 +476,38 @@ mod tests {
         assert!(
             vi.is_ignored(&root.join("Engine/Source/notes.txt"), false),
             "an extension with no whitelist line stays ignored, as git has it"
+        );
+    }
+
+    /// Hiding a path must be reported, and the report must name the way back.
+    ///
+    /// The whole value of honouring ignore files is that it hides things; the whole risk is
+    /// hiding the wrong thing. On a real UE tree the default hides 451 first-party
+    /// `Content/Python` editor scripts, so "0 files" with no note is a lie the caller has no
+    /// way to catch — and, unlike the reverted design, this one can see every skip because
+    /// nothing is excluded behind its back.
+    #[test]
+    fn skipping_a_path_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, ".git/HEAD", "ref: refs/heads/main\n");
+        write(root, ".gitignore", "Saved/\n");
+        write(root, "Saved/hidden.rs", "fn h() {}\n");
+        write(root, "kept.rs", "fn k() {}\n");
+
+        begin_request(false); // also zeroes the counter
+        let seen: Vec<String> = crate::search::base_walk_builder(root)
+            .build()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        assert!(seen.contains(&"kept.rs".to_string()));
+        assert!(!seen.contains(&"hidden.rs".to_string()));
+
+        let note = skipped_note().expect("hiding a path must be reported");
+        assert!(
+            note.contains("include_ignored"),
+            "the report must name the way back: {note}"
         );
     }
 
