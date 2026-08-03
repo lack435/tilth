@@ -93,7 +93,13 @@ const GIT_NAMES: &[&str] = &[".gitignore"];
 const P4_NAMES: &[&str] = &[".p4ignore", ".p4ignore.txt"];
 
 /// One syntax's matchers for one directory, ordered shallowest first.
-type Layer = Vec<Gitignore>;
+///
+/// `Arc<Gitignore>`, not `Gitignore`. Every directory's stack is built by extending its
+/// parent's, so a plain `Vec<Gitignore>` deep-copies each ancestor's **compiled `GlobSet`**
+/// once per directory. On a UE checkout that is 26,694 copies of a 191-glob set — measured
+/// at 6.6s of the 6.9s total overhead, while a warm `is_ignored` costs 2.14us. Refcounts
+/// make extending a stack proportional to its depth rather than its content.
+type Layer = Vec<Arc<Gitignore>>;
 
 /// What one directory contributes, and whether it is itself excluded.
 struct DirRules {
@@ -207,10 +213,10 @@ impl VcsIgnore {
             None => (Vec::new(), Vec::new(), false),
         };
         if let Some(m) = build(dir, GIT_NAMES, false) {
-            git.push(m);
+            git.push(Arc::new(m));
         }
         if let Some(m) = build(dir, P4_NAMES, true) {
-            p4.push(m);
+            p4.push(Arc::new(m));
         }
         let rules = Arc::new(DirRules { git, p4, excluded });
         self.cache.insert(dir.to_path_buf(), Arc::clone(&rules));
