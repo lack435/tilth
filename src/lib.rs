@@ -1,22 +1,11 @@
-#![warn(clippy::pedantic)]
-#![allow(
-    clippy::cast_possible_truncation,  // line numbers as u32, token counts — we target 64-bit
-    clippy::cast_sign_loss,            // same
-    clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
-    clippy::module_name_repetitions,   // Rust naming conventions
-    clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // crate-wide to cover find_definitions in src/search/symbol.rs;
-                                       // narrow to a per-function allow once a refactor shrinks that file
-    clippy::too_many_arguments,        // internal recursive AST walker
-    clippy::unnecessary_wraps,         // Result return for API consistency
-    clippy::struct_excessive_bools,    // CLI struct derives clap
-    clippy::missing_errors_doc,        // internal pub(crate) fns don't need error docs
-    clippy::missing_panics_doc,        // same
-)]
-// Test code only. Both lints exist to avoid an intermediate allocation per append, and every site
-// they fire on is a fixture builder, where `push_str(&format!(..))` reads better than a `write!`
-// whose `Result` has to be discarded. Production code still gets both — the walk and the
-// formatters are where that allocation actually costs something.
+// `clippy::pedantic` and the lints this crate excuses from it are configured in `[lints.clippy]` in
+// Cargo.toml, so they reach every target rather than just this crate root. See the note there.
+//
+// This one stays an attribute because `[lints]` has no way to say "under cfg(test) only". Both lints
+// exist to avoid an intermediate allocation per append, and every site they fire on is a fixture
+// builder, where `push_str(&format!(..))` reads better than a `write!` whose `Result` has to be
+// discarded. Production code still gets both — the walk and the formatters are where that
+// allocation actually costs something.
 #![cfg_attr(test, allow(clippy::format_push_string, clippy::format_collect))]
 
 pub(crate) mod budget;

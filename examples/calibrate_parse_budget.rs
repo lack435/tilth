@@ -30,6 +30,11 @@
 //! nothing else in the process is parsing. `cargo build --examples` still compiles it, so it cannot
 //! rot silently.
 
+// Every cast this fires on turns a byte or file count into `f64` to report a ratio or a mean. The
+// counts are corpus sizes, nowhere near 2^53, and the output is a calibration figure a human reads
+// to pick a constant — losing low mantissa bits cannot change what it says.
+#![allow(clippy::cast_precision_loss)]
+
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashMap;
 use std::ffi::c_void;

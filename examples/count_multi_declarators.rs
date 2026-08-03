@@ -9,6 +9,10 @@
 //!
 //! Usage: `cargo run --release --example count_multi_declarators -- <dir>`
 
+// One cast of a declarator count to `f64` for a percentage. See the note in
+// `calibrate_parse_budget.rs` — same reasoning, same irrelevance.
+#![allow(clippy::cast_precision_loss)]
+
 use std::path::Path;
 
 use tilth::__calibration::{grammar_for, language_of, parse, Lang};

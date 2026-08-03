@@ -16,6 +16,31 @@ categories = ["command-line-utilities", "development-tools"]
 name = "tilth"
 path = "src/main.rs"
 
+# Lints live here, not as `#![warn(..)]` in src/lib.rs, because an inner attribute reaches only its
+# own crate root. `src/main.rs`, `tests/oracle.rs`, and `examples/*` are separate crate roots, so
+# for as long as this config sat in lib.rs they inherited none of it: `--all-targets` compiled them
+# but pedantic never reached them, and 23 warnings accumulated where nobody could see them —
+# including in the differential oracle, the most load-bearing test asset in the repo. A package-level
+# `[lints]` table applies to every target, which is what makes "the whole package is linted" a fact
+# about the build rather than a promise about where attributes were placed.
+#
+# `priority = -1` on the group is required: without it the group and the individual allows below sit
+# at the same precedence and the allows do not reliably win.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow" # line numbers as u32, token counts — we target 64-bit
+cast_sign_loss = "allow"           # same
+cast_possible_wrap = "allow"       # u32→i32 for tree-sitter APIs
+module_name_repetitions = "allow"  # Rust naming conventions
+similar_names = "allow"            # common in parser/search code
+too_many_lines = "allow"           # crate-wide to cover find_definitions in src/search/symbol.rs;
+                                   # narrow to a per-function allow once a refactor shrinks that file
+too_many_arguments = "allow"       # internal recursive AST walker
+unnecessary_wraps = "allow"        # Result return for API consistency
+struct_excessive_bools = "allow"   # CLI struct derives clap
+missing_errors_doc = "allow"       # internal pub(crate) fns don't need error docs
+missing_panics_doc = "allow"       # same
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }

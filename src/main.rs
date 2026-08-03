@@ -48,7 +48,7 @@ struct Cli {
     #[arg(long)]
     mcp: bool,
 
-    /// Enable edit mode: hashline output + tilth_write tool.
+    /// Enable edit mode: hashline output + `tilth_write` tool.
     #[arg(long)]
     edit: bool,
 
@@ -94,7 +94,7 @@ enum Command {
         /// MCP host to configure.
         host: String,
 
-        /// Enable edit mode (hashline output + tilth_write tool).
+        /// Enable edit mode (hashline output + `tilth_write` tool).
         #[arg(long)]
         edit: bool,
     },
@@ -293,9 +293,7 @@ fn main() {
     }
 
     // CLI mode: single query
-    let query = if let Some(q) = cli.query {
-        q
-    } else {
+    let Some(query) = cli.query else {
         eprintln!("usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]");
         process::exit(3);
     };
@@ -505,7 +503,7 @@ fn compute_expand(cli_expand: Option<usize>, cli_full: bool) -> usize {
     /// `--budget` already bounds output, but `expand=usize::MAX` makes tilth
     /// compute the expanded source for every match before truncating —
     /// wasted parsing + rendering on pathological queries. 50 is well above
-    /// any practical "show me everything that matters" case (MAX_MATCHES is
+    /// any practical "show me everything that matters" case (`MAX_MATCHES` is
     /// 10 for symbol search anyway).
     const FULL_EXPAND_CAP: usize = 50;
     match (cli_expand, cli_full) {
@@ -543,7 +541,7 @@ mod tests {
     }
 
     /// Pin the regression that 16212fc was authored to prevent: a piped
-    /// invocation (where `main` sets `full = !is_tty = true` for FilePath
+    /// invocation (where `main` sets `full = !is_tty = true` for `FilePath`
     /// queries) must still receive `expand=0` here. `compute_expand` only
     /// sees the parsed `cli.full`, never the piped-derived bool — so a
     /// future refactor that conflates the two would have to change this
