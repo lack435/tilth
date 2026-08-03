@@ -14,6 +14,10 @@ pub mod symbol;
 pub mod truncate;
 
 mod bloom_walk;
+mod vcsignore;
+
+pub(crate) use vcsignore::begin_request as vcsignore_begin_request;
+pub(crate) use vcsignore::skipped_note as vcsignore_skipped_note;
 mod callee_query;
 mod retain;
 pub mod scope;
@@ -115,6 +119,25 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     let cancel = crate::cancel::current();
+
+    // Every `git_*` knob stays off. This is not "we do not honour ignore files" — it is
+    // that `vcsignore` honours them instead, because the crate's matcher runs before
+    // `filter_entry` and anything it excludes is therefore invisible to us: uncountable,
+    // unreportable, and impossible to overrule. See `vcsignore`'s module header.
+    // Two opt-outs. `include_ignored` is per call, so an agent can reach a wrongly-hidden
+    // file mid-task; `TILTH_NO_VCS_IGNORE` is process-wide, for the CLI and for anyone who
+    // wants the pre-2026 walk-everything behaviour back without passing an argument.
+    let env_opt_out = matches!(
+        std::env::var("TILTH_NO_VCS_IGNORE")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    );
+    let rules = (!env_opt_out && !vcsignore::include_ignored())
+        .then(|| vcsignore::VcsIgnore::for_scope(scope))
+        .flatten()
+        .map(std::sync::Arc::new);
+
     builder
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
@@ -128,9 +151,21 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
             if cancel.is_cancelled() {
                 return false;
             }
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if is_dir {
                 if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            if let Some(rules) = &rules {
+                // `depth() == 0` is the walk root. Pruning it would answer an explicitly
+                // named scope with a silent zero, and a caller naming a directory outranks
+                // a blanket rule that happens to cover it.
+                if entry.depth() > 0 && rules.is_ignored(entry.path(), is_dir) {
+                    rules.note_skipped();
+                    return false;
                 }
             }
             true

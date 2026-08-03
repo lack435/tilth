@@ -356,15 +356,25 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
         // for the live request; a worker abandoned by an earlier timeout keeps running, and
         // is excluded by the generation `run_walk` captures rather than by this bracket.
         crate::walkbudget::reset();
+        // After `walkbudget::reset`, which bumps the generation both of these share, and
+        // before the worker spawns so the walk it builds sees the flag.
+        crate::search::vcsignore_begin_request(
+            args.get("include_ignored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        );
         let out = run_tool_with_timeout(services, tool_name, args, timeout::request_timeout());
-        // A truncated walk says so on the response that carries its partial results.
-        // Reporting nothing would turn "incomplete" into "nothing more to find" — the same
-        // defect class as a scope silently widening to the whole checkout.
+        // Both notes ride on the response that carries the affected results. An omission
+        // nobody is told about is the failure mode this codebase keeps having to fix — a
+        // widened scope, a silent cap, a hidden file all read as "nothing more to find".
         match out {
-            Ok(body) => match crate::walkbudget::report() {
-                Some(note) => Ok(format!("{note}{body}")),
-                None => Ok(body),
-            },
+            Ok(body) => {
+                let mut prefix = crate::walkbudget::report().unwrap_or_default();
+                if let Some(note) = crate::search::vcsignore_skipped_note() {
+                    prefix.push_str(&note);
+                }
+                Ok(format!("{prefix}{body}"))
+            }
             err => err,
         }
     };
