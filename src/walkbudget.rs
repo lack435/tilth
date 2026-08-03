@@ -1,20 +1,17 @@
 //! A ceiling on how many entries one request's walks may visit.
 //!
-//! `base_walk_builder` prunes a fixed `SKIP_DIRS` list and nothing else — it does not
-//! consult `.gitignore`, deliberately, so that ignored-but-locally-relevant files stay
-//! findable. On a normal repo that is a good trade. On a game checkout it means the walk
-//! covers the whole disk: measured on a real Unreal tree, **2,043,544 files walked against
-//! 835 tracked**, and a content search over it took **2m51s against a 90s request timeout**.
-//! Sixty percent of that tree is one directory whose name no fixed denylist would guess.
+//! The backstop for trees no ignore file rescues. `search::vcsignore` honours `.gitignore`
+//! and `.p4ignore`, which is what makes a real game checkout searchable — but only where
+//! those files exist and are accurate. A tree with neither, or with a million untracked
+//! files nobody thought to ignore, still walks until the request timeout kills it.
 //!
 //! A timeout is the least informative way to learn any of that. It arrives after the full
 //! wait, says only "too long", and discards whatever the walk had found. This trips first,
 //! keeps the partial results, and says what consumed the budget.
 //!
-//! It is a floor on how bad things can get, not a fix for why they are bad. Teaching the
-//! walker to read the checkout's own ignore files is the real answer and is being designed
-//! separately — a first attempt was reverted after review found it hid 451 first-party
-//! source files on the same tree it was meant to help.
+//! A floor on the worst case, not a substitute for `vcsignore`. Both exist because they
+//! fail differently: ignore files make the common case fast and cannot help a tree that has
+//! none, while this bounds any tree at all and returns a partial answer when it fires.
 //!
 //! # Not silent
 //!

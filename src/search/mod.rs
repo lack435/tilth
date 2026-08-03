@@ -14,6 +14,15 @@ pub mod symbol;
 pub mod truncate;
 
 mod bloom_walk;
+mod vcsignore;
+
+pub(crate) fn vcsignore_begin_request(include_ignored: bool) {
+    vcsignore::begin_request(include_ignored);
+}
+#[must_use]
+pub fn vcsignore_skipped_note() -> Option<String> {
+    vcsignore::skipped_note()
+}
 mod callee_query;
 mod retain;
 pub mod scope;
@@ -115,6 +124,25 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     let cancel = crate::cancel::current();
+
+    // Every `git_*` knob stays off. This is not "we do not honour ignore files" — it is
+    // that `vcsignore` honours them instead, because the crate's matcher runs before
+    // `filter_entry` and anything it excludes is therefore invisible to us: uncountable,
+    // unreportable, and impossible to overrule. See `vcsignore`'s module header.
+    // Two opt-outs. `include_ignored` is per call, so an agent can reach a wrongly-hidden
+    // file mid-task; `TILTH_NO_VCS_IGNORE` is process-wide, for the CLI and for anyone who
+    // wants the pre-2026 walk-everything behaviour back without passing an argument.
+    let env_opt_out = matches!(
+        std::env::var("TILTH_NO_VCS_IGNORE")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    );
+    let rules = (!env_opt_out && !vcsignore::include_ignored())
+        .then(|| vcsignore::VcsIgnore::for_scope(scope))
+        .flatten()
+        .map(std::sync::Arc::new);
+
     builder
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
@@ -128,9 +156,21 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
             if cancel.is_cancelled() {
                 return false;
             }
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if is_dir {
                 if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            if let Some(rules) = &rules {
+                // `depth() == 0` is the walk root. Pruning it would answer an explicitly
+                // named scope with a silent zero, and a caller naming a directory outranks
+                // a blanket rule that happens to cover it.
+                if entry.depth() > 0 && rules.is_ignored(entry.path(), is_dir) {
+                    rules.note_skipped(entry.path());
+                    return false;
                 }
             }
             true
@@ -1143,11 +1183,23 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<PathBuf> = None;
     let mut best_priority: u8 = 0;
 
-    let walker = ignore::WalkBuilder::new(scope)
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(true)
-        .git_ignore(true)
+    // `base_walk_builder`, not a hand-rolled twin.
+    //
+    // This walker predates `vcsignore` and set `git_ignore(true)` — the one arrangement that
+    // module exists to replace, since the crate's matcher runs ahead of any filter and its
+    // exclusions are uncountable and honour neither opt-out. The first correction applied
+    // the shared matcher here but kept the bespoke builder, and filtered only *files*: with
+    // no `filter_entry` it never pruned a directory, so it descended into an ignored tree
+    // and recorded every file inside it individually. Measured on a 21-file repo with one
+    // ignored 600-file directory: the same request reported **601 paths skipped** where the
+    // main walk collapses that directory to 1, and visited 600 files it had no reason to
+    // open. The note's own promise — "a skipped directory counts once, not its contents" —
+    // was false wherever this fired.
+    //
+    // Reusing the shared builder makes the policy, the pruning and the counting identical by
+    // construction rather than by two implementations agreeing.
+    let walker = base_walk_builder(scope)
+        .hidden(true) // narrower than the shared default: a dotfile is never the answer here
         .max_depth(Some(6))
         .build();
 
