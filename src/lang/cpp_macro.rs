@@ -174,11 +174,59 @@ fn blank_spans(bytes: &[u8], spans: &[(usize, usize)]) -> Option<String> {
 /// removes the artifact `read::outline::code` deduplicates, where each annotated enumerator
 /// parsed as a `function_declarator` and the outline gained one `fn UMETA` per enumerator.
 ///
-/// The other UE macros are deliberately absent. `UCLASS`, `USTRUCT`, `UPROPERTY` and
-/// `UFUNCTION` each leave an `ERROR` or an `expression_statement` behind, but recovery is
-/// local — the declaration after them still parses — so masking them would change tested
-/// output for no correctness gain.
-const ANNOTATION_MACROS: [&[u8]; 1] = [b"UMETA"];
+/// The **deprecation attributes** are here for a different failure, on the same principle. A
+/// deprecation attribute before a class member —
+///
+/// ```text
+/// namespace NetworkingPrivate
+/// {
+/// struct FRepPropertyDescriptor
+/// {
+///     UE_DEPRECATED(5.2, "No longer used")   // ← attribute before the constructor
+///     FRepPropertyDescriptor(const FProperty* Property) { … }
+/// };
+/// }
+/// ```
+///
+/// derails the enclosing type: tree-sitter-cpp reads `UE_DEPRECATED(…)` as a member
+/// declaration, and inside a namespace the recovery is *not* local — the `struct` keyword and
+/// tag are absorbed into an `ERROR`, so the `struct_specifier` disappears and only the
+/// surviving constructor is findable. `read`/`search`/`grok` then report the type's own line as
+/// a *usage* and resolve the type to a member (#130). Like `UMETA`, `UE_DEPRECATED` is pure
+/// metadata — a version and a message — with no symbol inside, so blanking every invocation is
+/// length-preserving and loses nothing. It composes with `mask_export_macros`, which already
+/// blanks the same macro in a *type head* (`class UE_DEPRECATED(…) API Widget`); the two never
+/// fight, since both overwrite the identical span with spaces.
+///
+/// **Why `UE_DEPRECATED` and not "every deprecation macro".** The misparse is triggered by the
+/// *shape of the arguments*, not by the macro being a deprecation macro: a **numeric first
+/// argument** — `MACRO(5.2, …)` — is what tree-sitter-cpp cannot place in member-declarator
+/// position. Isolated on synthetic input: `M(x, "s")`, `M("a", "b")` and `M("s")` all parse; only
+/// `M(1, …)` / `M(1.0, …)` collapse the enclosing type. `UE_DEPRECATED(Version, Message)` is the
+/// one deprecation attribute spelled with a leading numeric version, and a scan of
+/// `Engine/Source/Runtime` finds no other `*DEPRECATED*(<number>, …)` invocation. The
+/// single-*message* attributes of other libraries — `BOOST_DEPRECATED("m")`,
+/// `ABSL_DEPRECATED("m")`, `GTEST_INTERNAL_DEPRECATED("m")` — take a lone string and do **not**
+/// misparse, so masking them recovers nothing (measured: zero change over `GoogleTest` and Boost
+/// header trees) and is deliberately not done.
+///
+/// Two `DEPRECATED`-named kinds must never be added, because blanking them would be wrong rather
+/// than merely useless: **declaration-generating** macros — above all Slate's
+/// `SLATE_ARGUMENT_DEPRECATED` / `SLATE_ATTRIBUTE_DEPRECATED`, where
+/// `SLATE_ATTRIBUTE_DEPRECATED(Type, Name, …)` expands to a member variable and function named
+/// `Name`, so blanking it deletes a real symbol — and **file-scope pragma emitters**
+/// (`UE_DEPRECATED_HEADER`, `UE_DEPRECATED_MACRO`), which sit at file scope, not before a member.
+///
+/// The plain `UCLASS`/`USTRUCT`/`UPROPERTY`/`UFUNCTION` macros are likewise absent: each leaves an
+/// `ERROR` or `expression_statement` behind, but recovery is local — the declaration after them
+/// still parses — so masking them would change tested output for no correctness gain.
+const ANNOTATION_MACROS: [&[u8]; 2] = [
+    // Enumerator editor metadata.
+    b"UMETA",
+    // The one deprecation attribute whose `(numeric version, message)` shape triggers the
+    // member misparse (see above); other libraries' single-message ones do not, so are absent.
+    b"UE_DEPRECATED",
+];
 
 /// Newlines an annotation's argument list may cross before the span is refused.
 ///
@@ -1061,5 +1109,104 @@ public:
                 "missing {want} in {fixed:?}"
             );
         }
+    }
+
+    /// `UE_DEPRECATED` is masked wherever it appears, arguments and all — the same treatment as
+    /// `UMETA`, for the member-position misparse it causes (#130).
+    #[test]
+    fn masks_a_ue_deprecated_invocation() {
+        blanks_only(
+            "    ",
+            "UE_DEPRECATED(5.2, \"No longer used\")",
+            "\n    void Old();\n",
+        );
+        // The message's own parens are inside a string literal, so balanced-paren matching does
+        // not end the span early on them.
+        blanks_only(
+            "",
+            "UE_DEPRECATED(5.4, \"use Bar() instead\")",
+            "\nint x;\n",
+        );
+    }
+
+    /// The list is curated by the misparse trigger, not by the name containing `DEPRECATED`, and
+    /// these must stay untouched — for two different reasons, one per line below.
+    ///
+    /// `UE_DEPRECATED_FORGAME` is the one that guards *matching precision*: it contains the listed
+    /// `UE_DEPRECATED` as a substring, so the memmem prefilter fires and the scanner reads the
+    /// full identifier — the exact-slice check at the `ANNOTATION_MACROS.contains` call is what
+    /// then declines it. Regress that check to a prefix/substring match and this assertion fails.
+    ///
+    /// The other two never reach that check — neither name contains a listed macro, so the
+    /// prefilter short-circuits and the scanner never runs. They are behaviour locks on the
+    /// *curation itself*: `SLATE_ARGUMENT_DEPRECATED` declares a real member (`Width`) and blanking
+    /// it would delete a symbol, and `BOOST_DEPRECATED` is a single-message attribute that never
+    /// misparses — so a future "just mask everything `*DEPRECATED*`" change is what these two catch.
+    #[test]
+    fn leaves_unlisted_and_declaration_generating_deprecated_macros_alone() {
+        // Guards exact-match against a substring prefilter hit.
+        assert!(mask_annotation_macros("UE_DEPRECATED_FORGAME(5.0, \"x\")\nvoid f();\n").is_none());
+        // Guards the curation: a declaration-generating macro must never be blanked.
+        assert!(
+            mask_annotation_macros("SLATE_ARGUMENT_DEPRECATED(int, Width, 5.0, \"x\")\n").is_none()
+        );
+        // Guards the curation: a single-message attribute is left alone (it never misparses).
+        assert!(mask_annotation_macros("BOOST_DEPRECATED(\"x\")\nvoid f();\n").is_none());
+    }
+
+    /// The failure `UE_DEPRECATED` masking exists to fix (#130): a deprecation attribute before a
+    /// class member, inside a namespace, absorbs the `struct` keyword into an `ERROR`, so the
+    /// type's own `struct_specifier` disappears and only the surviving constructor is findable.
+    /// Masking restores the struct.
+    ///
+    /// The namespace wrapper is load-bearing — the same struct at file scope recovers a
+    /// `struct_specifier` on its own — so the unmasked half is asserted first to keep the fixture
+    /// honest if a grammar update changes recovery. Goes through `parse_masked`, the production
+    /// path.
+    #[test]
+    fn a_member_ue_deprecated_no_longer_hides_its_enclosing_struct() {
+        let src = "\
+namespace NP
+{
+struct FDescriptor
+{
+    UE_DEPRECATED(5.2, \"No longer used\")
+    FDescriptor(const int* P) : Name(P) {}
+    const int* Name;
+};
+}
+";
+        let lang = crate::types::Lang::Cpp;
+        let ts = crate::lang::outline::outline_language(lang).expect("grammar");
+        let has_named_struct = |tree: &tree_sitter::Tree| -> bool {
+            let mut stack = vec![tree.root_node()];
+            while let Some(n) = stack.pop() {
+                if n.kind() == "struct_specifier"
+                    && n.child_by_field_name("name")
+                        .is_some_and(|x| &src[x.byte_range()] == "FDescriptor")
+                {
+                    return true;
+                }
+                let mut c = n.walk();
+                stack.extend(n.children(&mut c));
+            }
+            false
+        };
+
+        // Guard the fixture: unmasked, the struct_specifier is gone — the misparse this fixes.
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts).expect("grammar loads");
+        let raw = parser.parse(src, None).expect("parse");
+        assert!(
+            !has_named_struct(&raw),
+            "fixture no longer reproduces the misparse it guards"
+        );
+
+        // Masked (production path): the struct is back.
+        let fixed = crate::lang::parse_masked(src, Some(lang), &ts).expect("parses");
+        assert!(
+            has_named_struct(&fixed),
+            "UE_DEPRECATED masking did not restore the struct_specifier"
+        );
     }
 }
