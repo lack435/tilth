@@ -174,11 +174,35 @@ fn blank_spans(bytes: &[u8], spans: &[(usize, usize)]) -> Option<String> {
 /// removes the artifact `read::outline::code` deduplicates, where each annotated enumerator
 /// parsed as a `function_declarator` and the outline gained one `fn UMETA` per enumerator.
 ///
+/// `UE_DEPRECATED` is here for a different failure, on the same principle. A deprecation
+/// attribute before a class member —
+///
+/// ```text
+/// namespace NetworkingPrivate
+/// {
+/// struct FRepPropertyDescriptor
+/// {
+///     UE_DEPRECATED(5.2, "No longer used")   // ← attribute before the constructor
+///     FRepPropertyDescriptor(const FProperty* Property) { … }
+/// };
+/// }
+/// ```
+///
+/// derails the enclosing type: tree-sitter-cpp reads `UE_DEPRECATED(…)` as a member
+/// declaration, and inside a namespace the recovery is *not* local — the `struct` keyword and
+/// tag are absorbed into an `ERROR`, so the `struct_specifier` disappears and only the
+/// surviving constructor is findable. `read`/`search`/`grok` then report the type's own line as
+/// a *usage* and resolve the type to a member (#130). Like `UMETA`, `UE_DEPRECATED` is pure
+/// metadata — a version and a message — with no symbol inside, so blanking every invocation is
+/// length-preserving and loses nothing. It composes with `mask_export_macros`, which already
+/// blanks the same macro when it sits in a *type head* (`class UE_DEPRECATED(…) API Widget`);
+/// the two never fight, since both overwrite the identical span with spaces.
+///
 /// The other UE macros are deliberately absent. `UCLASS`, `USTRUCT`, `UPROPERTY` and
 /// `UFUNCTION` each leave an `ERROR` or an `expression_statement` behind, but recovery is
 /// local — the declaration after them still parses — so masking them would change tested
 /// output for no correctness gain.
-const ANNOTATION_MACROS: [&[u8]; 1] = [b"UMETA"];
+const ANNOTATION_MACROS: [&[u8]; 2] = [b"UMETA", b"UE_DEPRECATED"];
 
 /// Newlines an annotation's argument list may cross before the span is refused.
 ///
@@ -1061,5 +1085,79 @@ public:
                 "missing {want} in {fixed:?}"
             );
         }
+    }
+
+    /// `UE_DEPRECATED` is masked wherever it appears, arguments and all — the same treatment as
+    /// `UMETA`, for the member-position misparse it causes (#130).
+    #[test]
+    fn masks_a_ue_deprecated_invocation() {
+        blanks_only(
+            "    ",
+            "UE_DEPRECATED(5.2, \"No longer used\")",
+            "\n    void Old();\n",
+        );
+        // The message's own parens are inside a string literal, so balanced-paren matching does
+        // not end the span early on them.
+        blanks_only(
+            "",
+            "UE_DEPRECATED(5.4, \"use Bar() instead\")",
+            "\nint x;\n",
+        );
+    }
+
+    /// The failure `UE_DEPRECATED` masking exists to fix (#130): a deprecation attribute before a
+    /// class member, inside a namespace, absorbs the `struct` keyword into an `ERROR`, so the
+    /// type's own `struct_specifier` disappears and only the surviving constructor is findable.
+    /// Masking restores the struct.
+    ///
+    /// The namespace wrapper is load-bearing — the same struct at file scope recovers a
+    /// `struct_specifier` on its own — so the unmasked half is asserted first to keep the fixture
+    /// honest if a grammar update changes recovery. Goes through `parse_masked`, the production
+    /// path.
+    #[test]
+    fn a_member_ue_deprecated_no_longer_hides_its_enclosing_struct() {
+        let src = "\
+namespace NP
+{
+struct FDescriptor
+{
+    UE_DEPRECATED(5.2, \"No longer used\")
+    FDescriptor(const int* P) : Name(P) {}
+    const int* Name;
+};
+}
+";
+        let lang = crate::types::Lang::Cpp;
+        let ts = crate::lang::outline::outline_language(lang).expect("grammar");
+        let has_named_struct = |tree: &tree_sitter::Tree| -> bool {
+            let mut stack = vec![tree.root_node()];
+            while let Some(n) = stack.pop() {
+                if n.kind() == "struct_specifier"
+                    && n.child_by_field_name("name")
+                        .is_some_and(|x| &src[x.byte_range()] == "FDescriptor")
+                {
+                    return true;
+                }
+                let mut c = n.walk();
+                stack.extend(n.children(&mut c));
+            }
+            false
+        };
+
+        // Guard the fixture: unmasked, the struct_specifier is gone — the misparse this fixes.
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts).expect("grammar loads");
+        let raw = parser.parse(src, None).expect("parse");
+        assert!(
+            !has_named_struct(&raw),
+            "fixture no longer reproduces the misparse it guards"
+        );
+
+        // Masked (production path): the struct is back.
+        let fixed = crate::lang::parse_masked(src, Some(lang), &ts).expect("parses");
+        assert!(
+            has_named_struct(&fixed),
+            "UE_DEPRECATED masking did not restore the struct_specifier"
+        );
     }
 }
