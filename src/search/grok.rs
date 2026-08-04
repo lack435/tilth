@@ -128,11 +128,18 @@ fn resolve_def_by_query(
         return Ok(None);
     };
     let other_def_count = definitions.len().saturating_sub(1);
-    let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
+    let (start, end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
         reason: format!("definition match for `{query}` had no def_range"),
     })?;
-    enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count).map(Some)
+    enrich_from_outline(
+        top.path.clone(),
+        start,
+        end,
+        query.to_string(),
+        other_def_count,
+    )
+    .map(Some)
 }
 
 fn resolve_by_path_line(
@@ -174,32 +181,76 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     Ok((content, lang))
 }
 
-/// Read the file at `path`, find the outline entry that starts at `start_line`
-/// (or the deepest entry enclosing it), and convert to `ResolvedTarget`.
+/// Read the file at `path`, find the outline entry for the resolved symbol, and convert to
+/// `ResolvedTarget`. `start_line`/`end_line` are the search match's own def range, used both
+/// to locate the outline entry and as the fallback range when the outline has none.
 fn enrich_from_outline(
     path: PathBuf,
     start_line: u32,
+    end_line: u32,
     name: String,
     other_def_count: usize,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(&path)?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_by_start_line(&entries, start_line)
-        .or_else(|| find_entry_at_line(&entries, start_line));
+    // The outline entry must name the symbol the search resolved. Matching the name — not just
+    // the line — is load-bearing twice over:
+    //
+    //  * A misparse can collapse a whole run of declarations into one spurious enclosing node
+    //    (a real case: a CRLF header turned lines 81-231 into a single `function_definition`),
+    //    so `find_entry_at_line` would hand back *that* enclosing definition and `grok
+    //    FDoRepLifetimeParams` answered about `GetReplicatedProperty`.
+    //  * A multi-declarator line — `int mWidth, mHeight;` — holds several entries at one
+    //    `start_line`, so a line-only match returns the first (`mWidth`) whatever was asked for.
+    //
+    // Preferring the entry that starts at the def line *and* names the symbol handles both, then
+    // an enclosing entry (for a def whose outline start sits a doc-comment above `start_line`)
+    // is a name-checked fallback. When neither names the symbol the outline has disagreed with
+    // the search — which already proved a definition of `name` spans `start_line..=end_line` —
+    // so synthesise the target from the search rather than report a different symbol.
+    let entry = find_named_at_start_line(&entries, start_line, &name)
+        .or_else(|| find_entry_at_line(&entries, start_line).filter(|e| e.name == name));
     let target = match entry {
         Some(e) => target_from_entry(e, path, other_def_count),
         None => ResolvedTarget {
             name,
             path,
             start_line,
-            end_line: start_line,
-            kind: OutlineKind::Function,
+            end_line,
+            kind: kind_from_source_line(&content, start_line),
             signature: None,
             doc: None,
             other_def_count,
         },
     };
     Ok((target, content, lang))
+}
+
+/// Best-effort definition kind from the leading keyword of a definition's first source line.
+///
+/// Only reached on the misparse fallback in `enrich_from_outline`, where the outline entry is
+/// gone and the tree-sitter node kind with it, so all that is left is the text. The def range
+/// came from a definition node, so its first line almost always opens with the keyword;
+/// anything unrecognised falls to `Function`, the prior default.
+fn kind_from_source_line(content: &str, line: u32) -> OutlineKind {
+    let text = content
+        .lines()
+        .nth(line.saturating_sub(1) as usize)
+        .unwrap_or("")
+        .trim_start();
+    let leading = text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .find(|w| !w.is_empty())
+        .unwrap_or("");
+    match leading {
+        "struct" | "union" => OutlineKind::Struct,
+        "class" => OutlineKind::Class,
+        "enum" => OutlineKind::Enum,
+        "interface" => OutlineKind::Interface,
+        "namespace" | "module" | "mod" => OutlineKind::Module,
+        "typedef" | "using" | "type" => OutlineKind::TypeAlias,
+        _ => OutlineKind::Function,
+    }
 }
 
 fn target_from_entry(
@@ -233,13 +284,21 @@ fn find_entry_at_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
     best
 }
 
-/// Walk the outline tree and return the first entry whose `start_line == line`.
-fn find_by_start_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEntry> {
+/// Walk the outline tree and return the entry that both starts at `line` and is named `name`.
+///
+/// The name match is what disambiguates a multi-declarator line (`int mWidth, mHeight;`), where
+/// several entries share one `start_line` and a line-only lookup would return whichever comes
+/// first regardless of which was asked for.
+fn find_named_at_start_line<'a>(
+    entries: &'a [OutlineEntry],
+    line: u32,
+    name: &str,
+) -> Option<&'a OutlineEntry> {
     for e in entries {
-        if e.start_line == line {
+        if e.start_line == line && e.name == name {
             return Some(e);
         }
-        if let Some(child) = find_by_start_line(&e.children, line) {
+        if let Some(child) = find_named_at_start_line(&e.children, line, name) {
             return Some(child);
         }
     }
@@ -1193,23 +1252,41 @@ mod tests {
         assert!(find_entry_at_line(&entries, 100).is_none());
     }
 
-    // -- find_by_start_line ----------------------------------------------
+    // -- find_named_at_start_line ----------------------------------------
 
     #[test]
-    fn start_line_lookup_matches_exact_start() {
+    fn start_line_lookup_matches_exact_start_and_name() {
         let mut class = make_entry(OutlineKind::Class, "Outer", 1, 50);
         class
             .children
             .push(make_entry(OutlineKind::Function, "inner", 10, 25));
         let entries = vec![class];
-        let hit = find_by_start_line(&entries, 10).expect("expected inner");
+        let hit = find_named_at_start_line(&entries, 10, "inner").expect("expected inner");
         assert_eq!(hit.name, "inner");
     }
 
     #[test]
     fn start_line_lookup_no_match_returns_none() {
         let entries = vec![make_entry(OutlineKind::Function, "foo", 10, 20)];
-        assert!(find_by_start_line(&entries, 11).is_none());
+        // Right line, wrong name.
+        assert!(find_named_at_start_line(&entries, 10, "bar").is_none());
+        // Right name, wrong line.
+        assert!(find_named_at_start_line(&entries, 11, "foo").is_none());
+    }
+
+    /// The name is what picks between two entries sharing a start line.
+    #[test]
+    fn start_line_lookup_disambiguates_by_name() {
+        let entries = vec![
+            make_entry(OutlineKind::Variable, "mWidth", 2, 2),
+            make_entry(OutlineKind::Variable, "mHeight", 2, 2),
+        ];
+        assert_eq!(
+            find_named_at_start_line(&entries, 2, "mHeight")
+                .expect("expected mHeight")
+                .name,
+            "mHeight"
+        );
     }
 
     // -- resolve_by_path_line — integration via tempdir ------------------
@@ -1278,6 +1355,69 @@ mod tests {
         // Relative path is joined with scope.
         let (target, _, _) = resolve_with_source("src/a.rs:3", tmp.path()).unwrap();
         assert_eq!(target.name, "two");
+    }
+
+    // -- misparse fallback (#127) ----------------------------------------
+
+    /// When the outline collapses under a misparse, grok must still answer about the symbol the
+    /// search resolved — not the enclosing definition the broken outline hands back.
+    ///
+    /// The search finds `Target`'s definition (its walk recovers definitions buried in error
+    /// regions), but the outline of this input holds no `Target` entry: `find_entry_at_line`
+    /// would return the enclosing node, so grok reported a *different* symbol. The name guard in
+    /// `enrich_from_outline` is what keeps the resolved identity, and `kind_from_source_line`
+    /// supplies the kind the vanished outline entry would have. This is the reduced,
+    /// deterministic form of the CRLF header where `grok FDoRepLifetimeParams` answered about
+    /// `GetReplicatedProperty`.
+    #[test]
+    fn grok_keeps_the_resolved_symbol_when_the_outline_misparses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "namespace N {\n  int Broken(\n  struct Target { int Value; };\n}\n";
+        write_fixture(tmp.path(), "probe.h", body);
+
+        let (target, _, _) = resolve_with_source("Target", tmp.path()).unwrap();
+        assert_eq!(
+            target.name, "Target",
+            "must resolve the symbol, not its encloser"
+        );
+        assert_eq!(target.start_line, 3);
+        assert_eq!(target.kind, OutlineKind::Struct);
+    }
+
+    /// A multi-declarator line holds several outline entries at one `start_line`; grok must
+    /// enrich from the one that names the resolved symbol, not the first on the line.
+    #[test]
+    fn grok_picks_the_named_declarator_on_a_shared_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `mWidth` and `mHeight` are both defined on line 2, at the same start line.
+        write_fixture(
+            tmp.path(),
+            "probe.h",
+            "struct S {\n    int mWidth, mHeight;\n};\n",
+        );
+
+        let (target, _, _) = resolve_with_source("mHeight", tmp.path()).unwrap();
+        assert_eq!(
+            target.name, "mHeight",
+            "must not enrich from the first declarator"
+        );
+        assert_eq!(target.start_line, 2);
+    }
+
+    #[test]
+    fn kind_from_source_line_reads_the_leading_keyword() {
+        let cases: &[(&str, OutlineKind)] = &[
+            ("struct FThing\n", OutlineKind::Struct),
+            ("\tunion U { int a; };\n", OutlineKind::Struct),
+            ("class Widget final : public Base {\n", OutlineKind::Class),
+            ("enum class Mode : uint8 {\n", OutlineKind::Enum),
+            ("namespace Priv {\n", OutlineKind::Module),
+            ("typedef int Handle;\n", OutlineKind::TypeAlias),
+            ("void Run(int a);\n", OutlineKind::Function),
+        ];
+        for (i, (line, want)) in cases.iter().enumerate() {
+            assert_eq!(kind_from_source_line(line, 1), *want, "case {i}: {line:?}");
+        }
     }
 
     // -- collect_siblings ------------------------------------------------
