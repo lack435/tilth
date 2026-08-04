@@ -1129,19 +1129,28 @@ public:
         );
     }
 
-    /// The list is curated by the misparse trigger, not by the name containing `DEPRECATED`. Two
-    /// kinds must stay untouched: a declaration-*generating* macro (Slate's, which declares the
-    /// member `Width`), and any other `DEPRECATED`-named macro. Exact-identifier matching is what
-    /// guarantees it — a substring hit in the prefilter must not widen the mask.
+    /// The list is curated by the misparse trigger, not by the name containing `DEPRECATED`, and
+    /// these must stay untouched — for two different reasons, one per line below.
+    ///
+    /// `UE_DEPRECATED_FORGAME` is the one that guards *matching precision*: it contains the listed
+    /// `UE_DEPRECATED` as a substring, so the memmem prefilter fires and the scanner reads the
+    /// full identifier — the exact-slice check at the `ANNOTATION_MACROS.contains` call is what
+    /// then declines it. Regress that check to a prefix/substring match and this assertion fails.
+    ///
+    /// The other two never reach that check — neither name contains a listed macro, so the
+    /// prefilter short-circuits and the scanner never runs. They are behaviour locks on the
+    /// *curation itself*: `SLATE_ARGUMENT_DEPRECATED` declares a real member (`Width`) and blanking
+    /// it would delete a symbol, and `BOOST_DEPRECATED` is a single-message attribute that never
+    /// misparses — so a future "just mask everything `*DEPRECATED*`" change is what these two catch.
     #[test]
     fn leaves_unlisted_and_declaration_generating_deprecated_macros_alone() {
-        // Declares a real member — blanking it would delete `Width`.
+        // Guards exact-match against a substring prefilter hit.
+        assert!(mask_annotation_macros("UE_DEPRECATED_FORGAME(5.0, \"x\")\nvoid f();\n").is_none());
+        // Guards the curation: a declaration-generating macro must never be blanked.
         assert!(
             mask_annotation_macros("SLATE_ARGUMENT_DEPRECATED(int, Width, 5.0, \"x\")\n").is_none()
         );
-        // A longer identifier that shares the `UE_DEPRECATED` prefix must not be caught by the
-        // prefilter's substring hit; nor a single-message attribute that never misparses.
-        assert!(mask_annotation_macros("UE_DEPRECATED_FORGAME(5.0, \"x\")\nvoid f();\n").is_none());
+        // Guards the curation: a single-message attribute is left alone (it never misparses).
         assert!(mask_annotation_macros("BOOST_DEPRECATED(\"x\")\nvoid f();\n").is_none());
     }
 
