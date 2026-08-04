@@ -174,8 +174,8 @@ fn blank_spans(bytes: &[u8], spans: &[(usize, usize)]) -> Option<String> {
 /// removes the artifact `read::outline::code` deduplicates, where each annotated enumerator
 /// parsed as a `function_declarator` and the outline gained one `fn UMETA` per enumerator.
 ///
-/// `UE_DEPRECATED` is here for a different failure, on the same principle. A deprecation
-/// attribute before a class member —
+/// The **deprecation attributes** are here for a different failure, on the same principle. A
+/// deprecation attribute before a class member —
 ///
 /// ```text
 /// namespace NetworkingPrivate
@@ -195,14 +195,38 @@ fn blank_spans(bytes: &[u8], spans: &[(usize, usize)]) -> Option<String> {
 /// a *usage* and resolve the type to a member (#130). Like `UMETA`, `UE_DEPRECATED` is pure
 /// metadata — a version and a message — with no symbol inside, so blanking every invocation is
 /// length-preserving and loses nothing. It composes with `mask_export_macros`, which already
-/// blanks the same macro when it sits in a *type head* (`class UE_DEPRECATED(…) API Widget`);
-/// the two never fight, since both overwrite the identical span with spaces.
+/// blanks the same macro in a *type head* (`class UE_DEPRECATED(…) API Widget`); the two never
+/// fight, since both overwrite the identical span with spaces.
 ///
-/// The other UE macros are deliberately absent. `UCLASS`, `USTRUCT`, `UPROPERTY` and
-/// `UFUNCTION` each leave an `ERROR` or an `expression_statement` behind, but recovery is
-/// local — the declaration after them still parses — so masking them would change tested
-/// output for no correctness gain.
-const ANNOTATION_MACROS: [&[u8]; 2] = [b"UMETA", b"UE_DEPRECATED"];
+/// **Why `UE_DEPRECATED` and not "every deprecation macro".** The misparse is triggered by the
+/// *shape of the arguments*, not by the macro being a deprecation macro: a **numeric first
+/// argument** — `MACRO(5.2, …)` — is what tree-sitter-cpp cannot place in member-declarator
+/// position. Isolated on synthetic input: `M(x, "s")`, `M("a", "b")` and `M("s")` all parse; only
+/// `M(1, …)` / `M(1.0, …)` collapse the enclosing type. `UE_DEPRECATED(Version, Message)` is the
+/// one deprecation attribute spelled with a leading numeric version, and a scan of
+/// `Engine/Source/Runtime` finds no other `*DEPRECATED*(<number>, …)` invocation. The
+/// single-*message* attributes of other libraries — `BOOST_DEPRECATED("m")`,
+/// `ABSL_DEPRECATED("m")`, `GTEST_INTERNAL_DEPRECATED("m")` — take a lone string and do **not**
+/// misparse, so masking them recovers nothing (measured: zero change over `GoogleTest` and Boost
+/// header trees) and is deliberately not done.
+///
+/// Two `DEPRECATED`-named kinds must never be added, because blanking them would be wrong rather
+/// than merely useless: **declaration-generating** macros — above all Slate's
+/// `SLATE_ARGUMENT_DEPRECATED` / `SLATE_ATTRIBUTE_DEPRECATED`, where
+/// `SLATE_ATTRIBUTE_DEPRECATED(Type, Name, …)` expands to a member variable and function named
+/// `Name`, so blanking it deletes a real symbol — and **file-scope pragma emitters**
+/// (`UE_DEPRECATED_HEADER`, `UE_DEPRECATED_MACRO`), which sit at file scope, not before a member.
+///
+/// The plain `UCLASS`/`USTRUCT`/`UPROPERTY`/`UFUNCTION` macros are likewise absent: each leaves an
+/// `ERROR` or `expression_statement` behind, but recovery is local — the declaration after them
+/// still parses — so masking them would change tested output for no correctness gain.
+const ANNOTATION_MACROS: [&[u8]; 2] = [
+    // Enumerator editor metadata.
+    b"UMETA",
+    // The one deprecation attribute whose `(numeric version, message)` shape triggers the
+    // member misparse (see above); other libraries' single-message ones do not, so are absent.
+    b"UE_DEPRECATED",
+];
 
 /// Newlines an annotation's argument list may cross before the span is refused.
 ///
@@ -1103,6 +1127,22 @@ public:
             "UE_DEPRECATED(5.4, \"use Bar() instead\")",
             "\nint x;\n",
         );
+    }
+
+    /// The list is curated by the misparse trigger, not by the name containing `DEPRECATED`. Two
+    /// kinds must stay untouched: a declaration-*generating* macro (Slate's, which declares the
+    /// member `Width`), and any other `DEPRECATED`-named macro. Exact-identifier matching is what
+    /// guarantees it — a substring hit in the prefilter must not widen the mask.
+    #[test]
+    fn leaves_unlisted_and_declaration_generating_deprecated_macros_alone() {
+        // Declares a real member — blanking it would delete `Width`.
+        assert!(
+            mask_annotation_macros("SLATE_ARGUMENT_DEPRECATED(int, Width, 5.0, \"x\")\n").is_none()
+        );
+        // A longer identifier that shares the `UE_DEPRECATED` prefix must not be caught by the
+        // prefilter's substring hit; nor a single-message attribute that never misparses.
+        assert!(mask_annotation_macros("UE_DEPRECATED_FORGAME(5.0, \"x\")\nvoid f();\n").is_none());
+        assert!(mask_annotation_macros("BOOST_DEPRECATED(\"x\")\nvoid f();\n").is_none());
     }
 
     /// The failure `UE_DEPRECATED` masking exists to fix (#130): a deprecation attribute before a
