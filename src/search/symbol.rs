@@ -1189,6 +1189,7 @@ fn stream_defs_from_tree(
         &mut |m| dedupe.push(m),
         lang,
         0,
+        0,
     );
     dedupe.finish();
 }
@@ -1249,7 +1250,33 @@ impl<'a> SameSpanDedupe<'a> {
     }
 }
 
+/// Relevance cap on genuine definition nesting. Definitions buried more than this many
+/// *well-formed* levels down are rare and low-value, so the walk stops counting there —
+/// the same judgement `is_transparent_wrapper`'s namespace exemption rests on.
+const MAX_DEF_DEPTH: usize = 3;
+
+/// Absolute recursion ceiling, independent of `MAX_DEF_DEPTH`.
+///
+/// Error-recovery nesting is transparent to the relevance cap (see `walk_for_definitions`), so
+/// a misparse cannot be bounded by `depth` alone — a pathological or adversarial tree that is
+/// errors all the way down would recurse without limit. This is the separate guard that bounds
+/// it. Chosen for headroom rather than tightness: the deepest real misparse chain seen — a
+/// trailing-whitespace/CRLF-induced giant `function_definition` hiding a file-scope `struct`
+/// eight levels down — is far inside it, as is any plausible depth of well-formed transparent
+/// nesting (namespaces, `template_declaration`), which this also bounds now that error nesting
+/// no longer feeds `depth`.
+const MAX_WALK_DEPTH: usize = 64;
+
 /// Recursively walk AST nodes looking for definitions of the queried symbol.
+///
+/// `depth` is the *relevance* budget over well-formed nesting; `abs_depth` is the true
+/// recursion depth and only guards the stack. They diverge because a node whose subtree
+/// carries a parse error does not spend the relevance budget — see the `child_depth`
+/// computation below.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one file's identity plus the query and two depth counters"
+)]
 fn walk_for_definitions(
     node: tree_sitter::Node,
     query: &str,
@@ -1260,8 +1287,9 @@ fn walk_for_definitions(
     emit: &mut dyn FnMut(Match),
     lang: Option<crate::types::Lang>,
     depth: usize,
+    abs_depth: usize,
 ) {
-    if depth > 3 {
+    if depth > MAX_DEF_DEPTH || abs_depth > MAX_WALK_DEPTH {
         return;
     }
 
@@ -1403,7 +1431,17 @@ fn walk_for_definitions(
     // put `Count` at depth 5 and made it unfindable. Not consuming a level here
     // mirrors how `outline::node_to_entry` already treats namespaces, and keeps C++
     // at parity with the languages whose members sit two levels under the file.
-    let child_depth = if is_transparent_wrapper(kind, lang) {
+    //
+    // A node whose subtree carries a parse error is transparent for the same reason: the
+    // levels tree-sitter's error recovery invents are artifacts, not structure an agent
+    // asked about. A file-scope `struct` in a header with CRLF (or any trailing whitespace
+    // before the newline — the two parse identically) can land eight levels down inside a
+    // spurious `function_definition` → … → `parameter_declaration` chain, where the depth
+    // budget hid it entirely: search reported the struct's own line as a *usage* and `grok`
+    // answered a bare `not found`. Descending it recovers the definition. `abs_depth` still
+    // climbs on every level, so `MAX_WALK_DEPTH` bounds the recursion the relevance cap no
+    // longer does.
+    let child_depth = if is_transparent_wrapper(kind, lang) || node.has_error() {
         depth
     } else {
         depth + 1
@@ -1420,6 +1458,7 @@ fn walk_for_definitions(
             emit,
             lang,
             child_depth,
+            abs_depth + 1,
         );
     }
 }
@@ -2561,6 +2600,34 @@ using MyAlias = float;
         let joined = "namespace A::B::C { class Target { public: void Method(); }; }\n";
         assert_eq!(cpp_find(joined, "Target").len(), 1);
         assert_eq!(cpp_find(joined, "Method").len(), 1);
+    }
+
+    /// A definition buried inside a parse-error region must still be found (#127).
+    ///
+    /// tree-sitter's error recovery invents deep nesting: a real `struct` can land many
+    /// artifact-levels down inside a spurious `function_declarator`/`parameter_list` chain the
+    /// recovery leaves behind. The depth budget — sized for *well-formed* nesting — then hid it
+    /// entirely, so search reported the struct's own line as a *usage* and `grok` answered a
+    /// bare `not found`. This is what a C++ header with CRLF (or any trailing whitespace before
+    /// the newline; the two parse identically) did to a file-scope `struct` that landed eight
+    /// levels deep.
+    ///
+    /// The trigger there was a whole file's worth of content interacting in the GLR recovery,
+    /// which does not minimise — so this pins the *mechanism* with a small input that
+    /// deterministically buries a struct in an error region past the old cap: `Target`'s
+    /// `struct_specifier` sits at tree-depth seven inside the unterminated `Broken(`. Before the
+    /// fix, the depth budget cut the walk at the `parameter_declaration` one level above it.
+    #[test]
+    fn cpp_definition_buried_in_an_error_region_is_still_found() {
+        let code = "namespace N {\n  int Broken(\n  struct Target { int Value; };\n}\n";
+        let defs = cpp_find(code, "Target");
+        assert_eq!(
+            defs.len(),
+            1,
+            "the buried struct must be found once as a definition, got {defs:?}"
+        );
+        assert!(defs[0].is_definition, "must be a definition, not a usage");
+        assert_eq!(defs[0].def_range, Some((3, 3)));
     }
 
     /// A template whose `template <…>` clause sits on its own line — the normal spelling
