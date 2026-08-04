@@ -123,10 +123,120 @@ pub(crate) fn walk_top_level(
             entries.extend(walk_top_level(child, lines, lang));
             continue;
         }
-        entries.extend(node_to_entries(child, lines, lang, 0));
+        let base = node_to_entries(child, lines, lang, 0);
+
+        // A C/C++ misparse can collapse a whole run of declarations into one giant
+        // error-bearing node — a header with CRLF (or any trailing whitespace before the
+        // newline; the two parse identically) turned lines 81-231 of a real file into a single
+        // `function_definition`, so every `struct` and `namespace` inside it vanished from the
+        // outline while `node_to_entries` reported only the outermost name. The definition walk
+        // recovers such buried symbols by descending error nesting transparently (#127); this
+        // does the same for the outline so the two surfaces agree on what a file defines.
+        //
+        // `seen` is seeded from what `node_to_entries` already produced for this child so the
+        // recovery descent cannot re-emit a nested type the ordinary walk reached on its own —
+        // the two overlap whenever an error-bearing parent's body still parses far enough to
+        // collect a clean nested definition directly.
+        if matches!(lang, Lang::C | Lang::Cpp) && child.has_error() {
+            let mut seen = SeenDefs::default();
+            seen.mark(&base);
+            entries.extend(base);
+            recover_buried_definitions(child, lines, lang, 0, &mut seen, &mut entries);
+        } else {
+            entries.extend(base);
+        }
     }
 
     entries
+}
+
+/// Definitions already emitted for the current top-level child, so recovery does not repeat one.
+///
+/// Keyed by name **and line-range overlap**, not by start line alone: the ordinary walk and the
+/// recovery descent can anchor the same type to *different* lines — `node_to_entry` hoists a
+/// `template <…>`-wrapped entry's start to the `template` keyword, while recovery reaches the
+/// inner `struct_specifier` and anchors it one line down — so a `(name, start_line)` key misses
+/// and the type is emitted twice. Two genuinely distinct types of the same name occupy disjoint
+/// ranges, so "same name and any line overlap" means "the same definition", which is what dedup
+/// wants.
+#[derive(Default)]
+struct SeenDefs(Vec<(String, u32, u32)>);
+
+impl SeenDefs {
+    /// Record every `(name, start, end)` in `entries`, children included.
+    fn mark(&mut self, entries: &[OutlineEntry]) {
+        for e in entries {
+            self.0.push((e.name.clone(), e.start_line, e.end_line));
+            self.mark(&e.children);
+        }
+    }
+
+    /// True when a definition of this name whose range overlaps `[start, end]` was already seen.
+    fn contains(&self, name: &str, start: u32, end: u32) -> bool {
+        self.0
+            .iter()
+            .any(|(n, s, e)| n == name && *s <= end && start <= *e)
+    }
+}
+
+/// Surface named type definitions a C/C++ misparse has buried inside `node`.
+///
+/// tree-sitter's error recovery invents deep nesting: a real `struct` / `class` / `enum` /
+/// `union` can land many artifact-levels down inside a spurious `function_definition` →
+/// `parameter_list` → … chain. `node_to_entries` on the collapsed node sees only its outermost
+/// name, so the buried types are lost. This descends the error subtree — treating the recovery
+/// nesting as transparent, exactly as `search::walk_for_definitions` does — and emits each
+/// buried named specifier as its own entry.
+///
+/// A **clean** buried specifier (no error in its own subtree) renders through `node_to_entries`
+/// with its members intact, and the walk does not descend into it again — its own entry covers
+/// its interior, so descending would surface its nested types a second time.
+///
+/// A specifier that is itself still misparsed renders **flat** (name and kind only, via the
+/// depth argument that suppresses children): its recovered body is unreliable — an outer
+/// `struct` whose real span is 20 lines can misparse to swallow 130, dragging unrelated
+/// declarations in as bogus members — so only its name is trustworthy. The walk then descends
+/// past it, because the common shape is a *clean* definition nested inside a misparsed enclosing
+/// one (here, a valid file-scope `struct` inside the misparsed struct above it), and that is the
+/// one worth recovering with its members.
+fn recover_buried_definitions(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+    seen: &mut SeenDefs,
+    out: &mut Vec<OutlineEntry>,
+) {
+    // Matches `search::symbol`'s error-descent bound and outline's own `MAX_MISPARSE_DEPTH`:
+    // error recovery promises no depth bound, and this is a fuzz target.
+    if depth > MAX_MISPARSE_DEPTH {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if is_named_bodied_specifier(child) {
+            let clean = !child.has_error();
+            // A clean specifier renders with its members; a still-misparsed one renders flat
+            // (`depth >= 1` makes `node_to_entry` skip `collect_children`, whose recovered body
+            // would be unreliable — an outer `struct` can misparse to swallow unrelated
+            // declarations as bogus members).
+            let mut added = node_to_entries(child, lines, lang, usize::from(!clean));
+            if added
+                .first()
+                .is_some_and(|e| !seen.contains(&e.name, e.start_line, e.end_line))
+            {
+                seen.mark(&added);
+                out.append(&mut added);
+            }
+            // A clean definition's own entry covers its interior; descending it again would
+            // re-surface its nested types. A misparsed one is descended past, because the shape
+            // worth recovering is a clean definition nested inside a misparsed enclosing one.
+            if clean {
+                continue;
+            }
+        }
+        recover_buried_definitions(child, lines, lang, depth + 1, seen, out);
+    }
 }
 
 /// True for the C/C++ conditional-compilation wrappers that hold ordinary declarations.
@@ -1884,6 +1994,104 @@ mod crlf_column_tests {
             "outline should still find the function after the continued string, got {:?}",
             entries.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
+    }
+
+    /// Flatten an entry tree to `(name, kind)`, children included.
+    fn flat_named(
+        entries: &[crate::types::OutlineEntry],
+    ) -> Vec<(String, crate::types::OutlineKind)> {
+        let mut out = Vec::new();
+        for e in entries {
+            out.push((e.name.clone(), e.kind));
+            out.extend(flat_named(&e.children));
+        }
+        out
+    }
+
+    /// A named type a C/C++ misparse buried inside an error-bearing top-level node must still
+    /// appear in the outline (#127 follow-up).
+    ///
+    /// A header with CRLF — or any trailing whitespace before the newline, which parses
+    /// identically — can tip tree-sitter-cpp's recovery into collapsing a run of declarations
+    /// into one giant node, so a file-scope `struct` vanished from the outline while the same
+    /// bytes with LF endings outlined it. The definition walk already recovers such symbols by
+    /// descending error nesting transparently; `recover_buried_definitions` does the same for the
+    /// outline so `read` and `grok`'s outline enrichment agree with search on what a file defines.
+    ///
+    /// The real trigger is a whole-file GLR artifact that does not minimise, so this pins the
+    /// mechanism with a top-level *function* whose body is misparsed around a stray token: a
+    /// function node collects no children, so without the recovery `Target` is invisible.
+    #[test]
+    fn misparse_buried_struct_is_recovered_into_the_outline() {
+        let src = "void Fn()\n{\n    @@@\n    struct Target { int Value; };\n}\n";
+        let entries = get_outline_entries(src, Lang::Cpp);
+        let named = flat_named(&entries);
+        // The misparsed function is still surfaced, unchanged.
+        assert!(
+            named.iter().any(|(n, _)| n == "Fn"),
+            "the enclosing function vanished: {named:?}"
+        );
+        // The buried struct is recovered, with its correct kind.
+        let target = named.iter().find(|(n, _)| n == "Target");
+        assert_eq!(
+            target.map(|(_, k)| *k),
+            Some(crate::types::OutlineKind::Struct),
+            "buried struct Target not recovered into the outline: {named:?}"
+        );
+    }
+
+    /// A top-level node that both carries an error *and* holds a nested clean specifier is the
+    /// shape where recovery could double-count: `node_to_entries`' own `collect_children` reaches
+    /// the nested type while the recovery descent finds it again. It must appear exactly once.
+    ///
+    /// Both orderings are checked: the error *after* the nested struct is the one that still lets
+    /// `collect_children` reach `Inner`, so it is the case that actually double-counted before the
+    /// `seen` guard; the error *before* it is the case where only recovery reaches `Inner`.
+    #[test]
+    fn erroring_parent_with_a_clean_nested_struct_does_not_duplicate_it() {
+        let cases = [
+            "struct Outer {\n    struct Inner { int x; };\n    int broken(\n};\n",
+            "struct Outer {\n    int broken(\n    struct Inner { int x; };\n    int after;\n};\n",
+        ];
+        for src in cases {
+            let named = flat_named(&get_outline_entries(src, Lang::Cpp));
+            let inner = named.iter().filter(|(n, _)| n == "Inner").count();
+            assert_eq!(inner, 1, "Inner should appear once, not {inner}: {named:?}");
+        }
+    }
+
+    /// The dedup keys on name and line-range overlap, not the start line alone, because the two
+    /// walks anchor a `template <…>`-wrapped type to different lines: `node_to_entry` hoists the
+    /// base entry to the `template` keyword, while recovery reaches the inner `struct_specifier`
+    /// one line down. A start-line-only key missed and emitted the template twice.
+    #[test]
+    fn a_templated_type_in_an_error_region_is_not_duplicated() {
+        let src = "namespace N {\ntemplate <class T>\nstruct Tpl { T v; };\nint broken(\nstruct After { int a; };\n}\n";
+        let named = flat_named(&get_outline_entries(src, Lang::Cpp));
+        let tpl = named.iter().filter(|(n, _)| n == "Tpl").count();
+        assert_eq!(tpl, 1, "Tpl should appear once, not {tpl}: {named:?}");
+        // The genuinely-buried sibling past the error is still recovered.
+        assert!(
+            named.iter().any(|(n, _)| n == "After"),
+            "After was not recovered: {named:?}"
+        );
+    }
+
+    /// Recovery is scoped to error-bearing subtrees: a well-formed file must outline identically
+    /// whether or not the recovery pass exists, since nothing in it has an error to descend.
+    #[test]
+    fn well_formed_file_is_unaffected_by_recovery() {
+        let src = "struct A { int x; };\nnamespace N { struct B { int y; }; }\nvoid f() {}\n";
+        let named = flat_named(&get_outline_entries(src, Lang::Cpp));
+        let names: Vec<&str> = named.iter().map(|(n, _)| n.as_str()).collect();
+        // Each defined name appears exactly once — no duplicate from a spurious recovery pass.
+        for want in ["A", "B", "N", "f"] {
+            assert_eq!(
+                names.iter().filter(|n| **n == want).count(),
+                1,
+                "{want} should appear exactly once: {names:?}"
+            );
+        }
     }
 }
 
