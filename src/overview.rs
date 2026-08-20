@@ -916,7 +916,9 @@ fn decode_utf16_with_bom(bytes: &[u8]) -> Option<String> {
     // chosen deliberately rather than invented here. Reachable only by a UTF-16 manifest sized
     // near available memory.
     let units: Vec<u16> = rest
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             if big_endian {
                 u16::from_be_bytes([c[0], c[1]])
@@ -1338,9 +1340,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
             .take(MAX_TEST_STYLE_PROBES)
             .any(|(path, _)| {
                 let full = root.join(path);
-                fs::read_to_string(&full)
-                    .ok()
-                    .is_some_and(|content| content.contains("#[cfg(test)]"))
+                fs::read_to_string(&full).is_ok_and(|content| content.contains("#[cfg(test)]"))
             });
         if has_cfg_test {
             styles.push("in-source #[cfg(test)]".to_string());
