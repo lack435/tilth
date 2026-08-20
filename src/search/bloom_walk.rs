@@ -9,8 +9,9 @@ use std::time::SystemTime;
 use crate::index::bloom::BloomFilterCache;
 
 /// Skip files larger than this; tree-sitter parses on huge files dominate
-/// query latency without surfacing useful matches.
-pub(super) const MAX_FILE_SIZE: u64 = 500_000;
+/// query latency without surfacing useful matches. Shares the crate-wide parse
+/// gate so callers/callees/deps track the symbol walks and the parse budget.
+pub(super) const MAX_FILE_SIZE: u64 = crate::lang::parse_budget::MAX_PARSE_FILE_SIZE;
 
 /// Read `path`, validate size, and pass through only when at least one
 /// target is bloom-positive. Returns `(content, mtime)` for the next stage,

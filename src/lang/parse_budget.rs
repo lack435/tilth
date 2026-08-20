@@ -118,14 +118,42 @@ use crate::types::Lang;
 /// Lowering it below a grammar's real cost exceeds the ceiling by that ratio.
 const TREE_BYTES_PER_SOURCE_BYTE: usize = 128;
 
+/// Maximum size of a file any parsing walk will read before skipping it.
+///
+/// Every AST gate in search shares this constant: the symbol walks, the caller/callee/deps bloom
+/// walk (`search::bloom_walk::MAX_FILE_SIZE`), the outline parse cache (`cache::MAX_PARSE_BYTES`,
+/// which also gates `search::scope`), and the in-result outline context. Content search does *not*
+/// — it runs no parser and gates on its own `search::content::MAX_SEARCH_FILE_SIZE`.
+///
+/// Raised from 500 000 to 1 MB so hand-written large source files stay searchable. Real code sits
+/// above the old gate — e.g. Unreal's `CharacterMovementComponent.cpp` (536 KB) and
+/// `UnrealEngine.cpp` (692 KB) — while nearly everything past 1 MB is generated tables or vendored
+/// header dumps, where a parse is pure cost and outline output is noise.
+///
+/// Coupled to `DEFAULT_BUDGET_MB`: the worst per-file tree estimate is
+/// `MAX_PARSE_FILE_SIZE x TREE_BYTES_PER_SOURCE_BYTE`. See there for how the budget responds when
+/// this moves.
+pub(crate) const MAX_PARSE_FILE_SIZE: u64 = 1_000_000;
+
 /// Default ceiling on concurrently-held tree bytes.
 ///
-/// **Derived, not tuned.** It is the smallest multiple of 64 MiB that admits `worker_threads`'
-/// maximum of 6 worst-case parses at once: a parsing walk gates files at 500 000 B, so no file can
-/// estimate above `500_000 x 128 = 64 MB`, and `6 x 64 = 384`. That is what keeps it inert at the
-/// default thread count, and it means the value is coupled to **two** other constants — the thread
-/// clamp in `util::worker_threads` and the size gate in the walks.
-/// `the_worst_single_file_estimate_matches_the_ceiling_derivation` fails if either drifts.
+/// **Was derived, now deliberately under the derivation.** When the parse gate was 500 000 B the
+/// worst per-file estimate was `500_000 x 128 = 64 MB`, and this was the smallest multiple of 64 MiB
+/// admitting all `6` of `worker_threads`' worst-case parses at once (`6 x 64 = 384`), so it never
+/// bound at the default thread count. Raising the gate to `MAX_PARSE_FILE_SIZE` (1 MB) doubled the
+/// worst per-file estimate to `1_000_000 x 128 = 128 MB`, and the budget was **left at 384** rather
+/// than moved to `6 x 128 = 768`.
+///
+/// That is the Option-B trade, and it is safe by construction: `reserve` always admits when nothing
+/// is in flight, so no file is ever skipped for want of budget. A walk that parses more than three
+/// near-gate-size files at once (`384 / 128 ≈ 3`) serialises the excess parses instead of raising
+/// peak RSS — it pays latency, not memory, and only on the rare large-file-dense walk. The
+/// 500 000 B era's inert-at-default property is traded for a bound that still holds at 1 MB without
+/// doubling peak. The value stays coupled to the thread clamp in `util::worker_threads` — raising it
+/// widens the serialising range rather than binding for the first time — and to `MAX_PARSE_FILE_SIZE`,
+/// which sets the worst per-file estimate. `the_worst_single_file_estimate_bounds_the_ceiling` guards
+/// only that arithmetic (gate × per-byte); it does *not* see the thread clamp, because under Option B
+/// the ceiling is deliberately no longer a function of it.
 ///
 /// Measured with the same binary throughout, `TILTH_PARSE_BUDGET_MB=0` as the unbudgeted reference so
 /// nothing but the mechanism differs. Seven reps at the default thread count, five at 32. Fixtures of
@@ -145,10 +173,12 @@ const TREE_BYTES_PER_SOURCE_BYTE: usize = 128;
 /// ```
 ///
 /// **4.0x / 4.1x / 2.6x** at 32 threads, for 29% / 18% / 15% wall. At the default thread count every
-/// bounded cell sits inside its unbudgeted range on all three shapes and on this repository — which
-/// is the property the value was derived for, and the property the previous 256 MB did *not* have:
-/// it bound the line-dense shape at the default, taking 33 MB off peak for wall it did not need to
-/// spend.
+/// bounded cell sits inside its unbudgeted range on all three shapes and on this repository — the
+/// property 384 was originally derived for at the 500 000 B gate, and the property the previous
+/// 256 MB did *not* have: it bound the line-dense shape at the default, taking 33 MB off peak for
+/// wall it did not need to spend. These fixtures are all ≤ 499 KB, so under the 1 MB gate they still
+/// never bind at the default; a file in the new 500 KB–1 MB band can, which is the Option-B trade
+/// stated above.
 ///
 /// Override with `TILTH_PARSE_BUDGET_MB`. Three cells say the knob is real rather than decorative,
 /// all on the line-dense fixture at 32 threads:
@@ -484,21 +514,23 @@ mod tests {
         assert_eq!(estimate_bytes(&dense), 1000 * TREE_BYTES_PER_SOURCE_BYTE);
     }
 
-    /// The worst single-file estimate is what the ceiling is derived from, so pin the arithmetic.
+    /// The worst single-file estimate is the unit the ceiling is measured in, so pin the arithmetic.
     ///
-    /// `MAX_SEARCH_FILE_SIZE` (500 000) gates every parsing walk, so no file can estimate above
-    /// this — which is what makes `DEFAULT_BUDGET_MB` a function of the thread ceiling rather than
-    /// of the corpus. If either constant moves, this fails and the ceiling has to be re-derived.
+    /// `MAX_PARSE_FILE_SIZE` (1 MB) gates every parsing walk, so no file can estimate above this.
+    /// Under the Option-B sizing the default ceiling is deliberately *below* `worker_threads`'
+    /// worst-case parses: a large-file-dense walk serialises the excess rather than raising peak RSS
+    /// (see `DEFAULT_BUDGET_MB`). What must still hold is that the ceiling admits more than one
+    /// worst-case file at once, so such a walk degrades to reduced parallelism, never to strictly
+    /// serial parsing. If `MAX_PARSE_FILE_SIZE` or `TREE_BYTES_PER_SOURCE_BYTE` drift, re-derive.
     #[test]
-    fn the_worst_single_file_estimate_matches_the_ceiling_derivation() {
-        let worst = 500_000 * TREE_BYTES_PER_SOURCE_BYTE;
-        assert_eq!(worst, 64_000_000, "worst per-file estimate moved");
-        // `util::worker_threads` clamps to at most 6, and the default ceiling is the smallest
-        // multiple of 64 MiB that admits that many worst-case files at once.
-        let needed = 6 * worst;
+    fn the_worst_single_file_estimate_bounds_the_ceiling() {
+        let worst = MAX_PARSE_FILE_SIZE as usize * TREE_BYTES_PER_SOURCE_BYTE;
+        assert_eq!(worst, 128_000_000, "worst per-file estimate moved");
         assert!(
-            DEFAULT_BUDGET_MB * 1024 * 1024 >= needed,
-            "the default ceiling ({DEFAULT_BUDGET_MB} MB) no longer admits 6 worst-case parses              ({needed} B), so it will bind at the default thread count"
+            DEFAULT_BUDGET_MB * 1024 * 1024 >= 2 * worst,
+            "the default ceiling ({DEFAULT_BUDGET_MB} MB) no longer admits two worst-case parses \
+             ({} B), so large-file searches parse strictly serially",
+            2 * worst
         );
     }
 

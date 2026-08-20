@@ -136,7 +136,7 @@ unsafe extern "C" fn ts_free(p: *mut c_void) {
 }
 
 /// The constant under test. Kept in sync by `parse_budget`'s
-/// `the_worst_single_file_estimate_matches_the_ceiling_derivation`, which fails if the shipped value
+/// `the_worst_single_file_estimate_bounds_the_ceiling`, which fails if the shipped value
 /// changes without the ceiling being re-derived.
 const SHIPPED_BYTES_PER_SOURCE_BYTE: f64 = 128.0;
 

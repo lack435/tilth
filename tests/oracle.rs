@@ -233,8 +233,11 @@ const SKIP_DIRS: &[&str] = &[
     ".metals",
 ];
 
-/// Mirrors `search::content::MAX_SEARCH_FILE_SIZE`.
-const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+/// Mirrors `search::content::MAX_SEARCH_FILE_SIZE`, and — because the fixtures below exercise
+/// default symbol search too — must also equal `lang::parse_budget::MAX_PARSE_FILE_SIZE`. Both
+/// production consts are 1 MB; this mirror is only valid while they stay equal. If they diverge,
+/// split this into two mirrors gated on the search kind under test.
+const MAX_SEARCH_FILE_SIZE: u64 = 1_000_000;
 
 /// Mirrors `lang::detection::MINIFIED_CHECK_THRESHOLD`.
 const MINIFIED_CHECK_THRESHOLD: u64 = 100_000;
@@ -527,14 +530,14 @@ impl Fixture {
         write("web/bundle.min.js", "var ZorbulSentinel=1;\n");
         write("web/other-min.js", "var ZorbulSentinel=2;\n");
 
-        // Over the size cap: 600 KB, plant on the first line so a naive reader would find it.
+        // Over the size cap: 1.1 MB, plant on the first line so a naive reader would find it.
         let mut big = String::from("const ZorbulSentinel = 1;\n");
-        while big.len() < 600_000 {
+        while big.len() < 1_100_000 {
             big.push_str("// filler filler filler filler filler filler filler filler\n");
         }
         write("web/huge.js", &big);
 
-        // Minified by content: over 100 KB, under 500 KB, almost no newlines.
+        // Minified by content: 150 KB (under the size cap), almost no newlines.
         let mut min = String::from("var ZorbulSentinel=1;");
         while min.len() < 150_000 {
             min.push_str("var a=1;b=2;c=3;d=4;e=5;f=6;g=7;h=8;i=9;j=10;k=11;l=12;");

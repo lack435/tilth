@@ -1672,7 +1672,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    if meta.len() > 500_000 {
+    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {

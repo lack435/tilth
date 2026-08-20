@@ -681,7 +681,7 @@ fn find_definitions(
             // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > 500_000 {
+                    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -856,7 +856,7 @@ fn find_definitions_multi(
             // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > 500_000 {
+                    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -1024,7 +1024,7 @@ fn find_usages_multi(
 
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > 500_000 {
+                    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -1566,7 +1566,7 @@ fn find_usages(
             // Skip oversized files
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > 500_000 {
+                    if meta.len() > crate::lang::parse_budget::MAX_PARSE_FILE_SIZE {
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -1580,7 +1580,7 @@ fn find_usages(
                 return ignore::WalkState::Continue;
             };
 
-            // Catch unmarked minified bundles between 100KB and 500KB — they
+            // Catch unmarked minified bundles between 100KB and 1MB — they
             // were not skipped by the filename check or the size cap above.
             if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
                 && crate::lang::detection::is_minified_by_content(&bytes)
