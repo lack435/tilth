@@ -9,6 +9,21 @@ use crate::session::Session;
 
 use super::{apply_budget, resolve_scope};
 
+/// Split a multi-symbol query into its individual targets.
+///
+/// Accepts both `,` (the documented separator) and `|` (regex-alternation
+/// muscle memory). `|` is never a valid identifier character in any language
+/// tilth supports, so splitting on it can never break a legitimate single
+/// symbol name — while `A|B|C` typed out of grep habit would otherwise be
+/// searched as one literal symbol and silently return zero matches.
+fn split_symbol_list(query: &str) -> Vec<&str> {
+    query
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub(in crate::mcp) fn tool_search(
     args: &Value,
     cache: &OutlineCache,
@@ -42,11 +57,7 @@ pub(in crate::mcp) fn tool_search(
 
     let output = match kind {
         "symbol" => {
-            let queries: Vec<&str> = query
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
+            let queries = split_symbol_list(query);
             match queries.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => crate::search::search_symbol_expanded(
@@ -72,11 +83,7 @@ pub(in crate::mcp) fn tool_search(
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
-            let targets: Vec<&str> = query
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
+            let targets = split_symbol_list(query);
             match targets.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => crate::search::callers::search_callers_expanded(
@@ -393,6 +400,90 @@ mod tests {
             result.is_ok(),
             "bare search must default to cwd, not refuse: {result:?}"
         );
+    }
+
+    #[test]
+    fn split_symbol_list_accepts_both_separators() {
+        // Comma — the documented separator.
+        assert_eq!(split_symbol_list("a,b,c"), vec!["a", "b", "c"]);
+        // Pipe — grep/regex-alternation muscle memory.
+        assert_eq!(split_symbol_list("a|b|c"), vec!["a", "b", "c"]);
+        // Mixed, with surrounding whitespace to trim and an empty run to drop.
+        assert_eq!(split_symbol_list("a, b | c ||"), vec!["a", "b", "c"]);
+        // A lone identifier is a single target, untouched.
+        assert_eq!(split_symbol_list("handleRequest"), vec!["handleRequest"]);
+    }
+
+    /// Regression: a symbol query written with regex-style `|` alternation —
+    /// `alpha|beta` out of grep habit — must resolve each symbol, not search
+    /// for one literal symbol named "alpha|beta" and return zero matches. This
+    /// is the exact failure mode that made an agent conclude tilth's index was
+    /// "stale" and fall back to grep.
+    #[test]
+    fn symbol_pipe_query_finds_each_symbol() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn gamma() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha|beta",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("alpha"), "alpha not found: {out}");
+        assert!(out.contains("beta"), "beta not found: {out}");
+        // The combined literal must never be searched as one symbol name.
+        assert!(
+            !out.contains("\"alpha|beta\""),
+            "pipe query was treated as a literal symbol: {out}"
+        );
+    }
+
+    /// The pipe separator must reach the callers path too, matching the comma
+    /// behavior guarded by `callers_comma_query_finds_both_targets`.
+    #[test]
+    fn callers_pipe_query_finds_both_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn uses_alpha() { alpha(); }\n\
+             fn uses_beta() { beta(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha|beta",
+            "kind": "callers",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            out.contains("Callers of \"alpha\""),
+            "missing alpha section: {out}"
+        );
+        assert!(
+            out.contains("Callers of \"beta\""),
+            "missing beta section: {out}"
+        );
+        assert!(out.contains("uses_alpha"), "alpha call site missing: {out}");
+        assert!(out.contains("uses_beta"), "beta call site missing: {out}");
     }
 
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
