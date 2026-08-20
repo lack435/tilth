@@ -233,7 +233,10 @@ const SKIP_DIRS: &[&str] = &[
     ".metals",
 ];
 
-/// Mirrors `search::content::MAX_SEARCH_FILE_SIZE`.
+/// Mirrors `search::content::MAX_SEARCH_FILE_SIZE`, and — because the fixtures below exercise
+/// default symbol search too — must also equal `lang::parse_budget::MAX_PARSE_FILE_SIZE`. Both
+/// production consts are 1 MB; this mirror is only valid while they stay equal. If they diverge,
+/// split this into two mirrors gated on the search kind under test.
 const MAX_SEARCH_FILE_SIZE: u64 = 1_000_000;
 
 /// Mirrors `lang::detection::MINIFIED_CHECK_THRESHOLD`.

@@ -149,9 +149,11 @@ pub(crate) const MAX_PARSE_FILE_SIZE: u64 = 1_000_000;
 /// near-gate-size files at once (`384 / 128 ≈ 3`) serialises the excess parses instead of raising
 /// peak RSS — it pays latency, not memory, and only on the rare large-file-dense walk. The
 /// 500 000 B era's inert-at-default property is traded for a bound that still holds at 1 MB without
-/// doubling peak. The value stays coupled to the thread clamp in `util::worker_threads` and to
-/// `MAX_PARSE_FILE_SIZE`; `the_worst_single_file_estimate_bounds_the_ceiling` fails if either
-/// drifts.
+/// doubling peak. The value stays coupled to the thread clamp in `util::worker_threads` — raising it
+/// widens the serialising range rather than binding for the first time — and to `MAX_PARSE_FILE_SIZE`,
+/// which sets the worst per-file estimate. `the_worst_single_file_estimate_bounds_the_ceiling` guards
+/// only that arithmetic (gate × per-byte); it does *not* see the thread clamp, because under Option B
+/// the ceiling is deliberately no longer a function of it.
 ///
 /// Measured with the same binary throughout, `TILTH_PARSE_BUDGET_MB=0` as the unbudgeted reference so
 /// nothing but the mechanism differs. Seven reps at the default thread count, five at 32. Fixtures of
@@ -171,10 +173,12 @@ pub(crate) const MAX_PARSE_FILE_SIZE: u64 = 1_000_000;
 /// ```
 ///
 /// **4.0x / 4.1x / 2.6x** at 32 threads, for 29% / 18% / 15% wall. At the default thread count every
-/// bounded cell sits inside its unbudgeted range on all three shapes and on this repository — which
-/// is the property the value was derived for, and the property the previous 256 MB did *not* have:
-/// it bound the line-dense shape at the default, taking 33 MB off peak for wall it did not need to
-/// spend.
+/// bounded cell sits inside its unbudgeted range on all three shapes and on this repository — the
+/// property 384 was originally derived for at the 500 000 B gate, and the property the previous
+/// 256 MB did *not* have: it bound the line-dense shape at the default, taking 33 MB off peak for
+/// wall it did not need to spend. These fixtures are all ≤ 499 KB, so under the 1 MB gate they still
+/// never bind at the default; a file in the new 500 KB–1 MB band can, which is the Option-B trade
+/// stated above.
 ///
 /// Override with `TILTH_PARSE_BUDGET_MB`. Three cells say the knob is real rather than decorative,
 /// all on the line-dense fixture at 32 threads:
