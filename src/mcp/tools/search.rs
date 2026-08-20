@@ -9,6 +9,45 @@ use crate::session::Session;
 
 use super::{apply_budget, resolve_scope};
 
+/// Split a multi-symbol query into its individual targets.
+///
+/// `,` is the documented separator. We also accept `|` because agents reach
+/// for regex-style `A|B|C` alternation out of grep muscle memory — without
+/// this, that whole string is searched as one literal symbol name and
+/// silently returns zero matches (the failure that made an agent conclude
+/// tilth's index was "stale" and fall back to grep).
+///
+/// The one identifier family that legitimately contains a `|` is a C++
+/// operator overload: tilth extracts operator names verbatim (see
+/// `lang/treesitter.rs`), so `operator|`, `operator|=`, and `operator||` are
+/// real symbol names. A part whose `operator` keyword is followed by
+/// punctuation is kept intact rather than split on its pipe.
+fn split_symbol_list(query: &str) -> Vec<&str> {
+    // Comma is the true separator — split on it first, then split each part on
+    // `|` unless the part is a pipe-bearing C++ operator overload.
+    query
+        .split(',')
+        .flat_map(|part| {
+            let part = part.trim();
+            if is_operator_overload(part) {
+                vec![part]
+            } else {
+                part.split('|').map(str::trim).collect::<Vec<_>>()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// A C++ operator overload like `operator|` or `operator|=` — the `operator`
+/// keyword followed immediately by punctuation. Distinguished from ordinary
+/// identifiers such as `operatorId`, where a letter/digit/`_` follows and the
+/// pipe (if any) is real alternation.
+fn is_operator_overload(part: &str) -> bool {
+    part.strip_prefix("operator")
+        .is_some_and(|rest| rest.starts_with(|c: char| !c.is_alphanumeric() && c != '_'))
+}
+
 pub(in crate::mcp) fn tool_search(
     args: &Value,
     cache: &OutlineCache,
@@ -42,11 +81,7 @@ pub(in crate::mcp) fn tool_search(
 
     let output = match kind {
         "symbol" => {
-            let queries: Vec<&str> = query
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
+            let queries = split_symbol_list(query);
             match queries.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => crate::search::search_symbol_expanded(
@@ -72,11 +107,7 @@ pub(in crate::mcp) fn tool_search(
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
-            let targets: Vec<&str> = query
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
+            let targets = split_symbol_list(query);
             match targets.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => crate::search::callers::search_callers_expanded(
@@ -393,6 +424,113 @@ mod tests {
             result.is_ok(),
             "bare search must default to cwd, not refuse: {result:?}"
         );
+    }
+
+    #[test]
+    fn split_symbol_list_accepts_both_separators() {
+        // Comma — the documented separator.
+        assert_eq!(split_symbol_list("a,b,c"), vec!["a", "b", "c"]);
+        // Pipe — grep/regex-alternation muscle memory.
+        assert_eq!(split_symbol_list("a|b|c"), vec!["a", "b", "c"]);
+        // Mixed, with surrounding whitespace to trim and an empty run to drop.
+        assert_eq!(split_symbol_list("a, b | c ||"), vec!["a", "b", "c"]);
+        // A lone identifier is a single target, untouched.
+        assert_eq!(split_symbol_list("handleRequest"), vec!["handleRequest"]);
+    }
+
+    /// A C++ operator overload's name legitimately contains a pipe. tilth
+    /// extracts these verbatim, so an agent copies `operator|` straight out of
+    /// an outline into a search — splitting it into a bare `operator` would
+    /// silently lose the definition. Common in Unreal C++ (`ENUM_CLASS_FLAGS`
+    /// generates `operator|`, `operator|=`).
+    #[test]
+    fn split_symbol_list_preserves_cpp_operator_overloads() {
+        assert_eq!(split_symbol_list("operator|"), vec!["operator|"]);
+        assert_eq!(split_symbol_list("operator|="), vec!["operator|="]);
+        assert_eq!(split_symbol_list("operator||"), vec!["operator||"]);
+        // Comma still separates an overload from other targets.
+        assert_eq!(
+            split_symbol_list("operator|,operator&"),
+            vec!["operator|", "operator&"]
+        );
+        // An ordinary identifier that merely starts with "operator" is NOT an
+        // overload — the pipe is real alternation and must still split.
+        assert_eq!(
+            split_symbol_list("operatorName|foo"),
+            vec!["operatorName", "foo"]
+        );
+    }
+
+    /// Regression: a symbol query written with regex-style `|` alternation —
+    /// `alpha|beta` out of grep habit — must resolve each symbol, not search
+    /// for one literal symbol named "alpha|beta" and return zero matches. This
+    /// is the exact failure mode that made an agent conclude tilth's index was
+    /// "stale" and fall back to grep.
+    #[test]
+    fn symbol_pipe_query_finds_each_symbol() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn gamma() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha|beta",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("alpha"), "alpha not found: {out}");
+        assert!(out.contains("beta"), "beta not found: {out}");
+        // The combined literal must never be searched as one symbol name.
+        assert!(
+            !out.contains("\"alpha|beta\""),
+            "pipe query was treated as a literal symbol: {out}"
+        );
+    }
+
+    /// The pipe separator must reach the callers path too, matching the comma
+    /// behavior guarded by `callers_comma_query_finds_both_targets`.
+    #[test]
+    fn callers_pipe_query_finds_both_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n\
+             fn uses_alpha() { alpha(); }\n\
+             fn uses_beta() { beta(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha|beta",
+            "kind": "callers",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            out.contains("Callers of \"alpha\""),
+            "missing alpha section: {out}"
+        );
+        assert!(
+            out.contains("Callers of \"beta\""),
+            "missing beta section: {out}"
+        );
+        assert!(out.contains("uses_alpha"), "alpha call site missing: {out}");
+        assert!(out.contains("uses_beta"), "beta call site missing: {out}");
     }
 
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
