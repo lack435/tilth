@@ -29,11 +29,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// figure is flat across a 32x change in thread count — which is what identifies it as one live tree
 /// per thread rather than anything about match counts.
 ///
-/// **`lang::parse_budget`'s default ceiling is derived from the `6` here**, not only from its own
-/// per-byte constant: it is the smallest multiple of 64 MiB that admits six worst-case parses at
-/// once, which is what keeps it inert at this default. Raising the clamp to 7 makes the budget bind
-/// at the default immediately. Change one and re-derive the other;
-/// `the_worst_single_file_estimate_matches_the_ceiling_derivation` fails if they drift.
+/// **`lang::parse_budget`'s default ceiling is coupled to the `6` here** and to its own per-file
+/// gate. When the gate was 500 000 B the ceiling was sized to admit all six worst-case parses at
+/// once, keeping it inert at this default. Since the gate rose to 1 MB the ceiling is deliberately
+/// left below that (Option B — it admits three near-gate-size parses and serialises the rest), so
+/// raising this clamp now widens the range of large-file walks that serialise rather than making the
+/// budget bind for the first time. Change one and reconsider the other;
+/// `the_worst_single_file_estimate_bounds_the_ceiling` fails if the arithmetic drifts.
 ///
 /// The practical consequence: at this default of at most 6, a search over a tree of large source
 /// files peaks around 80-195 MB. Setting `TILTH_THREADS=32` on a 32-core machine — the obvious thing

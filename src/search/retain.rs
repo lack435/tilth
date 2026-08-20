@@ -54,7 +54,7 @@
 //!
 //! Measured, three reps per cell, peak working set, `TILTH_THREADS` pinned — the mechanism is per
 //! thread, so an unlabelled figure is not reproducible. Every fixture file is 499 000 B (31 187
-//! 16-byte lines) so none is skipped by the 500 KB search gate and file size is held constant
+//! 16-byte lines) so none is skipped by the search gate and file size is held constant
 //! throughout.
 //!
 //! **The isolated measurement.** 60 files, a match on every line — 1 871 220 matches — named `.txt`

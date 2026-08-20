@@ -59,10 +59,11 @@ use dashmap::DashMap;
 
 /// Largest file this cache will parse, in bytes.
 ///
-/// Unchanged from when `get_or_parse` owned it. A file past this is not worth a scope
+/// Shares the crate-wide parse gate (`lang::parse_budget::MAX_PARSE_FILE_SIZE`) so the outline
+/// cache and `search::scope` track the search walks. A file past this is not worth a scope
 /// annotation, and the transient tree for one is the single largest live allocation the
 /// render path can make.
-const MAX_PARSE_BYTES: u64 = 500_000;
+const MAX_PARSE_BYTES: u64 = crate::lang::parse_budget::MAX_PARSE_FILE_SIZE;
 
 /// Byte ceiling for each map, applied independently.
 ///

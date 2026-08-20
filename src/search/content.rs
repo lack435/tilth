@@ -12,7 +12,11 @@ use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
-const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+/// Content search runs no parser (ripgrep internals), so this is *not* the AST parse gate
+/// (`lang::parse_budget::MAX_PARSE_FILE_SIZE`) and carries none of its budget coupling — it only
+/// bounds bytes scanned per file. Kept at 1 MB to match the parse gate so both surfaces reach the
+/// same large source files; retention past that is bounded separately by `MAX_RETAINED`.
+const MAX_SEARCH_FILE_SIZE: u64 = 1_000_000;
 
 // This walk used to stop once a shared `AtomicUsize` crossed `EARLY_QUIT_THRESHOLD`
 // (30, or 300 under `--full`), which made content search **non-deterministic** for the
@@ -134,7 +138,7 @@ pub fn search(
                 return ignore::WalkState::Continue;
             };
 
-            // Catch unmarked minified bundles in the 100KB–500KB range.
+            // Catch unmarked minified bundles in the 100KB–1MB range.
             if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
                 && crate::lang::detection::is_minified_by_content(&bytes)
             {
