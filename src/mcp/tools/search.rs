@@ -11,17 +11,41 @@ use super::{apply_budget, resolve_scope};
 
 /// Split a multi-symbol query into its individual targets.
 ///
-/// Accepts both `,` (the documented separator) and `|` (regex-alternation
-/// muscle memory). `|` is never a valid identifier character in any language
-/// tilth supports, so splitting on it can never break a legitimate single
-/// symbol name — while `A|B|C` typed out of grep habit would otherwise be
-/// searched as one literal symbol and silently return zero matches.
+/// `,` is the documented separator. We also accept `|` because agents reach
+/// for regex-style `A|B|C` alternation out of grep muscle memory — without
+/// this, that whole string is searched as one literal symbol name and
+/// silently returns zero matches (the failure that made an agent conclude
+/// tilth's index was "stale" and fall back to grep).
+///
+/// The one identifier family that legitimately contains a `|` is a C++
+/// operator overload: tilth extracts operator names verbatim (see
+/// `lang/treesitter.rs`), so `operator|`, `operator|=`, and `operator||` are
+/// real symbol names. A part whose `operator` keyword is followed by
+/// punctuation is kept intact rather than split on its pipe.
 fn split_symbol_list(query: &str) -> Vec<&str> {
+    // Comma is the true separator — split on it first, then split each part on
+    // `|` unless the part is a pipe-bearing C++ operator overload.
     query
-        .split(['|', ','])
-        .map(str::trim)
+        .split(',')
+        .flat_map(|part| {
+            let part = part.trim();
+            if is_operator_overload(part) {
+                vec![part]
+            } else {
+                part.split('|').map(str::trim).collect::<Vec<_>>()
+            }
+        })
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// A C++ operator overload like `operator|` or `operator|=` — the `operator`
+/// keyword followed immediately by punctuation. Distinguished from ordinary
+/// identifiers such as `operatorId`, where a letter/digit/`_` follows and the
+/// pipe (if any) is real alternation.
+fn is_operator_overload(part: &str) -> bool {
+    part.strip_prefix("operator")
+        .is_some_and(|rest| rest.starts_with(|c: char| !c.is_alphanumeric() && c != '_'))
 }
 
 pub(in crate::mcp) fn tool_search(
@@ -412,6 +436,29 @@ mod tests {
         assert_eq!(split_symbol_list("a, b | c ||"), vec!["a", "b", "c"]);
         // A lone identifier is a single target, untouched.
         assert_eq!(split_symbol_list("handleRequest"), vec!["handleRequest"]);
+    }
+
+    /// A C++ operator overload's name legitimately contains a pipe. tilth
+    /// extracts these verbatim, so an agent copies `operator|` straight out of
+    /// an outline into a search — splitting it into a bare `operator` would
+    /// silently lose the definition. Common in Unreal C++ (`ENUM_CLASS_FLAGS`
+    /// generates `operator|`, `operator|=`).
+    #[test]
+    fn split_symbol_list_preserves_cpp_operator_overloads() {
+        assert_eq!(split_symbol_list("operator|"), vec!["operator|"]);
+        assert_eq!(split_symbol_list("operator|="), vec!["operator|="]);
+        assert_eq!(split_symbol_list("operator||"), vec!["operator||"]);
+        // Comma still separates an overload from other targets.
+        assert_eq!(
+            split_symbol_list("operator|,operator&"),
+            vec!["operator|", "operator&"]
+        );
+        // An ordinary identifier that merely starts with "operator" is NOT an
+        // overload — the pipe is real alternation and must still split.
+        assert_eq!(
+            split_symbol_list("operatorName|foo"),
+            vec!["operatorName", "foo"]
+        );
     }
 
     /// Regression: a symbol query written with regex-style `|` alternation —
