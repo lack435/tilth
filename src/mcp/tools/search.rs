@@ -718,6 +718,40 @@ mod tests {
         );
     }
 
+    /// The expand path resolves callees and renders them against the parent base under a file
+    /// scope (#141). This guards the containment/render base on the branch the original refusal
+    /// was really about: `format_single_match` feeds `canonical_boundary(&result.scope)` into
+    /// callee resolution, and `result.scope` must be the file's parent, not the file. If a
+    /// regression made it the file, `rel(callee, file)` would collapse the callee path to the
+    /// empty string (and `is_within(dir, file)` would refuse every C/C++ local include the same
+    /// way). The callee here shares the target file, so a correct base renders `target.rs:<line>`.
+    #[test]
+    fn file_scope_expand_resolves_callee_against_parent_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "pub fn caller_fn() -> u32 {\n    helper_fn()\n}\nfn helper_fn() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "caller_fn",
+            "expand": 2,
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("-- calls --"), "callee section missing: {out}");
+        assert!(
+            out.contains("helper_fn  target.rs:"),
+            "callee must resolve and render against the parent base as a basename: {out}"
+        );
+    }
+
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
     /// is unresolvable (the server cannot see the caller's shell cwd) — this
     /// must still refuse.

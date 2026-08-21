@@ -300,9 +300,8 @@ pub fn run_deps(
 /// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
 /// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
 pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
-    // A file scope (#141) collapses to its parent directory: grok wants a directory base for both
-    // resolution and rendering (see `tool_grok`). Directory scopes are unchanged.
-    let scope = search::scope_base(scope);
+    // A file scope (#141) is accepted; `grok` collapses it to its parent internally and carries
+    // the base on its result (see `tool_grok`).
     let bloom = index::bloom::BloomFilterCache::new();
     let session = session::Session::default();
     let caps = if full {
@@ -311,7 +310,7 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
         search::grok::GrokCaps::default()
     };
     let result = search::grok::grok(target_spec, scope, &bloom, &session, caps)?;
-    Ok(search::grok::format_grok(&result, scope))
+    Ok(search::grok::format_grok(&result))
 }
 
 fn run_inner(
