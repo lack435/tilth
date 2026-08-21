@@ -69,6 +69,15 @@ struct Cli {
     #[arg(long)]
     glob: Option<String>,
 
+    /// Case-insensitive text / regex search.
+    ///
+    /// Without this flag, text and regex queries use smart-case: a query with
+    /// no uppercase letter matches case-insensitively, one with any uppercase
+    /// stays case-sensitive. `-i` forces case-insensitive regardless. No effect
+    /// on symbol, file-path, or glob queries.
+    #[arg(short = 'i', long = "ignore-case")]
+    ignore_case: bool,
+
     /// Find all callers of a symbol.
     #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
     callers: bool,
@@ -319,6 +328,14 @@ fn main() {
     //
     let expand = compute_expand(cli.expand, cli.full);
 
+    // Smart-case unless `-i` forces case-insensitive. Consulted only by the
+    // content/regex arms of `run`; symbol/file/glob queries ignore it.
+    let case = if cli.ignore_case {
+        tilth::CaseMode::Insensitive
+    } else {
+        tilth::CaseMode::Smart
+    };
+
     // Callers mode
     if cli.callers {
         let result = tilth::run_callers(
@@ -366,6 +383,7 @@ fn main() {
             cli.glob.as_deref(),
             &cache,
             cli.full,
+            case,
         )
     } else if full {
         tilth::run_full(
@@ -375,6 +393,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            case,
         )
     } else {
         tilth::run(
@@ -384,6 +403,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            case,
         )
     };
 

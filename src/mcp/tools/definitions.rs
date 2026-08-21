@@ -44,6 +44,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": "symbol",
                         "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
                     },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Case handling for kind=content/regex (ignored for symbol/callers). Omit for smart-case: an all-lowercase query matches any case, a query with an uppercase letter stays case-sensitive. true forces case-insensitive; false forces case-sensitive."
+                    },
                     "expand": {
                         "type": "number",
                         "default": 2,

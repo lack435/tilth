@@ -416,6 +416,10 @@ const PARAMS_WITHOUT_THEIR_OWN_SURFACE: &[(&str, &str)] = &[
         "widens which files a walk visits (VCS-ignored ones); every visited file renders \n         through the same surfaces either way",
     ),
     ("context", "biases ranking; does not add a render path"),
+    (
+        "ignore_case",
+        "selects the matcher's case behaviour; every match renders through the same surfaces",
+    ),
     ("budget", "truncates an already-rendered surface"),
     (
         "blast",
