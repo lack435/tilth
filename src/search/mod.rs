@@ -457,9 +457,10 @@ pub fn search_content(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    case: crate::types::CaseMode,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, glob, false)?;
+    let result = content::search(pattern, scope, is_regex, None, glob, false, case)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -469,8 +470,9 @@ pub fn search_regex(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    case: crate::types::CaseMode,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, glob, false)?;
+    let result = content::search(pattern, scope, true, None, glob, false, case)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -485,9 +487,10 @@ pub fn search_content_expanded(
     glob: Option<&str>,
     full: bool,
     budget: Option<u64>,
+    case: crate::types::CaseMode,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context, glob, full)?;
+    let result = content::search(pattern, scope, is_regex, context, glob, full, case)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
@@ -503,8 +506,9 @@ pub fn search_regex_expanded(
     glob: Option<&str>,
     full: bool,
     budget: Option<u64>,
+    case: crate::types::CaseMode,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context, glob, full)?;
+    let result = content::search(pattern, scope, true, context, glob, full, case)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
@@ -523,9 +527,10 @@ pub fn search_content_raw(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    case: crate::types::CaseMode,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None, glob, false)
+    content::search(pattern, scope, is_regex, None, glob, false, case)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
@@ -533,8 +538,9 @@ pub fn search_regex_raw(
     pattern: &str,
     scope: &Path,
     glob: Option<&str>,
+    case: crate::types::CaseMode,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None, glob, false)
+    content::search(pattern, scope, true, None, glob, false, case)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -1876,6 +1882,7 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CaseMode;
     use std::collections::HashSet;
     use std::sync::Mutex;
 
@@ -1958,7 +1965,13 @@ mod tests {
         // Every line mentioning `target_sym`: the definition line plus each call site.
         let expected = defs + usages;
 
-        let result = search_content_raw("target_sym", dir.path(), None).unwrap();
+        let result = search_content_raw(
+            "target_sym",
+            dir.path(),
+            None,
+            crate::types::CaseMode::Sensitive,
+        )
+        .unwrap();
 
         assert_eq!(
             result.total_found, expected,
@@ -1987,7 +2000,16 @@ mod tests {
         );
 
         let content_runs: Vec<String> = (0..6)
-            .map(|_| search_content("target_sym", dir.path(), &cache, None).unwrap())
+            .map(|_| {
+                search_content(
+                    "target_sym",
+                    dir.path(),
+                    &cache,
+                    None,
+                    crate::types::CaseMode::Sensitive,
+                )
+                .unwrap()
+            })
             .collect();
         assert!(
             content_runs.windows(2).all(|w| w[0] == w[1]),
@@ -2014,7 +2036,14 @@ mod tests {
             ),
             (
                 "content",
-                search_content("target_sym", dir.path(), &cache, None).unwrap(),
+                search_content(
+                    "target_sym",
+                    dir.path(),
+                    &cache,
+                    None,
+                    crate::types::CaseMode::Sensitive,
+                )
+                .unwrap(),
             ),
         ] {
             let header = out.lines().next().unwrap_or_default();
@@ -2581,7 +2610,13 @@ mod tests {
             "matches per file divide evenly into chunks, so the partial-tail flush is untested"
         );
 
-        let result = search_content_raw("needle", dir.path(), None).unwrap();
+        let result = search_content_raw(
+            "needle",
+            dir.path(),
+            None,
+            crate::types::CaseMode::Sensitive,
+        )
+        .unwrap();
 
         assert_eq!(
             result.total_found, expected,
@@ -2646,7 +2681,16 @@ mod tests {
         let cache = OutlineCache::new();
 
         let runs: Vec<String> = (0..6)
-            .map(|_| search_content("needle", dir.path(), &cache, None).unwrap())
+            .map(|_| {
+                search_content(
+                    "needle",
+                    dir.path(),
+                    &cache,
+                    None,
+                    crate::types::CaseMode::Sensitive,
+                )
+                .unwrap()
+            })
             .collect();
 
         assert!(
@@ -3086,12 +3130,36 @@ mod tests {
     #[test]
     fn content_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all =
-            content::search("TilthError", &scope, false, None, None, false).expect("search failed");
-        let rs_only = content::search("TilthError", &scope, false, None, Some("*.rs"), false)
-            .expect("search with glob failed");
-        let toml_only = content::search("TilthError", &scope, false, None, Some("*.toml"), false)
-            .expect("search with toml glob failed");
+        let all = content::search(
+            "TilthError",
+            &scope,
+            false,
+            None,
+            None,
+            false,
+            CaseMode::Sensitive,
+        )
+        .expect("search failed");
+        let rs_only = content::search(
+            "TilthError",
+            &scope,
+            false,
+            None,
+            Some("*.rs"),
+            false,
+            CaseMode::Sensitive,
+        )
+        .expect("search with glob failed");
+        let toml_only = content::search(
+            "TilthError",
+            &scope,
+            false,
+            None,
+            Some("*.toml"),
+            false,
+            CaseMode::Sensitive,
+        )
+        .expect("search with toml glob failed");
 
         assert!(all.total_found > 0, "unfiltered should find TilthError");
         assert!(rs_only.total_found > 0, "*.rs should find TilthError");
@@ -3260,6 +3328,7 @@ mod tests {
             None,
             None,
             false,
+            CaseMode::Sensitive,
         )
         .unwrap();
         // Should find the symbol in both real/api.rs and linked/api.rs
@@ -4055,7 +4124,7 @@ mod tests {
             bytes.extend_from_slice(body.as_bytes());
             std::fs::write(tmp.path().join("notes.md"), &bytes).unwrap();
             let cache = OutlineCache::new();
-            search_content("zzz_token", tmp.path(), &cache, None).unwrap()
+            search_content("zzz_token", tmp.path(), &cache, None, CaseMode::Sensitive).unwrap()
         };
 
         let plain = run(0);

@@ -5,8 +5,8 @@ use super::retain::{BoundedRetain, FileOffer, MAX_RETAINED};
 
 use crate::error::TilthError;
 use crate::search::rank;
-use crate::types::{FacetTotals, Match, SearchResult};
-use grep_regex::RegexMatcher;
+use crate::types::{CaseMode, FacetTotals, Match, SearchResult};
+use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
@@ -68,6 +68,11 @@ const MAX_SEARCH_FILE_SIZE: u64 = 1_000_000;
 // `usages_cross`. Two of the five buckets are reachable, and `retain`'s tallies count both.
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
+///
+/// `case` selects the matcher's case behaviour. It is applied identically to the literal and regex
+/// paths: `Smart` inspects the (escaped or raw) pattern's literal characters, so `[A-Z]` in a regex
+/// correctly forces sensitivity and an inline `(?i)` flag still overrides the matcher default for
+/// the span it scopes.
 pub fn search(
     pattern: &str,
     scope: &Path,
@@ -75,17 +80,38 @@ pub fn search(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
+    case: CaseMode,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
-    let matcher = if is_regex {
-        RegexMatcher::new(pattern)
+    // Literal queries are regex-escaped so metacharacters match verbatim; regex queries pass
+    // through untouched. Case is then a matcher-builder setting rather than anything baked into
+    // the pattern, so the two paths share one build site.
+    let escaped;
+    let effective_pattern = if is_regex {
+        pattern
     } else {
-        RegexMatcher::new(&regex_syntax::escape(pattern))
+        escaped = regex_syntax::escape(pattern);
+        escaped.as_str()
+    };
+    let mut builder = RegexMatcherBuilder::new();
+    match case {
+        CaseMode::Sensitive => {}
+        CaseMode::Insensitive => {
+            builder.case_insensitive(true);
+        }
+        // Only one arm ever sets a flag, so `case_smart` and `case_insensitive` are never both
+        // enabled here. (grep-regex does accept both at once, letting `case_insensitive` win — we
+        // simply never rely on that precedence.)
+        CaseMode::Smart => {
+            builder.case_smart(true);
+        }
     }
-    .map_err(|e| TilthError::InvalidQuery {
-        query: pattern.to_string(),
-        reason: e.to_string(),
-    })?;
+    let matcher = builder
+        .build(effective_pattern)
+        .map_err(|e| TilthError::InvalidQuery {
+            query: pattern.to_string(),
+            reason: e.to_string(),
+        })?;
 
     let sink = BoundedRetain::new(MAX_RETAINED);
 
@@ -232,4 +258,92 @@ pub fn search(
         usages: total,
         facet_totals,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search;
+    use crate::types::CaseMode;
+
+    /// One file, three lines, deliberately varied in case so a case decision is
+    /// observable in the match count.
+    fn fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("notes.txt"),
+            "ALERT THRESHOLD marker\n\
+             alert threshold here\n\
+             Mixed Alert text\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn count(pattern: &str, is_regex: bool, case: CaseMode) -> usize {
+        let tmp = fixture();
+        search(pattern, tmp.path(), is_regex, None, None, false, case)
+            .unwrap()
+            .total_found
+    }
+
+    /// Sensitive: an all-lowercase literal matches only the lowercase line.
+    /// This is the pre-2026 behaviour — the class of failure reported in #138.
+    #[test]
+    fn sensitive_matches_exact_case_only() {
+        assert_eq!(count("alert threshold", false, CaseMode::Sensitive), 1);
+    }
+
+    /// Smart on an all-lowercase query behaves case-insensitively: it also
+    /// matches the uppercase line. Mutating the `Smart` arm back to sensitive
+    /// (or dropping the `case` plumbing) drops this to 1.
+    #[test]
+    fn smart_all_lowercase_is_case_insensitive() {
+        assert_eq!(count("alert threshold", false, CaseMode::Smart), 2);
+    }
+
+    /// Smart on a query that carries an uppercase letter stays case-sensitive.
+    /// `"ALERT threshold"` matches neither `"ALERT THRESHOLD"` (differs on
+    /// THRESHOLD) nor `"alert threshold"` (differs on ALERT), so a correct
+    /// smart-case gives zero. A smart arm wrongly wired to `case_insensitive`
+    /// would return 2.
+    #[test]
+    fn smart_with_uppercase_stays_sensitive() {
+        assert_eq!(count("ALERT threshold", false, CaseMode::Smart), 0);
+    }
+
+    /// Insensitive forces case-folding even when the query carries uppercase —
+    /// the behaviour that distinguishes it from `Smart` on the same input
+    /// (`smart_with_uppercase_stays_sensitive` gets 0 for this very query).
+    #[test]
+    fn insensitive_ignores_case_even_with_uppercase_query() {
+        assert_eq!(count("ALERT threshold", false, CaseMode::Insensitive), 2);
+    }
+
+    /// An inline `(?i)` flag is honoured on the regex path regardless of the
+    /// requested `CaseMode` — the flag scopes case-insensitivity in the pattern
+    /// itself. This is issue #138's requested feature (3). Passing `Sensitive`
+    /// proves the flag, not the mode, is what folds case here.
+    #[test]
+    fn regex_inline_case_flag_is_honoured() {
+        assert_eq!(count("(?i)alert threshold", true, CaseMode::Sensitive), 2);
+    }
+
+    /// The sharp interaction: `(?i)` followed by an *uppercase* literal under
+    /// `Smart`. `case_smart` sees the uppercase `A` and would set the matcher
+    /// default to sensitive, but the inline flag must still win and fold case.
+    /// All three fixture lines contain "alert"/"ALERT"/"Alert", so a correct
+    /// result is 3; if smart-case sensitivity wrongly overrode the flag, only
+    /// the `"Mixed Alert text"` line would match and this would be 1.
+    #[test]
+    fn regex_inline_flag_overrides_smart_case_on_uppercase() {
+        assert_eq!(count("(?i)Alert", true, CaseMode::Smart), 3);
+    }
+
+    /// The same `(?i)` text on the *literal* path is escaped, so it matches the
+    /// literal characters `(?i)…` — which no line contains. Guards against the
+    /// literal path accidentally interpreting regex metacharacters.
+    #[test]
+    fn literal_path_escapes_inline_flag() {
+        assert_eq!(count("(?i)alert threshold", false, CaseMode::Sensitive), 0);
+    }
 }

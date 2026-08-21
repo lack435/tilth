@@ -69,6 +69,15 @@ struct Cli {
     #[arg(long)]
     glob: Option<String>,
 
+    /// Case-insensitive text / regex search.
+    ///
+    /// Without this flag, text and regex queries use smart-case: a query with
+    /// no uppercase letter matches case-insensitively, one with any uppercase
+    /// stays case-sensitive. `-i` forces case-insensitive regardless. No effect
+    /// on symbol, file-path, or glob queries.
+    #[arg(short = 'i', long = "ignore-case")]
+    ignore_case: bool,
+
     /// Find all callers of a symbol.
     #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
     callers: bool,
@@ -319,6 +328,10 @@ fn main() {
     //
     let expand = compute_expand(cli.expand, cli.full);
 
+    // Smart-case unless `-i` forces case-insensitive. Consulted only by the
+    // content/regex arms of `run`; symbol/file/glob queries ignore it.
+    let case = case_mode(cli.ignore_case);
+
     // Callers mode
     if cli.callers {
         let result = tilth::run_callers(
@@ -366,6 +379,7 @@ fn main() {
             cli.glob.as_deref(),
             &cache,
             cli.full,
+            case,
         )
     } else if full {
         tilth::run_full(
@@ -375,6 +389,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            case,
         )
     } else {
         tilth::run(
@@ -384,6 +399,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            case,
         )
     };
 
@@ -499,6 +515,19 @@ fn configure_thread_pools() {
 /// `full = cli.full || !is_tty` in `main`. Subprocess / pipeline callers
 /// (Claude Code's Bash tool, CI scripts, `tilth foo | rg`) must keep the
 /// concise outline by default; expand-all is opt-in via explicit `--full`.
+/// Map the `-i` / `--ignore-case` flag to a `CaseMode` for the search dispatch.
+///
+/// Extracted (like `compute_expand`) so the flag-to-mode translation is unit-testable rather than
+/// buried inline in `main`. Without `-i` the CLI is smart-case; `-i` forces case-insensitive.
+/// Symbol / file-path / glob queries ignore whichever mode this returns.
+fn case_mode(ignore_case: bool) -> tilth::CaseMode {
+    if ignore_case {
+        tilth::CaseMode::Insensitive
+    } else {
+        tilth::CaseMode::Smart
+    }
+}
+
 fn compute_expand(cli_expand: Option<usize>, cli_full: bool) -> usize {
     /// `--budget` already bounds output, but `expand=usize::MAX` makes tilth
     /// compute the expanded source for every match before truncating —
@@ -538,6 +567,14 @@ mod tests {
     #[test]
     fn neither_flag_means_zero_expand() {
         assert_eq!(compute_expand(None, false), 0);
+    }
+
+    /// Pin the `-i` → `CaseMode` mapping: no flag is smart-case, `-i` forces
+    /// insensitive. Guards against the boolean being inverted in a refactor.
+    #[test]
+    fn ignore_case_flag_maps_to_case_mode() {
+        assert_eq!(case_mode(false), tilth::CaseMode::Smart);
+        assert_eq!(case_mode(true), tilth::CaseMode::Insensitive);
     }
 
     /// Pin the regression that 16212fc was authored to prevent: a piped

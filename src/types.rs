@@ -17,6 +17,28 @@ pub enum QueryType {
     Fallthrough(String),
 }
 
+/// Case sensitivity for content and regex search.
+///
+/// Threaded from the CLI/MCP surfaces down to the single matcher-building site in
+/// `search::content::search`, where each variant maps to one `grep_regex::RegexMatcherBuilder`
+/// setting. Only the content and regex paths consult it — symbol search is AST-based and matches
+/// names structurally, not by the text matcher.
+///
+/// `Smart` is the surface default: a query with no uppercase letter matches case-insensitively,
+/// one with any uppercase stays sensitive (the ripgrep/fd `-S` convention). `Insensitive` is the
+/// explicit `-i` / `ignore_case: true` force. `Sensitive` is the pre-2026 behaviour and the
+/// explicit `ignore_case: false`. No `Default` is derived on purpose: every caller states which
+/// mode it means, so a new call site cannot silently inherit one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseMode {
+    /// Case-sensitive matching.
+    Sensitive,
+    /// Case-insensitive matching, unconditionally.
+    Insensitive,
+    /// Case-insensitive unless the pattern contains an uppercase letter.
+    Smart,
+}
+
 /// Programming language, carried through the type system so downstream
 /// code never re-detects. Adding a language means adding an arm here
 /// and the compiler tells you everywhere else.

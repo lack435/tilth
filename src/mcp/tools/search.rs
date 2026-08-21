@@ -78,6 +78,14 @@ pub(in crate::mcp) fn tool_search(
     let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // Tri-state: absent → smart-case (the CLI default), `true` → force
+    // insensitive, `false` → force sensitive. Consulted only by the content and
+    // regex arms; symbol/callers ignore it.
+    let case = match args.get("ignore_case").and_then(serde_json::Value::as_bool) {
+        None => crate::types::CaseMode::Smart,
+        Some(true) => crate::types::CaseMode::Insensitive,
+        Some(false) => crate::types::CaseMode::Sensitive,
+    };
 
     let output = match kind {
         "symbol" => {
@@ -99,11 +107,12 @@ pub(in crate::mcp) fn tool_search(
             }
         }
         "content" => crate::search::search_content_expanded(
-            query, &scope, cache, session, expand, context, glob, false, budget,
+            query, &scope, cache, session, expand, context, glob, false, budget, case,
         ),
         "regex" => {
-            let result = crate::search::content::search(query, &scope, true, context, glob, false)
-                .map_err(|e| e.to_string())?;
+            let result =
+                crate::search::content::search(query, &scope, true, context, glob, false, case)
+                    .map_err(|e| e.to_string())?;
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
@@ -531,6 +540,50 @@ mod tests {
         );
         assert!(out.contains("uses_alpha"), "alpha call site missing: {out}");
         assert!(out.contains("uses_beta"), "beta call site missing: {out}");
+    }
+
+    /// The `ignore_case` tri-state maps through `tool_search` end to end:
+    /// absent → smart-case (all-lowercase query folds case), `false` → strictly
+    /// sensitive (no match on the uppercase-only token), `true` → insensitive.
+    /// The matched line's text is echoed into the output, so its presence is a
+    /// reliable proxy for a hit.
+    #[test]
+    fn ignore_case_tristate_controls_content_matching() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("data.txt"), "ZEBRA_TOKEN lives here\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+
+        let run = |ignore_case: Option<bool>| {
+            let mut args = serde_json::json!({
+                "query": "zebra_token",
+                "kind": "content",
+                "scope": tmp.path().to_str().unwrap(),
+            });
+            if let Some(b) = ignore_case {
+                args["ignore_case"] = serde_json::Value::Bool(b);
+            }
+            tool_search(&args, &cache, &session, &bloom).unwrap()
+        };
+
+        // Absent → smart-case: an all-lowercase query folds case and finds the
+        // uppercase token.
+        assert!(
+            run(None).contains("ZEBRA_TOKEN"),
+            "smart-case default should match the uppercase token"
+        );
+        // Explicit false → sensitive: the lowercase query must NOT match.
+        assert!(
+            !run(Some(false)).contains("ZEBRA_TOKEN"),
+            "ignore_case=false must be strictly case-sensitive"
+        );
+        // Explicit true → insensitive.
+        assert!(
+            run(Some(true)).contains("ZEBRA_TOKEN"),
+            "ignore_case=true must fold case"
+        );
     }
 
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
