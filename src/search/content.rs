@@ -99,8 +99,9 @@ pub fn search(
         CaseMode::Insensitive => {
             builder.case_insensitive(true);
         }
-        // `case_smart` and `case_insensitive` are mutually exclusive in grep-regex; only one arm
-        // ever sets a flag, so they never collide.
+        // Only one arm ever sets a flag, so `case_smart` and `case_insensitive` are never both
+        // enabled here. (grep-regex does accept both at once, letting `case_insensitive` win — we
+        // simply never rely on that precedence.)
         CaseMode::Smart => {
             builder.case_smart(true);
         }
@@ -325,6 +326,17 @@ mod tests {
     #[test]
     fn regex_inline_case_flag_is_honoured() {
         assert_eq!(count("(?i)alert threshold", true, CaseMode::Sensitive), 2);
+    }
+
+    /// The sharp interaction: `(?i)` followed by an *uppercase* literal under
+    /// `Smart`. `case_smart` sees the uppercase `A` and would set the matcher
+    /// default to sensitive, but the inline flag must still win and fold case.
+    /// All three fixture lines contain "alert"/"ALERT"/"Alert", so a correct
+    /// result is 3; if smart-case sensitivity wrongly overrode the flag, only
+    /// the `"Mixed Alert text"` line would match and this would be 1.
+    #[test]
+    fn regex_inline_flag_overrides_smart_case_on_uppercase() {
+        assert_eq!(count("(?i)Alert", true, CaseMode::Smart), 3);
     }
 
     /// The same `(?i)` text on the *literal* path is escaped, so it matches the
