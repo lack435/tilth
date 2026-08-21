@@ -224,7 +224,14 @@ pub(crate) fn match_text(line: &str) -> String {
 #[derive(Debug)]
 pub struct SearchResult {
     pub query: String,
+    /// The directory results render relative to (`rel`) and include-containment is bounded by.
+    /// Equals `walk_root` for a directory scope; for a file scope (#141) it is the file's parent.
     pub scope: PathBuf,
+    /// The root the walk actually recursed from — a directory, or a single file for a file scope.
+    /// Distinct from `scope` only for a file scope; used where a step must revisit the walked
+    /// tree (e.g. the basename-outline fallback) rather than the render base, so a single-file
+    /// scope never surfaces a sibling.
+    pub walk_root: PathBuf,
     pub matches: Vec<Match>,
     pub total_found: usize,
     pub definitions: usize,

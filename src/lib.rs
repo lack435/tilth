@@ -300,6 +300,9 @@ pub fn run_deps(
 /// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
 /// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
 pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
+    // A file scope (#141) collapses to its parent directory: grok wants a directory base for both
+    // resolution and rendering (see `tool_grok`). Directory scopes are unchanged.
+    let scope = search::scope_base(scope);
     let bloom = index::bloom::BloomFilterCache::new();
     let session = session::Session::default();
     let caps = if full {
@@ -616,4 +619,50 @@ fn multi_word_concept_search(
         path: scope.join(text),
         suggestion: read::suggest_similar_file(scope, first_word),
     })
+}
+
+#[cfg(test)]
+mod file_scope_tests {
+    use super::*;
+
+    /// #141 at the public API / CLI surface: `run` with a file path as `scope` searches only that
+    /// one file — the issue's literal reproduction (`tilth "<query>" --scope <file>`). The search
+    /// functions derive the render/containment base internally, so the CLI path is fixed by the
+    /// same change as the MCP path. Mutating the walk root back to the parent resurfaces the
+    /// sibling and fails this.
+    #[test]
+    fn run_with_a_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "pub fn a() { shared_symbol(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("sibling.rs"),
+            "pub fn b() { shared_symbol(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run(
+            "shared_symbol",
+            &tmp.path().join("target.rs"),
+            None,
+            None,
+            None,
+            &cache,
+            CaseMode::Smart,
+        )
+        .expect("a file scope must be accepted at the public API");
+
+        assert!(
+            out.contains("target.rs"),
+            "the target file's result must render as a basename: {out}"
+        );
+        assert!(
+            !out.contains("sibling"),
+            "a file scope must not walk siblings: {out}"
+        );
+    }
 }

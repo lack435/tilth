@@ -16,7 +16,7 @@ struct Cli {
     /// File path, symbol name, glob pattern, or text to search.
     query: Option<String>,
 
-    /// Directory to search within or resolve relative paths against.
+    /// Directory (or a single file) to search within, or resolve relative paths against.
     #[arg(long, default_value = ".")]
     scope: PathBuf,
 

@@ -20,7 +20,12 @@ pub(in crate::mcp) fn tool_grok(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let scope = resolve_scope(args, root)?;
+    // A file scope (#141) collapses to its parent directory: grok's value is the surrounding
+    // bundle (callers, siblings, tests) that a single-file walk starves, and both `grok` and
+    // `format_grok` want a directory base. `resolved` is kept only to own the buffer `scope`
+    // borrows from.
+    let resolved = resolve_scope(args, root)?;
+    let scope = crate::search::scope_base(&resolved);
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let caps = if full {
         crate::search::grok::GrokCaps::full()
@@ -28,7 +33,7 @@ pub(in crate::mcp) fn tool_grok(
         crate::search::grok::GrokCaps::default()
     };
 
-    let result = crate::search::grok::grok(target, &scope, bloom, session, caps)
+    let result = crate::search::grok::grok(target, scope, bloom, session, caps)
         .map_err(|e| e.to_string())?;
-    Ok(crate::search::grok::format_grok(&result, &scope))
+    Ok(crate::search::grok::format_grok(&result, scope))
 }
