@@ -496,18 +496,23 @@ pub fn search_callers_expanded(
     full: bool,
 ) -> Result<String, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    // `scope` is the walk root — a file scope (#141) walks exactly that one file for call sites;
+    // `base` is the directory the results render against and rank by proximity to. They diverge
+    // only for a file scope, where `base` is its parent; a directory scope has `base == scope`.
+    let base = crate::search::scope_base(scope);
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
     let raw = find_callers_batch(&single, scope, bloom, glob)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
         let target_seen = target_seen_in_scope(target, scope, glob);
+        // Header names what was searched (the file for a file scope); no path stripping here.
         return Ok(no_callers_message(target, scope, target_seen, glob));
     }
 
     // Sort by relevance (context file first, then by proximity)
     let mut sorted_callers = callers;
-    rank_callers(&mut sorted_callers, scope, context);
+    rank_callers(&mut sorted_callers, base, context);
 
     let total = sorted_callers.len();
 
@@ -530,14 +535,18 @@ pub fn search_callers_expanded(
     };
 
     let mut output = String::new();
-    write_caller_bucket(&mut output, target, scope, total, &sorted_callers, expand);
-    write_second_hop_impact(
+    // `scope` (walk root) titles the bucket; `base` strips match paths — identical for a
+    // directory scope, distinct only for a file scope (#141).
+    write_caller_bucket(
         &mut output,
-        &all_caller_names,
-        &sorted_callers,
-        &hop2,
+        target,
         scope,
+        base,
+        total,
+        &sorted_callers,
+        expand,
     );
+    write_second_hop_impact(&mut output, &all_caller_names, &sorted_callers, &hop2, base);
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
     let _ = write!(
@@ -558,7 +567,11 @@ pub fn search_callers_expanded(
 fn write_caller_bucket(
     output: &mut String,
     target: &str,
+    // The directory or file titling the bucket ("in <scope>") — the walk root, so a file scope
+    // (#141) names the file. `base` is what call-site paths render relative to (its parent for a
+    // file scope). Equal for a directory scope.
     scope: &Path,
+    base: &Path,
     total: usize,
     sorted_callers: &[CallerMatch],
     expand: usize,
@@ -579,7 +592,7 @@ fn write_caller_bucket(
             "\n## {}:{} [caller: {}]\n",
             caller
                 .path
-                .strip_prefix(scope)
+                .strip_prefix(base)
                 .unwrap_or(&caller.path)
                 .display(),
             caller.line,
@@ -795,6 +808,9 @@ pub fn search_callers_multi_expanded(
     full: bool,
 ) -> Result<String, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    // Walk root vs render/rank base — identical for a directory scope, diverging only for a file
+    // scope (#141), where `base` is the file's parent. See the single-target path.
+    let base = crate::search::scope_base(scope);
 
     // Dedupe targets, preserving first-seen order: a repeated target (e.g.
     // query "foo,foo") must not render an empty no-callers section on its
@@ -837,7 +853,7 @@ pub fn search_callers_multi_expanded(
             continue;
         }
 
-        rank_callers(&mut callers, scope, context);
+        rank_callers(&mut callers, base, context);
         let total = callers.len();
 
         // Unique direct-caller names BEFORE truncation, same as the
@@ -893,8 +909,8 @@ pub fn search_callers_multi_expanded(
             continue;
         }
 
-        write_caller_bucket(&mut output, target, scope, *total, callers, expand);
-        write_second_hop_impact(&mut output, all_caller_names, callers, &hop2, scope);
+        write_caller_bucket(&mut output, target, scope, base, *total, callers, expand);
+        write_second_hop_impact(&mut output, all_caller_names, callers, &hop2, base);
         output.push('\n');
     }
 
@@ -1827,6 +1843,7 @@ mod tests {
         write_caller_bucket(
             &mut out,
             "target_fn",
+            dir.path(),
             dir.path(),
             callers.len(),
             &callers,

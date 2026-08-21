@@ -83,6 +83,28 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
+/// The directory a `scope` renders results against and bounds C/C++ include resolution to.
+///
+/// When `scope` names a **file** (a single-file scope, #141) the walk root is the file itself —
+/// so the walk yields exactly that one file and never enumerates its siblings — but the *base*
+/// for path rendering (`rel`) and include-containment (`canonical_boundary`) must be the file's
+/// parent directory. A file is only valid as the walk root of `scope`'s three overloaded roles;
+/// as a render base `rel(file, file)` collapses to the empty string, and as a containment
+/// boundary `is_within(dir, file)` is false for every directory, flipping local headers to
+/// external. Deriving the parent here keeps those two roles pointed at a directory.
+///
+/// When `scope` is a directory (the overwhelmingly common case) the base *is* the scope, so every
+/// existing directory-scoped call is byte-identical to before.
+pub(crate) fn scope_base(scope: &Path) -> &Path {
+    if scope.is_file() {
+        // An absolute, canonicalized file path always has a parent; the fallback only guards a
+        // pathological rootless path and keeps the file itself rather than widening.
+        scope.parent().unwrap_or(scope)
+    } else {
+        scope
+    }
+}
+
 /// Cap for inlined markdown section bodies in the default preview slot.
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
@@ -122,7 +144,14 @@ const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 /// walk. Outside a request — the CLI, `map`, the test suite — `current()` yields a token that is
 /// never cancelled and the predicate costs one null check per entry.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
+    // `WalkBuilder::new(scope)` walks `scope` itself: a directory recurses, a **file** yields
+    // exactly that one entry and nothing else (#141) — the file at depth 0 is never pruned by
+    // the `filter_entry` below, so a single-file scope needs no glob and enumerates no siblings.
     let mut builder = WalkBuilder::new(scope);
+    // The vcs-ignore ruleset, by contrast, must be rooted at a *directory*: a file scope's rules
+    // live in its parent. `scope_base` is the file's parent (else the scope itself), so a
+    // directory scope is unchanged.
+    let ignore_root = scope_base(scope);
     let cancel = crate::cancel::current();
 
     // Every `git_*` knob stays off. This is not "we do not honour ignore files" — it is
@@ -139,7 +168,7 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
         Ok("1" | "true" | "yes" | "on")
     );
     let rules = (!env_opt_out && !vcsignore::include_ignored())
-        .then(|| vcsignore::VcsIgnore::for_scope(scope))
+        .then(|| vcsignore::VcsIgnore::for_scope(ignore_root))
         .flatten()
         .map(std::sync::Arc::new);
 
@@ -247,7 +276,9 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
+            // Glob patterns are matched relative to the override root, which must be a directory;
+            // for a file scope that is its parent (`scope_base`), else the scope itself.
+            let mut overrides = ignore::overrides::OverrideBuilder::new(scope_base(scope));
             overrides
                 .add(pattern)
                 .map_err(|e| TilthError::InvalidQuery {
@@ -416,9 +447,11 @@ pub fn search_multi_symbol_expanded(
     warm_match_labels(results.iter().flat_map(|r| r.matches.iter()), cache);
 
     for result in &results {
+        // Header names the walk root (the file itself for a file scope, #141); matches below
+        // render against `result.scope` (its parent). Equal for a directory scope.
         let mut out = format::search_header(
             &result.query,
-            &result.scope,
+            &result.walk_root,
             result.total_found,
             result.definitions,
             result.usages,
@@ -553,6 +586,10 @@ pub fn format_raw_result(
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
+    // A file scope (#141) collapses to its parent directory: listing files by glob has no
+    // single-file meaning, and both the walk and the scope-relative match rendering want a
+    // directory. Directory scopes are unchanged.
+    let scope = scope_base(scope);
     let result = glob::search(pattern, scope)?;
     format_glob_result(&result, scope)
 }
@@ -1239,7 +1276,8 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
 fn basename_file_outline(
     query: &str,
     matches: &[Match],
-    scope: &Path,
+    base: &Path,
+    walk_root: &Path,
     cache: &OutlineCache,
 ) -> Option<String> {
     let query_lower = query.to_ascii_lowercase();
@@ -1249,9 +1287,12 @@ fn basename_file_outline(
         return None;
     }
 
-    // Find the best candidate among existing matches whose basename matches the query
+    // Find the best candidate among existing matches whose basename matches the query.
+    // The directory-walk fallback recurses `walk_root`, not the render `base`: for a file scope
+    // (#141) `walk_root` is the single file, so this can never surface a sibling of it — a
+    // scope of one file stays a search of one file. Rendering below uses `base`.
     let matched_path = find_basename_candidate(matches, &query_lower)
-        .or_else(|| find_basename_fallback(scope, &query_lower))?;
+        .or_else(|| find_basename_fallback(walk_root, &query_lower))?;
 
     // Read file and generate outline
     let content = std::fs::read_to_string(&matched_path).ok()?;
@@ -1274,7 +1315,7 @@ fn basename_file_outline(
         return None;
     }
 
-    let rel_path = rel(&matched_path, scope);
+    let rel_path = rel(&matched_path, base);
     let line_count = content.lines().count();
     Some(format!(
         "## File overview: {rel_path} ({line_count} lines)\n{outline}"
@@ -1289,9 +1330,12 @@ fn format_search_result(
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
+    // Header names what was actually searched — the walk root, which for a file scope (#141) is
+    // the file itself, not the parent directory the matches render relative to. Directory scopes
+    // have `walk_root == scope`, so this is unchanged for them.
     let header = format::search_header(
         &result.query,
-        &result.scope,
+        &result.walk_root,
         result.total_found,
         result.definitions,
         result.usages,
@@ -1303,9 +1347,13 @@ fn format_search_result(
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
-    if let Some(file_outline) =
-        basename_file_outline(&result.query, &result.matches, &result.scope, cache)
-    {
+    if let Some(file_outline) = basename_file_outline(
+        &result.query,
+        &result.matches,
+        &result.scope,
+        &result.walk_root,
+        cache,
+    ) {
         let _ = write!(out, "\n\n{file_outline}");
     }
 

@@ -20,6 +20,8 @@ pub(in crate::mcp) fn tool_deps(
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
     let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
+    // A file scope (#141) is accepted; `analyze_deps` collapses it to its parent directory, since
+    // deps has no single-file walk to gain from a file root and only needs a directory base.
     let scope = resolve_scope(args, root)?;
     let budget = args
         .get("budget")
@@ -111,14 +113,18 @@ mod tests {
     /// A file `scope` is refused here too, and — the point of the test — refused *before*
     /// `analyze_deps` runs, so it cannot answer with the include-boundary defect.
     ///
-    /// `scope` is the containment boundary `resolve_c_include` uses. Handing it a file makes
-    /// `is_within(dir, boundary)` false for every directory, so local headers resolve as
-    /// external. Measured on a build that accepted file scopes: a UE-style
-    /// `#include "Module/Public/Thing.h"` went from `1 local, 0 external` to
-    /// `0 local, 1 external`. Refusing keeps that unreachable until the walk-root and
-    /// boundary roles are actually separated.
+    /// `scope` is deps' render/containment base and must be a directory: handing
+    /// `resolve_c_include` a file makes `is_within(dir, boundary)` false for every directory, so
+    /// local headers would resolve as external (measured: a UE-style
+    /// `#include "Module/Public/Thing.h"` flips `1 local, 0 external` → `0 local, 1 external`).
+    ///
+    /// deps has no single-file walk to gain from a file scope (it already takes an explicit
+    /// `path`), so a file scope (#141) collapses to its parent directory rather than being
+    /// refused. This pins that equivalence at the tool boundary: `scope: <file>` produces exactly
+    /// what `scope: <that file's parent>` produces. Deleting the `scope_base` collapse in
+    /// `tool_deps` breaks this — the file scope would then misclassify includes and diverge.
     #[test]
-    fn a_file_scope_is_refused_before_deps_can_misclassify_includes() {
+    fn a_file_scope_collapses_to_its_parent_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -127,18 +133,35 @@ mod tests {
             "pub fn shared() -> u32 { 1 }\npub fn inner() -> u32 { shared() + 1 }\n",
         )
         .unwrap();
+        std::fs::write(
+            src.join("caller.rs"),
+            "use crate::target;\npub fn go() -> u32 { target::shared() }\n",
+        )
+        .unwrap();
 
-        let args = serde_json::json!({
-            "path": src.join("target.rs").to_str().unwrap(),
-            "scope": src.join("target.rs").to_str().unwrap(),
-            "root": tmp.path().to_str().unwrap(),
-        });
-        let err = tool_deps(&args, &bloom())
-            .expect_err("a file scope must be refused until the boundary role is split out");
+        let target = src.join("target.rs");
+        let via_file = tool_deps(
+            &serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "scope": target.to_str().unwrap(),
+                "root": tmp.path().to_str().unwrap(),
+            }),
+            &bloom(),
+        )
+        .expect("a file scope must be accepted, not refused");
+        let via_parent = tool_deps(
+            &serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "scope": src.to_str().unwrap(),
+                "root": tmp.path().to_str().unwrap(),
+            }),
+            &bloom(),
+        )
+        .expect("parent-dir scope");
 
-        assert!(
-            err.contains("not a directory") && err.contains("parent directory"),
-            "refusal must diagnose the file and name the fix: {err}"
+        assert_eq!(
+            via_file, via_parent,
+            "a file scope must behave exactly like its parent-directory scope"
         );
     }
 

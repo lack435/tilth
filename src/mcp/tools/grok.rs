@@ -20,6 +20,8 @@ pub(in crate::mcp) fn tool_grok(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
+    // A file scope (#141) is accepted; `grok` collapses it to its parent internally and carries
+    // the base on its result, so nothing to normalize here.
     let scope = resolve_scope(args, root)?;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let caps = if full {
@@ -30,5 +32,5 @@ pub(in crate::mcp) fn tool_grok(
 
     let result = crate::search::grok::grok(target, &scope, bloom, session, caps)
         .map_err(|e| e.to_string())?;
-    Ok(crate::search::grok::format_grok(&result, &scope))
+    Ok(crate::search::grok::format_grok(&result))
 }

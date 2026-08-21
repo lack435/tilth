@@ -223,6 +223,10 @@ fn assemble(
     usage_tally: super::retain::ExactTallies,
     max_matches: usize,
 ) -> SearchResult {
+    // `scope` is the walk root (a file scope walked exactly that one file, #141); `base` is the
+    // directory results render against and facet/proximity ranking measures from. They diverge
+    // only for a file scope, where `base` is its parent; a directory scope has `base == scope`.
+    let base = crate::search::scope_base(scope);
     let def_offered = def_tally.total();
     let usage_offered = usage_tally.total();
     // Deduplicate: remove usage matches that overlap with definition matches.
@@ -330,7 +334,7 @@ fn assemble(
     let usage_count = usage_offered.saturating_sub(overlap_exact);
     let total = def_offered + usage_count;
 
-    rank::sort(&mut merged, query, scope, context);
+    rank::sort(&mut merged, query, base, context);
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each
@@ -346,7 +350,7 @@ fn assemble(
     // print `displayed/total` headings + per-facet hidden-count lines. Counted
     // by borrow — this used to clone the whole set, which was justified by the
     // early-quit bound holding it to ~80 entries. See `facets::facet_totals`.
-    let mut totals = super::facets::facet_totals(&merged, scope);
+    let mut totals = super::facets::facet_totals(&merged, base);
 
     // Three of the five facets are decided by the match alone, so the walk counted them exactly;
     // take those from the tallies rather than from the retained set. Only the local/cross split of
@@ -377,7 +381,8 @@ fn assemble(
 
     SearchResult {
         query: query.to_string(),
-        scope: scope.to_path_buf(),
+        scope: base.to_path_buf(),
+        walk_root: scope.to_path_buf(),
         matches: merged,
         total_found: total,
         definitions: def_offered,
@@ -520,6 +525,7 @@ fn clone_result(r: &SearchResult) -> SearchResult {
     SearchResult {
         query: r.query.clone(),
         scope: r.scope.clone(),
+        walk_root: r.walk_root.clone(),
         matches: r.matches.clone(),
         total_found: r.total_found,
         definitions: r.definitions,

@@ -586,6 +586,172 @@ mod tests {
         );
     }
 
+    /// A file path as `scope` (#141) restricts a symbol search to that one file and never
+    /// enumerates its siblings — the whole point of the feature.
+    ///
+    /// `shared_symbol` is used in both `target.rs` and `sibling.rs`. Scoped to `target.rs`, only
+    /// the target's usage may appear. Mutating the walk root back to the parent (or dropping the
+    /// file-aware `WalkBuilder`) resurfaces `sibling.rs` and fails this.
+    #[test]
+    fn symbol_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "pub fn a() { shared_symbol(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("sibling.rs"),
+            "pub fn b() { shared_symbol(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "shared_symbol",
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        // The match path renders as the basename (relative to the file's parent), not the empty
+        // string a file render-base would produce and not an absolute path.
+        assert!(
+            out.contains("target.rs:"),
+            "the target file's match must render as a basename: {out}"
+        );
+        assert!(
+            !out.contains("sibling"),
+            "a file scope must not walk siblings: {out}"
+        );
+    }
+
+    /// The same restriction for content search.
+    #[test]
+    fn content_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target.rs"), "// MARKER_TOKEN here\n").unwrap();
+        std::fs::write(tmp.path().join("sibling.rs"), "// MARKER_TOKEN there\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "MARKER_TOKEN",
+            "kind": "content",
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            out.contains("target.rs"),
+            "target file's match missing: {out}"
+        );
+        assert!(
+            !out.contains("sibling"),
+            "a file content scope must not walk siblings: {out}"
+        );
+    }
+
+    /// And for callers: a call site of `foo` in a sibling must not appear when scoped to one file.
+    #[test]
+    fn callers_file_scope_searches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "fn foo() {}\nfn in_target() { foo(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("sibling.rs"),
+            "fn in_sibling() { foo(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "foo",
+            "kind": "callers",
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("in_target"), "target call site missing: {out}");
+        assert!(
+            !out.contains("in_sibling") && !out.contains("sibling.rs"),
+            "a file callers scope must not walk siblings: {out}"
+        );
+    }
+
+    /// The basename-outline fallback must respect the file scope too (#141): a single-word query
+    /// that happens to match a *sibling's* filename must not drag that sibling's outline into a
+    /// one-file search. This pins the `walk_root` field — the fallback walks the walk root (the
+    /// file), not the render base (its parent). Routing the fallback back through `result.scope`
+    /// resurfaces `thing.rs` and fails this.
+    #[test]
+    fn file_scope_basename_fallback_does_not_surface_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target.rs"), "pub fn run() { thing(); }\n").unwrap();
+        // A sibling whose *stem* equals the query. The fallback would surface its outline if it
+        // walked the parent directory.
+        std::fs::write(tmp.path().join("thing.rs"), "pub fn thing() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "thing",
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            !out.contains("thing.rs") && !out.contains("File overview"),
+            "a file scope must not surface a sibling via the basename-outline fallback: {out}"
+        );
+    }
+
+    /// The expand path resolves callees and renders them against the parent base under a file
+    /// scope (#141). This guards the containment/render base on the branch the original refusal
+    /// was really about: `format_single_match` feeds `canonical_boundary(&result.scope)` into
+    /// callee resolution, and `result.scope` must be the file's parent, not the file. If a
+    /// regression made it the file, `rel(callee, file)` would collapse the callee path to the
+    /// empty string (and `is_within(dir, file)` would refuse every C/C++ local include the same
+    /// way). The callee here shares the target file, so a correct base renders `target.rs:<line>`.
+    #[test]
+    fn file_scope_expand_resolves_callee_against_parent_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("target.rs"),
+            "pub fn caller_fn() -> u32 {\n    helper_fn()\n}\nfn helper_fn() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "caller_fn",
+            "expand": 2,
+            "scope": tmp.path().join("target.rs").to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("-- calls --"), "callee section missing: {out}");
+        assert!(
+            out.contains("helper_fn  target.rs:"),
+            "callee must resolve and render against the parent base as a basename: {out}"
+        );
+    }
+
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
     /// is unresolvable (the server cannot see the caller's shell cwd) — this
     /// must still refuse.

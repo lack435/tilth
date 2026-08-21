@@ -32,7 +32,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
+                        "description": "Only use scope to search a specific subdirectory, or a single file path to search just that one file. DO NOT USE scope if you want to search the current working directory (initial search)."
                     },
                     "include_ignored": {
                         "type": "boolean",

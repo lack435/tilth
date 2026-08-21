@@ -203,7 +203,10 @@ pub(in crate::mcp) fn tool_read(
         // it *replaces* the `.git` root rather than adding to it (see `resolve_c_include`),
         // so a boundary narrower than the repository resolves fewer includes and one above
         // it can reach outside. Same as `deps`, which is the agreement being bought.
-        let boundary = crate::read::imports::canonical_boundary(Some(&scope));
+        // A file scope's containment base is its parent directory (`scope_base`); a directory
+        // scope is unchanged. The boundary is a directory either way, never the file itself.
+        let boundary =
+            crate::read::imports::canonical_boundary(Some(crate::search::scope_base(&scope)));
         let related = crate::read::imports::resolve_related_files(&path, boundary.as_deref());
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");

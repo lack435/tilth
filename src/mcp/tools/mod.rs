@@ -76,12 +76,13 @@ fn anchor_path(
 /// under this contract there is nothing left to warn about. Every outcome is either a
 /// directory the caller asked for or a refusal.
 ///
-/// A scope naming a **file** is refused for now, with its own message. The walker
-/// would accept a file root, but `scope` is also the containment boundary for C/C++
-/// include resolution and the base that result paths are rendered relative to, and a
-/// file is only valid as the first of those three. Accepting one without splitting
-/// those roles reports local headers as external, renders every path as the empty
-/// string, and makes path-bearing globs return a confident zero. Tracked separately.
+/// A scope naming a **file** is accepted and restricts the search to that one file (#141). The
+/// three roles `scope` overloads are split rather than conflated: the walk root is the file (so the
+/// walk yields exactly that file and enumerates no siblings), while the *base* for path rendering
+/// and C/C++ include-containment is the file's parent directory (`search::scope_base`). Feeding the
+/// file to both roles is what used to break — `rel(file, file)` collapses to the empty string and
+/// `is_within(dir, file)` flips every local header to external — so this returns the file as-is and
+/// the divergence is handled downstream where each role is consumed.
 pub(super) fn resolve_scope(
     args: &Value,
     root: Option<&std::path::Path>,
@@ -103,11 +104,14 @@ pub(super) fn resolve_scope(
 
     let anchored = anchor_path(&raw, root, "scope")?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
-    if resolved.is_dir() {
+    // A directory *or* a file are both valid scopes. A directory recurses; a file scope (#141)
+    // restricts the search to that one file, with its parent directory as the render/containment
+    // base — see `search::scope_base` and the callers that consume it.
+    if resolved.is_dir() || resolved.is_file() {
         return Ok(resolved);
     }
 
-    // Not a directory. Refused rather than widened to `root`.
+    // Neither a directory nor a file. Refused rather than widened to `root`.
     //
     // This deliberately reverses the earlier root-fallback behaviour. That fallback was
     // chosen over falling back to `"."` (the server cwd, frozen at spawn — the worktree
@@ -126,9 +130,12 @@ pub(super) fn resolve_scope(
     // Three cases, distinguished because they need different fixes from the caller.
     // `is_dir()`/`exists()` both answer "no" to a permission error, so a bare "does not
     // exist" would be a false statement about a directory that demonstrably does.
+    // A file scope returned above, so `Ok(true)` here is neither a file nor a directory — a
+    // special file or a symlink whose target does not resolve. `is_dir()`/`is_file()` both answer
+    // "no" to a permission error too, so the three cases stay distinct.
     let detail: String = match resolved.try_exists() {
-        Ok(true) => "exists but is not a directory (a file scope is not supported yet — \
-                     pass its parent directory)"
+        Ok(true) => "exists but is neither a file nor a directory (e.g. a special file, or a \
+                     symlink whose target is missing)"
             .to_string(),
         Ok(false) => "does not exist".to_string(),
         Err(e) => format!("cannot be inspected: {e}"),
@@ -225,63 +232,56 @@ mod tests {
         );
     }
 
-    /// A scope naming a file is refused *as a file*, not misreported as missing, and
-    /// above all is not widened to `root`.
+    /// A scope naming a file is *accepted* (#141) and resolves to that file itself — not
+    /// widened to `root`, not to its parent, and not refused.
     ///
-    /// The walker itself would accept a file root. Accepting one here does not work yet
-    /// because `scope` is overloaded: it is also the containment boundary for C/C++
-    /// include resolution and the base result paths are rendered against. Measured on a
-    /// build that accepted it — a UE-style `#include "Module/Public/Thing.h"` flipped
-    /// from `1 local, 0 external` to `0 local, 1 external`, every rendered path became
-    /// the empty string, and `tilth_files "src/*.rs"` answered 0 for a file that is one.
-    /// So the message points at the parent directory rather than pretending the path is
-    /// absent, and the widening — the actual defect this branch fixes — stays closed
-    /// either way.
+    /// Accepting a file root is what removes the round-trip the issue is about: an agent that
+    /// scopes to one file no longer gets a refusal it has to recover from. The three roles
+    /// `scope` overloads are split downstream — the walk root is the file, the render and
+    /// include-containment base is its parent (`search::scope_base`) — so accepting the file
+    /// here does not reintroduce the empty-path / external-header breakage that made the earlier
+    /// refusal correct. This pins only the resolution half: the file comes back verbatim.
     #[test]
-    fn resolve_scope_file_is_refused_as_a_file_not_widened() {
+    fn resolve_scope_file_is_accepted_and_returned_verbatim() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("only.rs");
         std::fs::write(&file, "fn f() {}\n").unwrap();
 
         let args = serde_json::json!({ "scope": file.to_str().unwrap() });
-        let err = resolve_scope(&args, Some(tmp.path())).unwrap_err();
+        let scope = resolve_scope(&args, Some(tmp.path())).unwrap();
 
-        assert!(
-            err.contains("not a directory"),
-            "a file scope must be diagnosed as a file, not as missing: {err}"
-        );
-        assert!(
-            err.contains("parent directory"),
-            "the refusal must tell the caller what to pass instead: {err}"
+        assert_eq!(
+            scope,
+            file.canonicalize().unwrap(),
+            "a file scope must resolve to the file itself, not its parent or root"
         );
     }
 
-    /// A permission error must not be reported as absence.
+    /// A missing scope still refuses, and a file scope now resolves rather than erroring.
     ///
-    /// `is_dir()` and `exists()` both answer "no" to `EACCES`, so the pre-`try_exists`
-    /// wording would state that a directory which demonstrably exists does not. Windows
-    /// has no cheap way to build an unreadable directory in a unit test, so this pins
-    /// the reachable half: the three diagnoses are distinct strings and the missing case
-    /// says exactly one of them.
+    /// `is_dir()`/`is_file()` both answer "no" to a permission error, so the three diagnoses
+    /// (accepted / missing / uninspectable) stay distinct. Windows has no cheap way to build an
+    /// unreadable directory in a unit test, so this pins the reachable pair: a file is accepted,
+    /// and a genuinely absent scope says "does not exist".
     #[test]
-    fn resolve_scope_distinguishes_missing_from_not_a_directory() {
+    fn resolve_scope_accepts_file_and_still_refuses_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("f.rs");
         std::fs::write(&file, "fn f() {}\n").unwrap();
 
-        let file_err = resolve_scope(
+        let file_scope = resolve_scope(
             &serde_json::json!({ "scope": file.to_str().unwrap() }),
             None,
         )
-        .unwrap_err();
+        .expect("a file scope must be accepted");
         let missing_err = resolve_scope(
             &serde_json::json!({ "scope": tmp.path().join("nope").to_str().unwrap() }),
             None,
         )
         .unwrap_err();
 
-        assert!(file_err.contains("not a directory") && !file_err.contains("does not exist"));
-        assert!(missing_err.contains("does not exist") && !missing_err.contains("not a directory"));
+        assert_eq!(file_scope, file.canonicalize().unwrap());
+        assert!(missing_err.contains("does not exist") && !missing_err.contains("neither"));
     }
 
     #[test]

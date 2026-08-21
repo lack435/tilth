@@ -115,6 +115,10 @@ pub fn search(
 
     let sink = BoundedRetain::new(MAX_RETAINED);
 
+    // `scope` is the walk root (a file scope walks exactly that file, #141); `base` is the
+    // directory results render against and ranking measures proximity to. They differ only for a
+    // file scope, where `base` is its parent — a directory scope has `base == scope`.
+    let base = super::scope_base(scope);
     let walker = super::walker(scope, glob)?;
 
     super::run_walk(walker, || {
@@ -123,7 +127,7 @@ pub fn search(
         // One scorer per worker thread. It memoises package-root lookups, and omitting the
         // recency term makes it independent of when it runs — so two threads scoring the
         // same match always agree, and so do two runs.
-        let mut scorer = rank::Scorer::new(pattern, scope, context);
+        let mut scorer = rank::Scorer::new(pattern, base, context);
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -230,7 +234,7 @@ pub fn search(
     // `into_matches` returns the retained set in no particular order. That costs nothing:
     // `rank::sort`'s key is a total order over these matches, so the page is a function of the
     // tree rather than of the order the walk's threads arrived in.
-    rank::sort(&mut all_matches, pattern, scope, context);
+    rank::sort(&mut all_matches, pattern, base, context);
 
     // Per-facet totals. Content search used to return `FacetTotals::default()`, i.e. all
     // zeros, which made `count_label` print a bare `10` and suppressed every hidden-count
@@ -251,7 +255,8 @@ pub fn search(
 
     Ok(SearchResult {
         query: pattern.to_string(),
-        scope: scope.to_path_buf(),
+        scope: base.to_path_buf(),
+        walk_root: scope.to_path_buf(),
         matches: all_matches,
         total_found: total,
         definitions: 0,

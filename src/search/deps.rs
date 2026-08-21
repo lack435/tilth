@@ -87,6 +87,11 @@ pub fn analyze_deps(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Result<DepsResult, TilthError> {
+    // A file scope (#141) collapses to its parent directory: deps analyses an explicit `path` and
+    // only needs `scope` as a directory render/containment base, so a file here would misclassify
+    // local includes as external (`is_within(dir, file)` is false for every directory). Directory
+    // scopes are unchanged (`scope_base` returns them as-is).
+    let scope = crate::search::scope_base(scope);
     // Canonicalize for reliable path comparison (callers return absolute paths).
     let path = &path.canonicalize().map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
