@@ -48,6 +48,53 @@ fn is_operator_overload(part: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(|c: char| !c.is_alphanumeric() && c != '_'))
 }
 
+/// A corrective note for a `kind:content`/`kind:regex` query that looks like a
+/// comma-separated list of *symbol names* but found nothing (#143).
+///
+/// Comma-separated multi-term search (up to 5) is a `kind:symbol`/`kind:callers` feature —
+/// content/regex treat the whole string as one literal/pattern, so a pasted `A,B,C` symbol
+/// list almost never matches. That produces a *false zero*: the caller reads "0 matches" as
+/// "these strings are absent" when the query shape was simply wrong.
+///
+/// The heuristic is deliberately narrow to avoid instruction noise on genuine queries. It
+/// fires only when EVERY comma-separated term is a bare symbol-name-ish token (identifier
+/// chars plus `::`/`.` qualifiers) — the exact shape an agent pastes out of a `kind:symbol`
+/// habit (`FBicycleTestAccess,ServerMountRider`). A comma that is a literal inside a real
+/// regex or phrase (`\d+,\s*\d+`, `hello world, bye`, `foo(a, b)`) has terms that are not
+/// identifiers, so that zero is left un-annotated: it is a genuine miss, not the multi-term
+/// trap, and a spurious "your query shape was wrong" note is what weak models overreact to.
+/// Only emitted on a zero result, so a symbol-name list that actually matches is untouched.
+fn multiterm_zero_hint(query: &str) -> Option<String> {
+    if !query.contains(',') {
+        return None;
+    }
+    let terms: Vec<&str> = query
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if terms.len() < 2 || !terms.iter().all(|t| is_symbol_like(t)) {
+        return None;
+    }
+    Some(format!(
+        "\n\n> Note: 0 matches. `kind:content`/`kind:regex` search the whole query as a single \
+         pattern — comma-separated multi-term search is only supported for `kind:symbol` and \
+         `kind:callers`. If you meant {} separate terms, search each on its own (or use \
+         `kind:symbol` if they are symbol names).",
+        terms.len()
+    ))
+}
+
+/// A bare symbol-name-ish token: starts with a letter or `_`, then identifier chars plus the
+/// qualifiers that appear in real symbol names (`::`, `.`). Rejects regex metacharacters
+/// (`\`, `(`, `+`, `|`, …) and whitespace, so a comma inside a genuine regex or phrase does
+/// not read as a symbol list. Used only by `multiterm_zero_hint`.
+fn is_symbol_like(t: &str) -> bool {
+    let mut chars = t.chars();
+    matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.'))
+}
+
 pub(in crate::mcp) fn tool_search(
     args: &Value,
     cache: &OutlineCache,
@@ -106,14 +153,29 @@ pub(in crate::mcp) fn tool_search(
                 }
             }
         }
-        "content" => crate::search::search_content_expanded(
+        "content" => crate::search::search_content_expanded_counted(
             query, &scope, cache, session, expand, context, glob, false, budget, case,
-        ),
+        )
+        .map(|(mut out, total)| {
+            if total == 0 {
+                if let Some(hint) = multiterm_zero_hint(query) {
+                    out.push_str(&hint);
+                }
+            }
+            out
+        }),
         "regex" => {
             let result =
                 crate::search::content::search(query, &scope, true, context, glob, false, case)
                     .map_err(|e| e.to_string())?;
-            crate::search::format_raw_result(&result, cache)
+            crate::search::format_raw_result(&result, cache).map(|mut out| {
+                if result.total_found == 0 {
+                    if let Some(hint) = multiterm_zero_hint(query) {
+                        out.push_str(&hint);
+                    }
+                }
+                out
+            })
         }
         "callers" => {
             let targets = split_symbol_list(query);
@@ -432,6 +494,161 @@ mod tests {
         assert!(
             result.is_ok(),
             "bare search must default to cwd, not refuse: {result:?}"
+        );
+    }
+
+    /// #143: a comma-separated multi-term `kind:content` query is a false zero — the
+    /// whole string is one literal, so it matches nothing. The zero result must carry a
+    /// note pointing the caller at the real multi-term shape (symbol/callers), naming the
+    /// term count, so "0 matches" is not misread as "these strings are absent".
+    #[test]
+    fn content_comma_query_zero_result_emits_multiterm_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha,beta,gamma",
+            "kind": "content",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("0 matches"), "expected a zero result: {out}");
+        assert!(
+            out.contains("multi-term") && out.contains("kind:symbol"),
+            "zero comma-query must carry the multi-term hint: {out}"
+        );
+        assert!(
+            out.contains("3 separate terms"),
+            "hint must name the term count: {out}"
+        );
+    }
+
+    /// The hint must NOT fire when a comma-bearing content query actually matches —
+    /// commas are ordinary characters in source (`foo(a, b)`), so a legitimate match must
+    /// come back clean, with no misleading multi-term note.
+    #[test]
+    fn content_comma_query_with_matches_has_no_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "let pair = make(a, b);\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "make(a, b)",
+            "kind": "content",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("make(a, b)"), "the literal must match: {out}");
+        assert!(
+            !out.contains("multi-term"),
+            "a matching comma query must not be annotated: {out}"
+        );
+    }
+
+    /// A zero content result with NO comma is an ordinary miss, not the multi-term trap —
+    /// it must stay clean so the hint keeps its signal.
+    #[test]
+    fn content_single_term_zero_result_has_no_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "fn alpha() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "no_such_token_zzz",
+            "kind": "content",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("0 matches"), "expected a zero result: {out}");
+        assert!(
+            !out.contains("multi-term"),
+            "a comma-free miss must not carry the multi-term hint: {out}"
+        );
+    }
+
+    /// The same false-zero note must ride the `kind:regex` arm, which runs through a
+    /// different code path (`content::search` + `format_raw_result`) than content.
+    #[test]
+    fn regex_comma_query_zero_result_emits_multiterm_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "zzalpha,zzbeta",
+            "kind": "regex",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("0 matches"), "expected a zero result: {out}");
+        assert!(
+            out.contains("multi-term") && out.contains("2 separate terms"),
+            "regex zero comma-query must carry the multi-term hint: {out}"
+        );
+    }
+
+    #[test]
+    fn multiterm_zero_hint_gates_on_two_symbol_like_terms() {
+        // Two-plus symbol-name terms → hint (the trap).
+        assert!(multiterm_zero_hint("alpha,beta").is_some());
+        assert!(multiterm_zero_hint("Foo::Bar, baz_qux, obj.field").is_some());
+        // A trailing comma is a single real term → no hint.
+        assert!(multiterm_zero_hint("alpha,").is_none());
+        // No comma at all → no hint.
+        assert!(multiterm_zero_hint("abc").is_none());
+        // A comma that is a regex/phrase literal, not a symbol list → no hint. These terms
+        // carry regex metacharacters or whitespace, so they are not symbol-like.
+        assert!(multiterm_zero_hint(r"\d+,\s*\d+").is_none());
+        assert!(multiterm_zero_hint("foo(a, b)").is_none());
+        assert!(multiterm_zero_hint("hello world, goodbye").is_none());
+        // A term starting with a digit is not a symbol name.
+        assert!(multiterm_zero_hint("123abc,def").is_none());
+    }
+
+    /// Precision guard for the Medium finding from review: a genuine `kind:regex` query whose
+    /// comma is a literal metacharacter context (`\d+,\s*\d+`) and which matches nothing must
+    /// NOT be annotated with the multi-term hint — that zero is a real miss, not the trap.
+    #[test]
+    fn regex_literal_comma_zero_result_has_no_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("lib.rs"), "let x = 1;\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": r"\d+,\s*\d+",
+            "kind": "regex",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(out.contains("0 matches"), "expected a zero result: {out}");
+        assert!(
+            !out.contains("multi-term"),
+            "a regex whose comma is a literal must not get the symbol-list hint: {out}"
         );
     }
 

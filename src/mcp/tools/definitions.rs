@@ -93,9 +93,9 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
                     },
                     "sections": {
-                        "type": "array",
+                        "type": ["array", "string"],
                         "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
+                        "description": "Multiple ranges from the same file in one call, as an array of range strings, e.g. [\"45-89\", \"120-140\"]. A single comma-separated string (\"45-89, 120-140\") is also accepted and split into the same ranges (use the array form for a heading that itself contains a comma). Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",

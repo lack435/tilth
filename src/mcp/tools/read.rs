@@ -110,15 +110,46 @@ pub(in crate::mcp) fn tool_read(
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
     let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
     let section = args.get("section").and_then(|v| v.as_str());
-    let sections_arr = args.get("sections").and_then(|v| v.as_array());
+    // `sections` is documented as an array of range strings. For ergonomics (#144) we also
+    // accept a single comma-separated range string ("596-700, 735-860") and split it into the
+    // same shape — that bare string is the natural-but-wrong form an agent reaches for, and
+    // without this coercion the client rejects it with a generic JSON-shape error that never
+    // points at `sections`. The schema advertises `type: ["array","string"]` so the client
+    // lets the string through to here in the first place.
+    let sections_owned: Option<Vec<String>> = match args.get("sections") {
+        Some(Value::Array(arr)) => Some(
+            arr.iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or("sections must be an array of strings")
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(Value::String(s)) => Some(
+            s.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(
+                "sections must be an array of range strings, e.g. [\"45-89\", \"120-140\"], \
+                 or a single comma-separated string \"45-89, 120-140\""
+                    .into(),
+            )
+        }
+    };
 
-    if section.is_some() && sections_arr.is_some() {
+    if section.is_some() && sections_owned.is_some() {
         return Err("provide either section (single) or sections (array), not both".into());
     }
 
     // signature/stripped reshape the whole file; a section selection has no
     // meaning there. Error rather than silently dropping the mode.
-    if (force_signature || force_stripped) && (section.is_some() || sections_arr.is_some()) {
+    if (force_signature || force_stripped) && (section.is_some() || sections_owned.is_some()) {
         return Err(format!(
             "mode={mode_str} cannot be combined with section/sections — \
              {mode_str} reshapes the whole file. Drop section/sections or pick mode=auto/full."
@@ -127,11 +158,8 @@ pub(in crate::mcp) fn tool_read(
 
     // Multi-section path: bypass smart view + related-file hints (those only
     // apply to whole-file reads).
-    if let Some(arr) = sections_arr {
-        let ranges: Vec<&str> = arr
-            .iter()
-            .map(|v| v.as_str().ok_or("sections must be an array of strings"))
-            .collect::<Result<Vec<_>, _>>()?;
+    if let Some(ranges_owned) = sections_owned {
+        let ranges: Vec<&str> = ranges_owned.iter().map(String::as_str).collect();
         if ranges.is_empty() {
             return Err("sections must contain at least one range".into());
         }
@@ -801,6 +829,135 @@ mod tests {
         assert!(
             err.contains("signature") && err.contains("section"),
             "error must name the conflict: {err}"
+        );
+    }
+
+    /// #144: a bare comma-separated range string passed as `sections` must be coerced into
+    /// the same array-of-ranges shape and emit each disjoint block, not fail with a generic
+    /// JSON-shape error. Two ranges → two `─── lines X-Y ───` delimiters, each carrying its
+    /// slice.
+    #[test]
+    fn tool_read_sections_accepts_comma_separated_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ranges.rs");
+        let mut src = String::new();
+        for i in 1..=20 {
+            let _ = writeln!(src, "let line_{i} = {i};");
+        }
+        std::fs::write(&path, &src).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        // The array form is the documented shape.
+        let via_array = tool_read(
+            &serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "sections": ["2-3", "10-11"],
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect("array sections");
+
+        // The bare comma-separated string (#144) must coerce to the identical result.
+        let via_string = tool_read(
+            &serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "sections": "2-3, 10-11",
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect("string sections");
+
+        assert_eq!(
+            via_array, via_string,
+            "a comma-separated string must produce the same output as the array form"
+        );
+        assert!(
+            via_string.contains("line_2"),
+            "first slice missing: {via_string}"
+        );
+        assert!(
+            via_string.contains("line_10"),
+            "second slice missing: {via_string}"
+        );
+        assert!(
+            !via_string.contains("line_5"),
+            "a line outside both ranges leaked in: {via_string}"
+        );
+    }
+
+    /// A `sections` value of the wrong scalar type (not array, not string) must refuse with
+    /// a message that names the accepted shapes — not a silent misparse.
+    #[test]
+    fn tool_read_sections_wrong_type_errors_with_shape_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("any.rs");
+        std::fs::write(&path, "fn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let err = tool_read(
+            &serde_json::json!({ "path": path.to_str().unwrap(), "sections": 42 }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect_err("a numeric sections must be refused");
+        assert!(
+            err.contains("array") && err.contains("comma-separated"),
+            "the refusal must name the accepted shapes: {err}"
+        );
+    }
+
+    /// An all-empty comma string ("," or " , ") coerces to zero ranges and must hit the
+    /// existing "at least one range" guard, not panic or read the whole file.
+    #[test]
+    fn tool_read_sections_empty_string_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("any.rs");
+        std::fs::write(&path, "fn f() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let err = tool_read(
+            &serde_json::json!({ "path": path.to_str().unwrap(), "sections": " , " }),
+            &cache,
+            &session,
+            false,
+        )
+        .expect_err("an all-empty sections string must be refused");
+        assert!(
+            err.contains("at least one range"),
+            "empty coercion must hit the range guard: {err}"
+        );
+    }
+
+    /// The schema must advertise `sections` as accepting a string too (#144), or the client
+    /// rejects a comma-separated string before it ever reaches the coercion above.
+    #[test]
+    fn tilth_read_schema_sections_accepts_string() {
+        let tools = tool_definitions(false);
+        let read = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("tilth_read"))
+            .expect("tilth_read definition");
+        let ty = read
+            .pointer("/inputSchema/properties/sections/type")
+            .expect("sections type");
+        let types: Vec<&str> = ty
+            .as_array()
+            .expect("sections type must be an array of accepted types")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            types.contains(&"array") && types.contains(&"string"),
+            "sections must accept both array and string: {ty}"
         );
     }
 

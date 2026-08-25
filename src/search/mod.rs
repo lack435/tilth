@@ -522,10 +522,37 @@ pub fn search_content_expanded(
     budget: Option<u64>,
     case: crate::types::CaseMode,
 ) -> Result<String, TilthError> {
+    search_content_expanded_counted(
+        query, scope, cache, session, expand, context, glob, full, budget, case,
+    )
+    .map(|(out, _)| out)
+}
+
+/// Like [`search_content_expanded`], but also returns the total match count.
+///
+/// The MCP layer uses the count to detect a *false zero* from a comma-separated
+/// multi-term query (#143): `kind:content`/`kind:regex` treat the whole query as one
+/// pattern, so `A,B,C` matches nothing and the caller misreads "0 matches" as "absent".
+/// Surfacing the count here lets `tool_search` append a corrective note without re-running
+/// the search.
+pub fn search_content_expanded_counted(
+    query: &str,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+    case: crate::types::CaseMode,
+) -> Result<(String, usize), TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, context, glob, full, case)?;
+    let total = result.total_found;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
+    let out = format_search_result(&result, cache, Some(session), &bloom, expand, budget)?;
+    Ok((out, total))
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
