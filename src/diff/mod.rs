@@ -1,6 +1,7 @@
 pub mod format;
 pub mod matching;
 pub mod overlay;
+pub mod p4;
 pub mod parse;
 
 use std::collections::HashSet;
@@ -20,6 +21,16 @@ pub enum DiffSource {
     Files(PathBuf, PathBuf),
     Patch(PathBuf),
     Log(String),
+    /// Perforce "uncommitted" (opened files). `entries` maps each `FileDiff`'s
+    /// relative path to the depot/local/old-side the overlay needs to fetch each
+    /// side; `work_dir` is the cwd every `p4` call runs in (so `P4CONFIG`
+    /// resolves consistently). Built by [`p4::build_uncommitted`], never by
+    /// `resolve_source`.
+    P4Uncommitted {
+        client: String,
+        work_dir: PathBuf,
+        entries: std::collections::HashMap<PathBuf, p4::P4Entry>,
+    },
 }
 
 #[derive(Debug)]
@@ -201,8 +212,11 @@ fn git_diff_once(source: &DiffSource, uncommitted_base: &str) -> Result<Output, 
         DiffSource::Files(fa, fb) => {
             cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
         }
-        // Patch and Log are handled by the caller
-        DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
+        // Patch and Log are handled by the caller; a Perforce source is served
+        // entirely by `diff::p4` and never reaches the git path.
+        DiffSource::Patch(_) | DiffSource::Log(_) | DiffSource::P4Uncommitted { .. } => {
+            unreachable!()
+        }
     }
 
     cmd.output()
@@ -301,16 +315,35 @@ pub fn diff(
         return diff_log(range, scope, budget);
     }
 
-    let raw = run_git_diff(source)?;
-    if raw.is_empty() {
-        return Ok("No changes.".to_string());
-    }
-
-    // 1. Parse raw unified diff.
-    let file_diffs = parse::parse_unified_diff(&raw);
+    // SCM detection: a git-backed mode in a non-git working directory falls
+    // through to Perforce. `p4_source` owns any p4-built source so the rest of
+    // the pipeline borrows it in place of `source`, and `effective_scope` is the
+    // scope re-based to the p4 enumeration (work-dir-relative), so the
+    // repo-relative selection machinery below applies unchanged.
+    let (file_diffs, p4_source, effective_scope_owned): (
+        Vec<FileDiff>,
+        Option<DiffSource>,
+        Option<String>,
+    ) = match detect_scm(source, scope)? {
+        P4Detect::NoChanges => return Ok("No changes.".to_string()),
+        P4Detect::Diff(fds, src, sc) => (fds, Some(src), sc),
+        P4Detect::UseGit => {
+            let raw = run_git_diff(source)?;
+            if raw.is_empty() {
+                return Ok("No changes.".to_string());
+            }
+            (
+                parse::parse_unified_diff(&raw),
+                None,
+                scope.map(str::to_string),
+            )
+        }
+    };
     if file_diffs.is_empty() {
         return Ok("No changes.".to_string());
     }
+    let source: &DiffSource = p4_source.as_ref().unwrap_or(source);
+    let scope: Option<&str> = effective_scope_owned.as_deref();
 
     // 2. Pin a symmetric range to its merge base once, up front.
     //
@@ -506,6 +539,114 @@ pub fn diff(
 }
 
 // ---------------------------------------------------------------------------
+// SCM detection (git vs Perforce)
+// ---------------------------------------------------------------------------
+
+/// Outcome of resolving which SCM serves a git-backed diff request.
+enum P4Detect {
+    /// Stay on the git path (git repo, or a mode that needs no repo at all).
+    UseGit,
+    /// A Perforce workspace with nothing open under the scope.
+    NoChanges,
+    /// A Perforce workspace: the built file diffs, the p4 source carrying the
+    /// per-file depot/local map, and the scope re-based to the enumeration.
+    Diff(Vec<FileDiff>, DiffSource, Option<String>),
+}
+
+/// Is the current working directory inside a git work tree?
+///
+/// Checked against the process cwd because `run_git_diff` runs git there — so
+/// this answers exactly "can the git path produce a diff here?". A `false` is
+/// what sends a git-backed request down the Perforce path.
+fn in_git_repo() -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
+/// Decide whether a git-backed diff request should be served from Perforce.
+///
+/// Only the git-backed modes are eligible; file-pair, patch, and an
+/// already-built p4 source pass through as `UseGit` (they need no repo, or are
+/// already resolved). When the working directory is a git repo, the git path is
+/// kept. Otherwise Perforce is tried: `uncommitted`/`working` is served;
+/// `staged`/ref are refused with a message naming why; a directory that is
+/// neither git nor a resolvable p4 workspace yields one clean, actionable error
+/// instead of git's raw usage dump (the behaviour issue #148 reported).
+fn detect_scm(source: &DiffSource, scope: Option<&str>) -> Result<P4Detect, String> {
+    match source {
+        DiffSource::GitUncommitted | DiffSource::GitStaged | DiffSource::GitRef(_) => {}
+        _ => return Ok(P4Detect::UseGit),
+    }
+    if in_git_repo() {
+        return Ok(P4Detect::UseGit);
+    }
+
+    // Not a git repo — resolve the scope to a working directory + optional file.
+    let path_part = scope.map(|s| split_path_symbol(s).map_or(s, |(p, _)| p));
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"))?;
+    let (work_dir, file_filter): (PathBuf, Option<PathBuf>) = match path_part {
+        None => (cwd.clone(), None),
+        Some(p) => {
+            let pb = PathBuf::from(p);
+            if pb.is_file() {
+                let parent = pb.parent().map_or_else(|| cwd.clone(), Path::to_path_buf);
+                (parent, Some(pb))
+            } else if pb.is_dir() {
+                (pb, None)
+            } else {
+                (cwd.clone(), None)
+            }
+        }
+    };
+
+    let client = p4::resolve_client(&work_dir).map_err(|p4err| {
+        format!(
+            "not a git repository, and not a resolvable Perforce workspace: {p4err}. \
+             tilth_diff's uncommitted / staged / ref modes need git or Perforce; the \
+             file-pair (a + b) and patch modes work without either."
+        )
+    })?;
+
+    // A Perforce workspace. Only the uncommitted (opened-files) mode maps.
+    match source {
+        DiffSource::GitUncommitted => {}
+        DiffSource::GitStaged => {
+            return Err("Perforce workspace: `staged` has no Perforce equivalent — \
+                        Perforce has no staging area (a pending changelist is the \
+                        closest analog). Use source:\"uncommitted\" for opened files."
+                .to_string());
+        }
+        DiffSource::GitRef(r) => {
+            return Err(format!(
+                "Perforce workspace: the ref mode (`{r}`) is git-only — Perforce \
+                 revisions are @changelist / #rev, not git refs. Use \
+                 source:\"uncommitted\" for opened files."
+            ));
+        }
+        _ => unreachable!("only git-backed modes reach here"),
+    }
+
+    match p4::build_uncommitted(&work_dir, file_filter.as_deref(), &client)? {
+        None => Ok(P4Detect::NoChanges),
+        Some((file_diffs, p4_source)) => {
+            // Re-base the caller's scope onto the (work-dir-relative) paths the
+            // enumeration produced, preserving any `:symbol` selector.
+            let downstream_scope = scope.and_then(|s| {
+                let (path, sym) = split_path_symbol(s).map_or((s, None), |(p, x)| (p, Some(x)));
+                match (p4::relativize(path, &work_dir), sym) {
+                    (None, _) => None,
+                    (Some(r), None) => Some(r),
+                    (Some(r), Some(x)) => Some(format!("{r}:{x}")),
+                }
+            });
+            Ok(P4Detect::Diff(file_diffs, p4_source, downstream_scope))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
@@ -518,6 +659,7 @@ fn source_label(source: &DiffSource) -> String {
         DiffSource::Files(a, b) => format!("{} vs {}", a.display(), b.display()),
         DiffSource::Patch(p) => format!("patch: {}", p.display()),
         DiffSource::Log(r) => format!("log: {r}"),
+        DiffSource::P4Uncommitted { .. } => "uncommitted (p4)".to_string(),
     }
 }
 

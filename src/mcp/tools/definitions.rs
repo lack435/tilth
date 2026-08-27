@@ -224,13 +224,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_diff",
             "annotations": { "readOnlyHint": true },
-            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
+            "description": "Structural diff showing function-level changes. Replaces git diff. Works in git or Perforce workspaces. Call with no args for uncommitted changes overview.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat', 'main...feat'). Both range spellings follow git: 'a..b' compares the two tips, 'a...b' compares their merge base against b. Ignored when a, b, patch, or log is set."
+                        "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat', 'main...feat'). Both range spellings follow git: 'a..b' compares the two tips, 'a...b' compares their merge base against b. In a non-git Perforce workspace, 'uncommitted' diffs the opened files (via p4); 'staged' and refs are git-only. Ignored when a, b, patch, or log is set."
                     },
                     "scope": {
                         "type": "string",

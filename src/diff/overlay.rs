@@ -366,6 +366,16 @@ fn get_old_content(
         DiffSource::Files(a, _) => {
             std::fs::read_to_string(a).map_err(|e| format!("read {}: {e}", a.display()))
         }
+        DiffSource::P4Uncommitted {
+            client,
+            work_dir,
+            entries,
+        } => match entries.get(path) {
+            Some(entry) => super::p4::print_old(entry, client, work_dir),
+            // Every FileDiff came from the same enumeration that built `entries`,
+            // so a miss is a bug, not a user-facing state.
+            None => Err(format!("no Perforce entry for {}", path.display())),
+        },
         DiffSource::Patch(_) | DiffSource::Log(_) => Ok(String::new()),
     }
 }
@@ -499,6 +509,12 @@ fn get_new_content(path: &Path, source: &DiffSource) -> Result<String, String> {
         DiffSource::Files(_, b) => {
             std::fs::read_to_string(b).map_err(|e| format!("read {}: {e}", b.display()))
         }
+        DiffSource::P4Uncommitted { entries, .. } => match entries.get(path) {
+            // New side is the working file on disk (absolute local path).
+            Some(entry) => std::fs::read_to_string(&entry.local)
+                .map_err(|e| format!("read {}: {e}", entry.local.display())),
+            None => Err(format!("no Perforce entry for {}", path.display())),
+        },
         DiffSource::Patch(_) | DiffSource::Log(_) => Ok(String::new()),
     }
 }
